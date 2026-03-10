@@ -25,10 +25,13 @@ export const MemoryRegion = {
   VRAM_SIZE:        0x00200000, // 2 MB
 
   RAM_START:        0x08000000,
-  RAM_SIZE:         0x02000000, // 32 MB (PSP-1000)
+  RAM_SIZE:         0x04000000, // 64 MB (PSP-2000+ / Slim)
 
   HWIO_START:       0x1C000000,
   HWIO_END:         0x1FC00000, // HW I/O registers end (0x1C000000–0x1FBFFFFF)
+
+  KERNEL_ROM_START: 0x1FC00000,
+  KERNEL_ROM_END:   0x20000000, // Kernel ROM / BIOS (0x1FC00000–0x1FFFFFFF)
 } as const;
 
 /** Strip kseg0/kseg1 top bits to get the physical address. */

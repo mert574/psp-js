@@ -60,6 +60,8 @@ export interface LoadResult {
   entryPoint: number;
   /** module_start_func from export table (may differ from ELF entry) */
   moduleStartFunc: number | null;
+  /** Global pointer value from module_info */
+  gp: number;
   /** Map from syscall code → NID, for wiring up HLE handlers */
   nidBySyscall: Map<number, number>;
 }
@@ -162,10 +164,12 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
     //   0x28: libentend (u32)
     //   0x2C: libstub (u32)
     //   0x30: libstubend (u32)
+    const gpValue    = bus.readU32(modinfoAddr + 0x20);
     const libent     = bus.readU32(modinfoAddr + 0x24);
     const libentend  = bus.readU32(modinfoAddr + 0x28);
     const libstub    = bus.readU32(modinfoAddr + 0x2C);
     const libstubend = bus.readU32(modinfoAddr + 0x30);
+    log.info(`gp=0x${gpValue.toString(16)}`);
 
     // Read module name for logging
     let modName = "";
@@ -196,10 +200,10 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
       log.debug(`module_start_func=0x${moduleStartFunc.toString(16)} differs from ELF entry=0x${elfEntry.toString(16)}`);
     }
 
-    return { entryPoint: elfEntry, moduleStartFunc, nidBySyscall };
+    return { entryPoint: elfEntry, moduleStartFunc, gp: gpValue, nidBySyscall };
   }
 
-  return { entryPoint: (entryPoint + baseAddr) >>> 0, moduleStartFunc: null, nidBySyscall };
+  return { entryPoint: (entryPoint + baseAddr) >>> 0, moduleStartFunc: null, gp: 0, nidBySyscall };
 }
 
 /**
@@ -360,7 +364,13 @@ function applyRelocations(
       const relocBase = segmentBases[addrBase] ?? baseAddr;
 
       // Read current 32-bit word at relocation target
-      const word = bus.readU32(addr);
+      // Skip relocations pointing outside mapped memory (e.g. absent segments)
+      let word: number;
+      try {
+        word = bus.readU32(addr);
+      } catch {
+        continue;
+      }
 
       switch (rType) {
         case R_MIPS_32: {

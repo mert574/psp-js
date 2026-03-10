@@ -46,6 +46,10 @@ export class MemoryBus {
     return addr >= MemoryRegion.HWIO_START && addr < MemoryRegion.HWIO_END;
   }
 
+  private static isKernelRom(addr: number): boolean {
+    return addr >= MemoryRegion.KERNEL_ROM_START && addr < MemoryRegion.KERNEL_ROM_END;
+  }
+
   // ── public read API ──────────────────────────────────────────────────────
 
   readU8(vaddr: number): number {
@@ -64,8 +68,9 @@ export class MemoryBus {
       return this.scratchpad[addr - MemoryRegion.SCRATCHPAD_START]!;
     }
     if (MemoryBus.isHwio(addr)) return 0;
+    if (MemoryBus.isKernelRom(addr)) return 0;
 
-    throw new RangeError(`Unmapped memory access at 0x${addr.toString(16).padStart(8, "0")}`);
+    return 0; // unmapped — return 0 like real hardware
   }
 
   readU16(vaddr: number): number {
@@ -84,8 +89,9 @@ export class MemoryBus {
       return this.scratchpadView.getUint16(addr - MemoryRegion.SCRATCHPAD_START, true);
     }
     if (MemoryBus.isHwio(addr)) return 0;
+    if (MemoryBus.isKernelRom(addr)) return 0;
 
-    throw new RangeError(`Unmapped memory access at 0x${addr.toString(16).padStart(8, "0")}`);
+    return 0; // unmapped — return 0 like real hardware
   }
 
   readU32(vaddr: number): number {
@@ -104,8 +110,9 @@ export class MemoryBus {
       return this.scratchpadView.getUint32(addr - MemoryRegion.SCRATCHPAD_START, true) >>> 0;
     }
     if (MemoryBus.isHwio(addr)) return 0;
+    if (MemoryBus.isKernelRom(addr)) return 0;
 
-    throw new RangeError(`Unmapped memory access at 0x${addr.toString(16).padStart(8, "0")}`);
+    return 0; // unmapped — return 0 like real hardware
   }
 
   // ── public write API ─────────────────────────────────────────────────────
@@ -129,8 +136,9 @@ export class MemoryBus {
       return;
     }
     if (MemoryBus.isHwio(addr)) return; // silently drop
+    if (MemoryBus.isKernelRom(addr)) return; // silently drop
 
-    throw new RangeError(`Unmapped memory access at 0x${addr.toString(16).padStart(8, "0")}`);
+    return; // unmapped — silently drop like real hardware
   }
 
   writeU16(vaddr: number, value: number): void {
@@ -152,8 +160,9 @@ export class MemoryBus {
       return;
     }
     if (MemoryBus.isHwio(addr)) return;
+    if (MemoryBus.isKernelRom(addr)) return;
 
-    throw new RangeError(`Unmapped memory access at 0x${addr.toString(16).padStart(8, "0")}`);
+    return; // unmapped — silently drop
   }
 
   writeU32(vaddr: number, value: number): void {
@@ -175,7 +184,8 @@ export class MemoryBus {
       return;
     }
     if (MemoryBus.isHwio(addr)) return;
+    if (MemoryBus.isKernelRom(addr)) return;
 
-    throw new RangeError(`Unmapped memory access at 0x${addr.toString(16).padStart(8, "0")}`);
+    return; // unmapped — silently drop
   }
 }

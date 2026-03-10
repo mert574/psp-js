@@ -33,6 +33,50 @@ export class AllegrexRegisters {
   /** Low 32 bits of multiply/divide result. */
   lo: number = 0;
 
+  // ── COP1 (FPU) registers ────────────────────────────────────────────────
+
+  /** FPU registers f0–f31 (single-precision float, stored as raw u32 bits) */
+  readonly fpr: Uint32Array = new Uint32Array(32);
+  /** FPU condition code flag (used by C.cond.S and BC1T/BC1F) */
+  fcr31: number = 0; // FCSR — FPU control/status register
+
+  // ── VFPU registers ──────────────────────────────────────────────────────
+  /** VFPU registers: 128 scalars organized as 8 4x4 matrices (float32) */
+  readonly vfpr: Float32Array = new Float32Array(128);
+  /** VFPU control registers (VFPU_CTRL) */
+  readonly vfpuCtrl: Uint32Array = new Uint32Array(16);
+  /** VFPU condition register */
+  vfpuCc: number = 0;
+  /** VFPU prefix state */
+  vpfxs: number = 0;
+  vpfxt: number = 0;
+  vpfxd: number = 0;
+  vpfxsEnabled: boolean = false;
+  vpfxtEnabled: boolean = false;
+  vpfxdEnabled: boolean = false;
+
+  /** Read FPR as float */
+  getFpr(index: number): number {
+    const buf = new Float32Array(this.fpr.buffer, index * 4, 1);
+    return buf[0]!;
+  }
+
+  /** Write FPR as float */
+  setFpr(index: number, value: number): void {
+    const buf = new Float32Array(this.fpr.buffer, index * 4, 1);
+    buf[0] = value;
+  }
+
+  /** Read FPR raw bits as u32 */
+  getFprBits(index: number): number {
+    return this.fpr[index]! >>> 0;
+  }
+
+  /** Write FPR raw bits from u32 */
+  setFprBits(index: number, value: number): void {
+    this.fpr[index] = value >>> 0;
+  }
+
   // ── CP0 registers we care about ─────────────────────────────────────────
 
   /** CP0 r12 — Status register (interrupt enable, operating mode, …) */

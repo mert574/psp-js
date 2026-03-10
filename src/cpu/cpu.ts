@@ -53,11 +53,15 @@ export class AllegrexCPU {
 
     // If PC=0, module_start returned — check for pending thread
     if (pc === 0 && this.hle?.pendingThreadEntry != null) {
-      const entry = this.hle.pendingThreadEntry;
+      const pending = this.hle.pendingThreadEntry;
       this.hle.pendingThreadEntry = null;
-      this.regs.pc = entry;
+      this.regs.pc = pending.entry;
+      this.regs.setGpr(4, pending.arglen);
+      this.regs.setGpr(5, pending.argp);
+      this.regs.setGpr(26, pending.k0);
+      this.regs.setGpr(29, pending.sp);
       this.regs.setGpr(31, 0); // $ra = 0 for the thread
-      log.info(`Starting thread at 0x${entry.toString(16)}`);
+      log.info(`Starting thread at 0x${pending.entry.toString(16)}`);
       return true;
     }
 

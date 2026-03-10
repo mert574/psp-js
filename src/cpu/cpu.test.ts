@@ -220,6 +220,230 @@ describe("AllegrexCPU — multiply", () => {
   });
 });
 
+describe("AllegrexCPU — LL/SC", () => {
+  let cpu: AllegrexCPU;
+
+  beforeEach(() => {
+    cpu = new AllegrexCPU(new MemoryBus());
+  });
+
+  it("LL loads a word from memory", () => {
+    const addr = RAM + 100;
+    cpu.bus.writeU32(addr, 0xcafebabe);
+    cpu.regs.setGpr(1, addr);
+    // LL rt=2, offset=0, base=r1 → opcode 0x30
+    loadProgram(cpu, [makeI(0x30, 1, 2, 0)]);
+    cpu.step();
+    expect(cpu.regs.getGpr(2)).toBe(0xcafebabe);
+  });
+
+  it("SC stores a word and sets rt=1", () => {
+    const addr = RAM + 100;
+    cpu.regs.setGpr(1, addr);
+    cpu.regs.setGpr(2, 0xdeadbeef);
+    // SC rt=2, offset=0, base=r1 → opcode 0x38
+    loadProgram(cpu, [makeI(0x38, 1, 2, 0)]);
+    cpu.step();
+    expect(cpu.bus.readU32(addr)).toBe(0xdeadbeef);
+    expect(cpu.regs.getGpr(2)).toBe(1); // SC always succeeds
+  });
+});
+
+describe("AllegrexCPU — MOVZ/MOVN", () => {
+  let cpu: AllegrexCPU;
+
+  beforeEach(() => {
+    cpu = new AllegrexCPU(new MemoryBus());
+  });
+
+  it("MOVZ: rd=rs when rt==0", () => {
+    cpu.regs.setGpr(1, 42);
+    cpu.regs.setGpr(2, 0); // condition: rt==0
+    cpu.regs.setGpr(3, 99);
+    // MOVZ rd=3, rs=1, rt=2 → SPECIAL funct=0x0a
+    loadProgram(cpu, [makeWord(SPECIAL, 1, 2, 3, 0, 0x0a)]);
+    cpu.step();
+    expect(cpu.regs.getGpr(3)).toBe(42);
+  });
+
+  it("MOVZ: rd unchanged when rt!=0", () => {
+    cpu.regs.setGpr(1, 42);
+    cpu.regs.setGpr(2, 1);
+    cpu.regs.setGpr(3, 99);
+    loadProgram(cpu, [makeWord(SPECIAL, 1, 2, 3, 0, 0x0a)]);
+    cpu.step();
+    expect(cpu.regs.getGpr(3)).toBe(99);
+  });
+
+  it("MOVN: rd=rs when rt!=0", () => {
+    cpu.regs.setGpr(1, 42);
+    cpu.regs.setGpr(2, 1);
+    cpu.regs.setGpr(3, 99);
+    loadProgram(cpu, [makeWord(SPECIAL, 1, 2, 3, 0, 0x0b)]);
+    cpu.step();
+    expect(cpu.regs.getGpr(3)).toBe(42);
+  });
+
+  it("MOVN: rd unchanged when rt==0", () => {
+    cpu.regs.setGpr(1, 42);
+    cpu.regs.setGpr(2, 0);
+    cpu.regs.setGpr(3, 99);
+    loadProgram(cpu, [makeWord(SPECIAL, 1, 2, 3, 0, 0x0b)]);
+    cpu.step();
+    expect(cpu.regs.getGpr(3)).toBe(99);
+  });
+});
+
+describe("AllegrexCPU — FPU (COP1)", () => {
+  let cpu: AllegrexCPU;
+
+  beforeEach(() => {
+    cpu = new AllegrexCPU(new MemoryBus());
+  });
+
+  it("MTC1 + MFC1 round-trip", () => {
+    cpu.regs.setGpr(1, 0x40490fdb); // π as f32 bits
+    // MTC1 rt=1, fs=0 → COP1(0x11) rs=0x04, rt=1, rd=0
+    const mtc1 = ((0x11 << 26) | (0x04 << 21) | (1 << 16) | (0 << 11)) >>> 0;
+    // MFC1 rt=2, fs=0 → COP1(0x11) rs=0x00, rt=2, rd=0
+    const mfc1 = ((0x11 << 26) | (0x00 << 21) | (2 << 16) | (0 << 11)) >>> 0;
+    loadProgram(cpu, [mtc1, mfc1]);
+    cpu.step(); cpu.step();
+    expect(cpu.regs.getGpr(2)).toBe(0x40490fdb);
+  });
+
+  it("ADD.S: f2 = f0 + f1", () => {
+    cpu.regs.setFpr(0, 1.5);
+    cpu.regs.setFpr(1, 2.5);
+    // ADD.S fd=2, fs=0, ft=1 → COP1 fmt=0x10, funct=0x00
+    // encoding: 0x11<<26 | 0x10<<21 | ft<<16 | fs<<11 | fd<<6 | funct
+    const add_s = ((0x11 << 26) | (0x10 << 21) | (1 << 16) | (0 << 11) | (2 << 6) | 0x00) >>> 0;
+    loadProgram(cpu, [add_s]);
+    cpu.step();
+    expect(cpu.regs.getFpr(2)).toBeCloseTo(4.0);
+  });
+
+  it("MUL.S: f2 = f0 * f1", () => {
+    cpu.regs.setFpr(0, 3.0);
+    cpu.regs.setFpr(1, 7.0);
+    const mul_s = ((0x11 << 26) | (0x10 << 21) | (1 << 16) | (0 << 11) | (2 << 6) | 0x02) >>> 0;
+    loadProgram(cpu, [mul_s]);
+    cpu.step();
+    expect(cpu.regs.getFpr(2)).toBeCloseTo(21.0);
+  });
+
+  it("CVT.W.S truncates float to int in FPR", () => {
+    cpu.regs.setFpr(0, 3.7);
+    // CVT.W.S fd=1, fs=0 → COP1 fmt=0x10, funct=0x24
+    const cvt = ((0x11 << 26) | (0x10 << 21) | (0 << 16) | (0 << 11) | (1 << 6) | 0x24) >>> 0;
+    loadProgram(cpu, [cvt]);
+    cpu.step();
+    expect(cpu.regs.getFprBits(1)).toBe(3); // truncated to int
+  });
+
+  it("LWC1 + SWC1 round-trip", () => {
+    const addr = RAM + 100;
+    cpu.bus.writeU32(addr, 0x40490fdb); // π bits
+    cpu.regs.setGpr(1, addr);
+    // LWC1 ft=0, base=r1, offset=0 → opcode 0x31
+    const lwc1 = ((0x31 << 26) | (1 << 21) | (0 << 16) | 0) >>> 0;
+    // SWC1 ft=0, base=r1, offset=4 → opcode 0x39
+    const swc1 = ((0x39 << 26) | (1 << 21) | (0 << 16) | 4) >>> 0;
+    loadProgram(cpu, [lwc1, swc1]);
+    cpu.step(); cpu.step();
+    expect(cpu.bus.readU32(addr + 4)).toBe(0x40490fdb);
+  });
+});
+
+describe("AllegrexCPU — VFPU", () => {
+  let cpu: AllegrexCPU;
+
+  beforeEach(() => {
+    cpu = new AllegrexCPU(new MemoryBus());
+  });
+
+  it("LV.S loads float into VFPU register", () => {
+    const addr = RAM + 100;
+    // Write 42.0 as f32 bits
+    const f32buf = new Float32Array(1);
+    f32buf[0] = 42.0;
+    const bits = new Uint32Array(f32buf.buffer)[0]!;
+    cpu.bus.writeU32(addr, bits);
+    cpu.regs.setGpr(1, addr);
+    // LV.S vt=0, base=r1, offset=0 → opcode 0x32, rt=0 (vt low), bits 1:0=0 (vt high)
+    const lvs = ((0x32 << 26) | (1 << 21) | (0 << 16) | 0) >>> 0;
+    loadProgram(cpu, [lvs]);
+    cpu.step();
+    expect(cpu.regs.vfpr[0]).toBeCloseTo(42.0);
+  });
+
+  it("SV.S stores VFPU register to memory", () => {
+    const addr = RAM + 100;
+    cpu.regs.vfpr[0] = 42.0;
+    cpu.regs.setGpr(1, addr);
+    // SV.S vt=0, base=r1, offset=0 → opcode 0x3a
+    const svs = ((0x3a << 26) | (1 << 21) | (0 << 16) | 0) >>> 0;
+    loadProgram(cpu, [svs]);
+    cpu.step();
+    // Read back as float
+    const view = new DataView(new ArrayBuffer(4));
+    view.setUint32(0, cpu.bus.readU32(addr), true);
+    expect(view.getFloat32(0, true)).toBeCloseTo(42.0);
+  });
+});
+
+describe("AllegrexCPU — SPECIAL2 (CLZ, MADD)", () => {
+  let cpu: AllegrexCPU;
+
+  beforeEach(() => {
+    cpu = new AllegrexCPU(new MemoryBus());
+  });
+
+  it("CLZ: count leading zeros of 0x00FF0000 = 8", () => {
+    cpu.regs.setGpr(1, 0x00FF0000);
+    // CLZ rd=2, rs=1 → SPECIAL2(0x1c) funct=0x20
+    const clz = ((0x1c << 26) | (1 << 21) | (0 << 16) | (2 << 11) | 0x20) >>> 0;
+    loadProgram(cpu, [clz]);
+    cpu.step();
+    expect(cpu.regs.getGpr(2)).toBe(8);
+  });
+
+  it("CLZ of 0 = 32", () => {
+    cpu.regs.setGpr(1, 0);
+    const clz = ((0x1c << 26) | (1 << 21) | (0 << 16) | (2 << 11) | 0x20) >>> 0;
+    loadProgram(cpu, [clz]);
+    cpu.step();
+    expect(cpu.regs.getGpr(2)).toBe(32);
+  });
+});
+
+describe("AllegrexCPU — SPECIAL3 (EXT, INS)", () => {
+  let cpu: AllegrexCPU;
+
+  beforeEach(() => {
+    cpu = new AllegrexCPU(new MemoryBus());
+  });
+
+  it("EXT: extract bits 4-7 from 0xFF", () => {
+    cpu.regs.setGpr(1, 0xFF);
+    // EXT rt=2, rs=1, pos=4, size=4 → rd=pos+size-1=7, shamt=pos=4, funct=0x00
+    const ext = ((0x1f << 26) | (1 << 21) | (2 << 16) | (3 << 11) | (4 << 6) | 0x00) >>> 0;
+    loadProgram(cpu, [ext]);
+    cpu.step();
+    expect(cpu.regs.getGpr(2)).toBe(0x0F); // bits 4-7 of 0xFF = 0xF
+  });
+
+  it("INS: insert bits", () => {
+    cpu.regs.setGpr(1, 0xA);  // value to insert
+    cpu.regs.setGpr(2, 0xFF); // destination
+    // INS rt=2, rs=1, pos=4, size=4 → rd=pos+size-1=7, shamt=pos=4, funct=0x04
+    const ins = ((0x1f << 26) | (1 << 21) | (2 << 16) | (7 << 11) | (4 << 6) | 0x04) >>> 0;
+    loadProgram(cpu, [ins]);
+    cpu.step();
+    expect(cpu.regs.getGpr(2)).toBe(0xAF); // bits 4-7 replaced with 0xA
+  });
+});
+
 describe("AllegrexCPU — branches", () => {
   let cpu: AllegrexCPU;
 

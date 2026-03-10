@@ -62,7 +62,7 @@ export class PSPEmulator {
       }
     }
 
-    const { entryPoint, moduleStartFunc, nidBySyscall } = loadElf(data, this.bus);
+    const { entryPoint, moduleStartFunc, gp, nidBySyscall } = loadElf(data, this.bus);
     // Use module_start_func from export table if available, otherwise ELF entry
     const startAddr = moduleStartFunc ?? entryPoint;
     this.cpu.regs.pc = startAddr;
@@ -72,6 +72,7 @@ export class PSPEmulator {
     this.hle.remapSyscalls(nidBySyscall);
 
     // Set up initial register state like the PSP kernel does before entry
+    if (gp !== 0) this.cpu.regs.setGpr(28, gp); // $gp from module_info
     // SP: top of user memory (32 MB RAM ends at 0x0A000000, leave some space)
     this.cpu.regs.setGpr(29, 0x09FFF000); // $sp
 
@@ -90,10 +91,14 @@ export class PSPEmulator {
     // Register the module-return handler
     this.hle.register(SYSCALL_MODULE_RETURN, (regs) => {
       hleLog.info("module_start returned");
-      const nextEntry = this.hle.pendingThreadEntry;
-      if (nextEntry != null) {
-        hleLog.info(`Jumping to pending thread entry: 0x${nextEntry.toString(16)}`);
-        regs.pc = nextEntry;
+      const pending = this.hle.pendingThreadEntry;
+      if (pending != null) {
+        hleLog.info(`Jumping to pending thread entry: 0x${pending.entry.toString(16)} arglen=${pending.arglen}`);
+        regs.pc = pending.entry;
+        regs.setGpr(4, pending.arglen);  // $a0 = arglen
+        regs.setGpr(5, pending.argp);    // $a1 = argp
+        regs.setGpr(26, pending.k0);    // $k0 = TCB pointer
+        regs.setGpr(29, pending.sp);    // $sp = thread stack
         this.hle.pendingThreadEntry = null;
         regs.setGpr(31, TRAMPOLINE_ADDR); // return here again when thread exits
       } else {
@@ -106,6 +111,17 @@ export class PSPEmulator {
     this.cpu.regs.setGpr(31, TRAMPOLINE_ADDR); // $ra → trampoline
 
     log.info(`ELF loaded, entry=0x${entryPoint.toString(16)}, module_start=0x${startAddr.toString(16)}, SP=0x09FFF000, RA=0x${TRAMPOLINE_ADDR.toString(16)}`);
+  }
+
+  /** Run one frame: execute steps then trigger VBlank to wake waiting threads. */
+  runFrame(stepsPerFrame: number): void {
+    this.cpu.run(stepsPerFrame);
+    if (this.cpu.stepFaulted) {
+      this.halted = true;
+      return;
+    }
+    // Trigger VBlank — wakes threads waiting on sceDisplayWaitVblankStart
+    this.hle.onVblank(this.cpu.regs);
   }
 
   run(maxSteps?: number): void {

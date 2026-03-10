@@ -100,7 +100,7 @@ function teardownGameplay(): void {
   window.removeEventListener("keydown", onHudToggle);
 }
 
-const STEPS_PER_FRAME = 2000;
+const STEPS_PER_FRAME = 500_000;
 
 function startRafLoop(): void {
   if (rafHandle !== 0) return;
@@ -109,7 +109,7 @@ function startRafLoop(): void {
     if (!emulator) return;
 
     try {
-      emulator.run(STEPS_PER_FRAME);
+      emulator.runFrame(STEPS_PER_FRAME);
     } catch (err) {
       stopRafLoop();
       showError(`CPU error: ${String(err)}`);

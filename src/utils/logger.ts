@@ -31,7 +31,7 @@ const instances = new Map<string, Logger>();
 let colorIdx = 0;
 
 export class Logger {
-  static minLevel: LogLevel = "debug";
+  static minLevel: LogLevel = "info";
 
   private readonly color: string;
 
