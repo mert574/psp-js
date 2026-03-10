@@ -3,6 +3,9 @@ import { MemoryBus } from "../memory/memory-bus.js";
 import { decodeInstruction } from "./decoder.js";
 import { executeInstruction } from "./executor.js";
 import type { HLEKernel } from "../kernel/hle-kernel.js";
+import { Logger } from "../utils/logger.js";
+
+const log = Logger.get("CPU");
 
 /**
  * AllegrexCPU
@@ -54,7 +57,7 @@ export class AllegrexCPU {
       this.hle.pendingThreadEntry = null;
       this.regs.pc = entry;
       this.regs.setGpr(31, 0); // $ra = 0 for the thread
-      console.log(`[CPU] Starting thread at 0x${entry.toString(16)}`);
+      log.info(`Starting thread at 0x${entry.toString(16)}`);
       return true;
     }
 
@@ -67,8 +70,8 @@ export class AllegrexCPU {
       for (let i = Math.max(0, this.traceIdx - 16); i < this.traceIdx; i++) {
         trace.push('0x' + this.traceBuffer[i & 15]!.toString(16));
       }
-      console.error(`[CPU] Fetch fault at PC=0x${pc.toString(16)}: ${e}`);
-      console.error(`[CPU] Recent PCs: ${trace.join(' → ')}`);
+      log.error(`Fetch fault at PC=0x${pc.toString(16)}: ${e}`);
+      log.error(`Recent PCs: ${trace.join(' → ')}`);
       this.stepFaulted = true;
       return false;
     }
@@ -89,11 +92,11 @@ export class AllegrexCPU {
           this.hle.dispatch(e.code, this.regs);
           if (this.stepFaulted) return false;
         } else {
-          console.warn(`[CPU] SYSCALL 0x${e.code.toString(16)} with no HLE kernel attached`);
+          log.warn(`SYSCALL 0x${e.code.toString(16)} with no HLE kernel attached`);
           this.regs.setGpr(2, 0x80020001);
         }
       } else {
-        console.error(`[CPU] Execute fault at PC=0x${pc.toString(16)}: ${e}`);
+        log.error(`Execute fault at PC=0x${pc.toString(16)}: ${e}`);
         this.stepFaulted = true;
         return false;
       }

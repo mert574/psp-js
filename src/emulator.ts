@@ -4,6 +4,10 @@ import { HLEKernel } from "./kernel/hle-kernel.js";
 import { loadElf } from "./loader/elf.js";
 import { isPbp, parsePbp } from "./loader/pbp.js";
 import { pspDecryptPRX } from "./loader/prx-decrypter.js";
+import { Logger } from "./utils/logger.js";
+
+const log = Logger.get("EMU");
+const hleLog = Logger.get("HLE");
 
 const MAGIC_ELF     = 0x7f454c46; // "\x7fELF" big-endian
 const MAGIC_PSP_ENC = 0x7e505350; // "~PSP"   big-endian — Kirk-encrypted
@@ -37,7 +41,7 @@ export class PSPEmulator {
     // Unwrap PBP container if needed (homebrew format)
     if (isPbp(data)) {
       const pbp = parsePbp(data);
-      console.log(`[EMU] PBP detected, extracting data.psp (${pbp.dataPsp.byteLength} bytes)`);
+      log.info(`PBP detected, extracting data.psp (${pbp.dataPsp.byteLength} bytes)`);
       data = pbp.dataPsp;
     }
 
@@ -46,20 +50,22 @@ export class PSPEmulator {
       const view = new DataView(data.buffer, data.byteOffset, 4);
       const magic = view.getUint32(0, false);
       if (magic === MAGIC_PSP_ENC) {
-        console.log(`[EMU] Encrypted PRX detected (~PSP magic), attempting decryption...`);
+        log.info(`Encrypted PRX detected (~PSP magic), attempting decryption...`);
         const decrypted = await pspDecryptPRX(data);
         if (!decrypted) {
           throw new Error(
             "Failed to decrypt PSP executable. The encryption tag may not be supported."
           );
         }
-        console.log(`[EMU] PRX decrypted successfully (${decrypted.byteLength} bytes)`);
+        log.info(`PRX decrypted successfully (${decrypted.byteLength} bytes)`);
         data = decrypted;
       }
     }
 
-    const { entryPoint, nidBySyscall } = loadElf(data, this.bus);
-    this.cpu.regs.pc = entryPoint;
+    const { entryPoint, moduleStartFunc, nidBySyscall } = loadElf(data, this.bus);
+    // Use module_start_func from export table if available, otherwise ELF entry
+    const startAddr = moduleStartFunc ?? entryPoint;
+    this.cpu.regs.pc = startAddr;
 
     // Wire up HLE handlers: re-register each NID handler under the syscall
     // code that the import stub patcher assigned.
@@ -83,15 +89,15 @@ export class PSPEmulator {
 
     // Register the module-return handler
     this.hle.register(SYSCALL_MODULE_RETURN, (regs) => {
-      console.log("[HLE] module_start returned");
+      hleLog.info("module_start returned");
       const nextEntry = this.hle.pendingThreadEntry;
       if (nextEntry != null) {
-        console.log(`[HLE] Jumping to pending thread entry: 0x${nextEntry.toString(16)}`);
+        hleLog.info(`Jumping to pending thread entry: 0x${nextEntry.toString(16)}`);
         regs.pc = nextEntry;
         this.hle.pendingThreadEntry = null;
         regs.setGpr(31, TRAMPOLINE_ADDR); // return here again when thread exits
       } else {
-        console.log("[HLE] No pending threads — halting.");
+        hleLog.info("No pending threads — halting.");
         this.halted = true;
         this.cpu.stepFaulted = true; // stop the CPU run loop immediately
       }
@@ -99,7 +105,7 @@ export class PSPEmulator {
 
     this.cpu.regs.setGpr(31, TRAMPOLINE_ADDR); // $ra → trampoline
 
-    console.log(`[EMU] ELF loaded, entry point: 0x${entryPoint.toString(16)}, SP=0x09FFF000, RA=0x${TRAMPOLINE_ADDR.toString(16)}`);
+    log.info(`ELF loaded, entry=0x${entryPoint.toString(16)}, module_start=0x${startAddr.toString(16)}, SP=0x09FFF000, RA=0x${TRAMPOLINE_ADDR.toString(16)}`);
   }
 
   run(maxSteps?: number): void {

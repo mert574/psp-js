@@ -1,5 +1,9 @@
 import type { MemoryBus } from "../memory/memory-bus.js";
 import type { AllegrexRegisters } from "../cpu/registers.js";
+import { Logger } from "../utils/logger.js";
+
+const log = Logger.get("HLE");
+const pspLog = Logger.get("PSP");
 
 /**
  * HLEKernel
@@ -46,6 +50,11 @@ export class HLEKernel {
   /** Thread entry to jump to after module_start returns */
   pendingThreadEntry: number | null = null;
 
+  /** Simple bump allocator for sceKernelAllocPartitionMemory */
+  private nextAllocAddr = 0x09000000; // start well above typical PRX load area (0x08804000+)
+  private readonly memBlocks = new Map<number, { addr: number; size: number; name: string }>();
+  private nextBlockId = 0x100;
+
   inputSnapshot: (() => InputSnapshot) | null = null;
   framebufAddr:   number = 0;
   framebufWidth:  number = 512;
@@ -87,7 +96,7 @@ export class HLEKernel {
     }
     // Store reverse map for debug logging
     this.syscallToNid = new Map(nidBySyscall);
-    console.log(`[HLE] Remapped ${mapped} syscalls (${unmapped} unimplemented NIDs)`);
+    log.info(`Remapped ${mapped} syscalls (${unmapped} unimplemented NIDs)`);
   }
 
   /** Dispatch a syscall. The syscall code is the lower 20 bits of the SYSCALL instruction. */
@@ -96,7 +105,7 @@ export class HLEKernel {
     if (!handler) {
       const nid = this.syscallToNid.get(syscallCode);
       const nidStr = nid != null ? `NID=0x${nid.toString(16).padStart(8, "0")}` : "unknown";
-      console.warn(`[HLE] Unimplemented syscall 0x${syscallCode.toString(16).padStart(5, "0")} (${nidStr})`);
+      log.warn(`Unimplemented syscall 0x${syscallCode.toString(16).padStart(5, "0")} (${nidStr})`);
       regs.setGpr(2, 0); // return success to avoid game bail-out
       return;
     }
@@ -107,6 +116,8 @@ export class HLEKernel {
 
   private registerBuiltins(): void {
     this.registerThreadManagement();
+    this.registerMemory();
+    this.registerSysMemStubs();
     this.registerDisplay();
     this.registerController();
     this.registerIo();
@@ -118,7 +129,7 @@ export class HLEKernel {
   private registerThreadManagement(): void {
     // sceKernelExitGame — terminate the program cleanly
     this.register(0x05572a5f, (regs) => {
-      console.log("[HLE] sceKernelExitGame");
+      log.info("sceKernelExitGame");
       // Signal the emulator to stop by pointing PC somewhere invalid.
       // The CPU's step() will catch the memory fault and halt.
       regs.pc = 0xdeadbeef;
@@ -136,12 +147,12 @@ export class HLEKernel {
     });
 
     // sceKernelCreateThread(name, entry, priority, stackSize, attr, option)
-    this.register(0xc9b4595c, (regs) => {
+    this.register(0x446d8de6, (regs) => {
       const entry = regs.getGpr(5); // $a1 = entry point
       const stackSize = regs.getGpr(7); // $a3 = stack size
       const tid = this.nextThreadId++;
       this.threads.set(tid, { entry, stackSize });
-      console.log(`[HLE] sceKernelCreateThread(entry=0x${entry.toString(16)}, stack=${stackSize}) → tid=${tid}`);
+      log.info(`sceKernelCreateThread(entry=0x${entry.toString(16)}, stack=${stackSize}) → tid=${tid}`);
       regs.setGpr(2, tid);
     });
 
@@ -150,7 +161,7 @@ export class HLEKernel {
       const thid = regs.getGpr(4); // $a0 = thread ID
       const thread = this.threads.get(thid);
       if (thread) {
-        console.log(`[HLE] sceKernelStartThread(tid=${thid}) → entry=0x${thread.entry.toString(16)}`);
+        log.info(`sceKernelStartThread(tid=${thid}) → entry=0x${thread.entry.toString(16)}`);
         this.pendingThreadEntry = thread.entry;
       }
       regs.setGpr(2, 0);
@@ -163,6 +174,94 @@ export class HLEKernel {
     });
   }
 
+  // ── SysMemUserForUser (memory management) ──────────────────────────────
+
+  private registerMemory(): void {
+    // sceKernelAllocPartitionMemory(partition, name, type, size, addr)
+    // Returns a block UID
+    this.register(0x237dbd4f, (regs, bus) => {
+      const partition = regs.getGpr(4);
+      const namePtr   = regs.getGpr(5);
+      const allocType = regs.getGpr(6);
+      const size      = regs.getGpr(7);
+
+      // Read name string
+      let name = "";
+      if (namePtr !== 0) {
+        for (let i = 0; i < 32; i++) {
+          const b = bus.readU8(namePtr + i);
+          if (b === 0) break;
+          name += String.fromCharCode(b);
+        }
+      }
+
+      // Simple bump allocator — align to 256 bytes
+      const aligned = (this.nextAllocAddr + 0xFF) & ~0xFF;
+      const blockId = this.nextBlockId++;
+      this.memBlocks.set(blockId, { addr: aligned, size, name });
+      this.nextAllocAddr = aligned + size;
+
+      log.debug(`sceKernelAllocPartitionMemory(part=${partition}, "${name}", type=${allocType}, size=${size}) → uid=${blockId} addr=0x${aligned.toString(16)}`);
+      regs.setGpr(2, blockId);
+    });
+
+    // sceKernelGetBlockHeadAddr(blockid) → address
+    this.register(0x9d9a5ba1, (regs) => {
+      const blockId = regs.getGpr(4);
+      const block = this.memBlocks.get(blockId);
+      const addr = block ? block.addr : 0;
+      log.debug(`sceKernelGetBlockHeadAddr(${blockId}) → 0x${addr.toString(16)}`);
+      regs.setGpr(2, addr);
+    });
+
+    // sceKernelFreePartitionMemory(blockid)
+    this.register(0xb6d61d02, (regs) => {
+      const blockId = regs.getGpr(4);
+      this.memBlocks.delete(blockId);
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelMaxFreeMemSize() — return a generous amount
+    this.register(0xa291f107, (regs) => {
+      regs.setGpr(2, 24 * 1024 * 1024); // 24 MB free
+    });
+
+    // sceKernelTotalFreeMemSize()
+    this.register(0xf919f628, (regs) => {
+      regs.setGpr(2, 24 * 1024 * 1024);
+    });
+
+    // sceKernelDcacheWritebackAll — no-op (no cache simulation)
+    this.register(0x79d1c3fa, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelDcacheWritebackInvalidateAll — no-op
+    this.register(0xb435dec5, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelDcacheWritebackRange — no-op
+    this.register(0x3ee30821, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelDcacheWritebackInvalidateRange — no-op
+    this.register(0x34b9fa9e, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelIcacheInvalidateAll — no-op
+    this.register(0x920f104a, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelIcacheInvalidateRange — no-op
+    this.register(0xc2df770e, (regs) => {
+      regs.setGpr(2, 0);
+    });
+  }
+
   // ── sceDisplay ───────────────────────────────────────────────────────────
 
   private registerDisplay(): void {
@@ -171,7 +270,7 @@ export class HLEKernel {
       const mode   = regs.getGpr(4);
       const width  = regs.getGpr(5);
       const height = regs.getGpr(6);
-      console.log(`[HLE] sceDisplaySetMode(${mode}, ${width}, ${height})`);
+      log.info(`sceDisplaySetMode(${mode}, ${width}, ${height})`);
       regs.setGpr(2, 0);
     });
 
@@ -180,7 +279,7 @@ export class HLEKernel {
       this.framebufAddr   = regs.getGpr(4);
       this.framebufWidth  = regs.getGpr(5);
       this.framebufFormat = regs.getGpr(6);
-      console.log(`[HLE] sceDisplaySetFrameBuf(0x${this.framebufAddr.toString(16)}, ${this.framebufWidth}, ${this.framebufFormat})`);
+      log.info(`sceDisplaySetFrameBuf(0x${this.framebufAddr.toString(16)}, ${this.framebufWidth}, ${this.framebufFormat})`);
       regs.setGpr(2, 0);
     });
 
@@ -231,7 +330,7 @@ export class HLEKernel {
         const bytes: number[] = [];
         for (let i = 0; i < size; i++) bytes.push(bus.readU8(data + i));
         const text = new TextDecoder().decode(new Uint8Array(bytes));
-        console.log(`[PSP stdout] ${text.replace(/\n$/, "")}`);
+        pspLog.info(`${text.replace(/\n$/, "")}`);
       }
       regs.setGpr(2, size);
     });
@@ -239,9 +338,32 @@ export class HLEKernel {
 
   // ── sceUtils / sceMisc ───────────────────────────────────────────────────
 
+  // ── SysMemForKernel (SDK version stubs) ─────────────────────────────────
+
+  private registerSysMemStubs(): void {
+    // sceKernelSetCompiledSdkVersion603_605 — just stores SDK version
+    this.register(0x1b4217bc, (regs) => {
+      log.debug(`sceKernelSetCompiledSdkVersion(0x${regs.getGpr(4).toString(16)})`);
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelSetCompilerVersion
+    this.register(0xf77d77cb, (regs) => {
+      log.debug(`sceKernelSetCompilerVersion(0x${regs.getGpr(4).toString(16)})`);
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelDevkitVersion — return a recent firmware version
+    this.register(0x3fc9ae6a, (regs) => {
+      regs.setGpr(2, 0x06060010); // 6.60
+    });
+  }
+
+  // ── sceUtils / sceMisc ───────────────────────────────────────────────────
+
   private registerUtils(): void {
     // sceKernelPrintf — variadic, just log as best we can
-    this.register(0x7c5be7cb, (regs, bus) => {
+    this.register(0x13a5abef, (regs, bus) => {
       const fmtPtr = regs.getGpr(4);
       let fmt = "";
       let i = 0;
@@ -250,7 +372,140 @@ export class HLEKernel {
         if (b === 0) break;
         fmt += String.fromCharCode(b);
       }
-      console.log(`[PSP] ${fmt.replace(/\n$/, "")}`);
+      pspLog.info(`${fmt.replace(/\n$/, "")}`);
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelGetSystemTimeWide() → i64 microseconds in v0/v1
+    this.register(0x82bc5777, (regs) => {
+      const us = BigInt(Date.now()) * 1000n;
+      regs.setGpr(2, Number(us & 0xFFFFFFFFn));        // v0 = low 32
+      regs.setGpr(3, Number((us >> 32n) & 0xFFFFFFFFn)); // v1 = high 32
+    });
+
+    // sceKernelGetSystemTimeLow() → u32 low microseconds
+    this.register(0x369ed59d, (regs) => {
+      regs.setGpr(2, (Date.now() * 1000) >>> 0);
+    });
+
+    // sceKernelReferThreadStatus(thid, status_ptr) — stub
+    this.register(0x17c1684e, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelGetThreadId() → current thread ID
+    this.register(0x293b45b8, (regs) => {
+      regs.setGpr(2, 1); // always thread 1
+    });
+
+    // sceKernelCheckThreadStack() — return plenty of stack
+    this.register(0xd13bde95, (regs) => {
+      regs.setGpr(2, 0x4000); // 16KB free
+    });
+
+    // sceKernelLoadModule — stub, return fake module ID
+    this.register(0x977de386, (regs) => {
+      log.debug("sceKernelLoadModule (stub)");
+      regs.setGpr(2, 0x80); // fake module ID
+    });
+
+    // sceKernelStartModule — stub
+    this.register(0x50f0c1ec, (regs) => {
+      log.debug("sceKernelStartModule (stub)");
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelStopModule — stub
+    this.register(0xd1ff982a, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelUnloadModule — stub
+    this.register(0x2e0911aa, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelDelayThreadCB(usec) — same as DelayThread but with callbacks
+    this.register(0x68da9e36, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelSleepThreadCB
+    this.register(0x82826f70, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelCreateSema(name, attr, initVal, maxVal, option)
+    this.register(0xd6da4ba1, (regs) => {
+      const sid = this.nextBlockId++;
+      log.debug(`sceKernelCreateSema → ${sid}`);
+      regs.setGpr(2, sid);
+    });
+
+    // sceKernelDeleteSema
+    this.register(0x28b6489c, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelSignalSema
+    this.register(0x3f53e640, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelWaitSema
+    this.register(0x4e3a1105, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelWaitSemaCB
+    this.register(0x6d212bac, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelCreateEventFlag(name, attr, bits, option)
+    this.register(0x55c20a00, (regs) => {
+      const eid = this.nextBlockId++;
+      regs.setGpr(2, eid);
+    });
+
+    // sceKernelSetEventFlag
+    this.register(0x1fb15a32, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelWaitEventFlag
+    this.register(0x402fcf22, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelWaitEventFlagCB
+    this.register(0x328c546f, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelDeleteEventFlag
+    this.register(0xef9e4c70, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelCreateMutex
+    this.register(0xb7d098c6, (regs) => {
+      const mid = this.nextBlockId++;
+      regs.setGpr(2, mid);
+    });
+
+    // sceKernelLockMutex
+    this.register(0xb011b11f, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelUnlockMutex
+    this.register(0x6b30100f, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelDeleteMutex
+    this.register(0xf8170fbe, (regs) => {
       regs.setGpr(2, 0);
     });
   }

@@ -1,4 +1,7 @@
 import { MemoryBus } from "../memory/memory-bus.js";
+import { Logger } from "../utils/logger.js";
+
+const log = Logger.get("ELF");
 
 /**
  * Minimal ELF loader for 32-bit little-endian MIPS binaries (PSP executables).
@@ -48,8 +51,15 @@ const R_MIPS_LO16    = 6;
 const MIPS_JR_RA   = 0x03e00008; // jr $ra
 const MIPS_SYSCALL = 0x0000000c; // syscall (code in bits 25:6)
 
+// Well-known export NIDs
+const NID_MODULE_START = 0xD632ACDB;
+const NID_MODULE_STOP  = 0xCEE8593C;
+const NID_MODULE_START_THREAD_PARAM = 0x0F7C276C;
+
 export interface LoadResult {
   entryPoint: number;
+  /** module_start_func from export table (may differ from ELF entry) */
+  moduleStartFunc: number | null;
   /** Map from syscall code → NID, for wiring up HLE handlers */
   nidBySyscall: Map<number, number>;
 }
@@ -79,13 +89,13 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
   const isPrx = eType === ET_PRX;
   const baseAddr = isPrx ? PRX_BASE : 0;
 
-  console.log(`[ELF] type=0x${eType.toString(16)} entry=0x${entryPoint.toString(16)} phoff=${phoff} phnum=${phnum} shoff=${shoff} shnum=${shnum} shentsize=${shentsize} isPrx=${isPrx}`);
+  log.debug(`type=0x${eType.toString(16)} entry=0x${entryPoint.toString(16)} phoff=${phoff} phnum=${phnum} shoff=${shoff} shnum=${shnum} shentsize=${shentsize} isPrx=${isPrx}`);
   if (isPrx && shoff !== 0) {
     const shTypes = [];
     for (let s = 0; s < Math.min(shnum, 10); s++) {
       shTypes.push('0x' + view.getUint32(shoff + s * shentsize + 0x04, le).toString(16));
     }
-    console.log(`[ELF] first section types: ${shTypes.join(', ')}${shnum > 10 ? '...' : ''}`);
+    log.debug(`first section types: ${shTypes.join(', ')}${shnum > 10 ? '...' : ''}`);
   }
 
   // Collect segment load addresses for relocation
@@ -134,14 +144,14 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
     // pPaddr is a file offset; subtract segment file offset to get offset within segment
     const modinfoAddr = ((baseAddr + pVaddr0 + (pPaddr & 0x7FFFFFFF) - pOffset0) >>> 0);
 
-    console.log(`[ELF] module_info: pPaddr=0x${pPaddr.toString(16)} modinfoAddr=0x${modinfoAddr.toString(16)}`);
+    log.debug(`module_info: pPaddr=0x${pPaddr.toString(16)} modinfoAddr=0x${modinfoAddr.toString(16)}`);
 
     // Dump raw bytes at modinfoAddr for debugging
     const rawDump: string[] = [];
     for (let i = 0; i < 0x34; i += 4) {
       rawDump.push(`+0x${i.toString(16)}=0x${bus.readU32(modinfoAddr + i).toString(16)}`);
     }
-    console.log(`[ELF] module_info raw: ${rawDump.join(' ')}`);
+    log.debug(`module_info raw: ${rawDump.join(' ')}`);
 
     // PspModuleInfo layout:
     //   0x00: moduleAttrs (u16)
@@ -152,6 +162,8 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
     //   0x28: libentend (u32)
     //   0x2C: libstub (u32)
     //   0x30: libstubend (u32)
+    const libent     = bus.readU32(modinfoAddr + 0x24);
+    const libentend  = bus.readU32(modinfoAddr + 0x28);
     const libstub    = bus.readU32(modinfoAddr + 0x2C);
     const libstubend = bus.readU32(modinfoAddr + 0x30);
 
@@ -162,19 +174,76 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
       if (b === 0) break;
       modName += String.fromCharCode(b);
     }
-    console.log(`[ELF] module="${modName}" libstub=0x${libstub.toString(16)} libstubend=0x${libstubend.toString(16)}`);
+    log.info(`module="${modName}" libent=0x${libent.toString(16)}-0x${libentend.toString(16)} libstub=0x${libstub.toString(16)}-0x${libstubend.toString(16)}`);
 
     // Store debug info globally for inspection
-    (globalThis as any).__elfDebug = { modinfoAddr, pPaddr, pVaddr0, pOffset0, libstub, libstubend, modName };
+    (globalThis as any).__elfDebug = { modinfoAddr, pPaddr, pVaddr0, pOffset0, libent, libentend, libstub, libstubend, modName };
+
+    // Parse export table to find module_start_func
+    let moduleStartFunc: number | null = null;
+    if (libent !== 0 && libentend > libent) {
+      moduleStartFunc = parseExportTable(bus, libent, libentend);
+    }
 
     if (libstub !== 0 && libstubend > libstub) {
       patchImportStubs(bus, libstub, libstubend, nidBySyscall);
     } else {
-      console.warn(`[ELF] No import stubs found (libstub=0x${libstub.toString(16)} libstubend=0x${libstubend.toString(16)})`);
+      log.warn(`No import stubs found (libstub=0x${libstub.toString(16)} libstubend=0x${libstubend.toString(16)})`);
     }
+
+    const elfEntry = (entryPoint + baseAddr) >>> 0;
+    if (moduleStartFunc != null && moduleStartFunc !== elfEntry) {
+      log.debug(`module_start_func=0x${moduleStartFunc.toString(16)} differs from ELF entry=0x${elfEntry.toString(16)}`);
+    }
+
+    return { entryPoint: elfEntry, moduleStartFunc, nidBySyscall };
   }
 
-  return { entryPoint: (entryPoint + baseAddr) >>> 0, nidBySyscall };
+  return { entryPoint: (entryPoint + baseAddr) >>> 0, moduleStartFunc: null, nidBySyscall };
+}
+
+/**
+ * Parse PspLibEntEntry tables (module exports) and find module_start_func.
+ *
+ * PspLibEntEntry layout (from PPSSPP):
+ *   0x00: name       (u32) — pointer to module name string (0 = own module)
+ *   0x04: version    (u16)
+ *   0x06: flags      (u16)
+ *   0x08: size       (u8)  — entry size in u32 units
+ *   0x09: vcount     (u8)  — variable export count
+ *   0x0A: fcount     (u16) — function export count
+ *   0x0C: resident   (u32) — pointer to NIDs array followed by addresses array
+ *
+ * Resident layout: [NID_func0..NID_funcN, NID_var0..NID_varM, ADDR_func0..ADDR_funcN, ADDR_var0..ADDR_varM]
+ */
+function parseExportTable(bus: MemoryBus, libent: number, libentend: number): number | null {
+  let pos = libent;
+  let moduleStartFunc: number | null = null;
+
+  while (pos < libentend) {
+    const sizeU32  = bus.readU8(pos + 0x08);
+    if (sizeU32 === 0) break;
+
+    const vcount   = bus.readU8(pos + 0x09);
+    const fcount   = bus.readU16(pos + 0x0A);
+    const resident = bus.readU32(pos + 0x0C);
+
+    if (resident !== 0 && fcount > 0) {
+      const exportPtr = resident + (fcount + vcount) * 4; // addresses start after NIDs
+      for (let j = 0; j < fcount; j++) {
+        const nid  = bus.readU32(resident + j * 4);
+        const addr = bus.readU32(exportPtr + j * 4);
+        if (nid === NID_MODULE_START) {
+          moduleStartFunc = addr;
+          log.info(`Found module_start export: 0x${addr.toString(16)}`);
+        }
+      }
+    }
+
+    pos += sizeU32 * 4;
+  }
+
+  return moduleStartFunc;
 }
 
 /**
@@ -223,7 +292,7 @@ function patchImportStubs(
       }
     }
 
-    console.log(`[ELF] Import lib="${libName}" funcs=${numFuncs} nidData=0x${nidData.toString(16)} stubs=0x${stubAddr.toString(16)}`);
+    log.debug(`Import lib="${libName}" funcs=${numFuncs} nidData=0x${nidData.toString(16)} stubs=0x${stubAddr.toString(16)}`);
 
     // Patch each function stub
     for (let i = 0; i < numFuncs; i++) {
@@ -242,7 +311,7 @@ function patchImportStubs(
     pos += sizeU32 * 4; // size is in u32 units
   }
 
-  console.log(`[ELF] Patched ${totalPatched} import stubs (${nextSyscallCode - 1} syscall codes assigned)`);
+  log.info(`Patched ${totalPatched} import stubs (${nextSyscallCode - 1} syscall codes assigned)`);
 }
 
 /**
@@ -271,7 +340,7 @@ function applyRelocations(
     const relOffset = view.getUint32(sh + 0x10, le);
     const relSize   = view.getUint32(sh + 0x14, le);
     const relEntsize = view.getUint32(sh + 0x24, le) || 8; // default 8 for 32-bit REL
-    console.log(`[ELF] REL section #${relSectionCount}: offset=${relOffset} size=${relSize} entsize=${relEntsize} numRels=${relSize / relEntsize}`);
+    log.debug(`REL section #${relSectionCount}: offset=${relOffset} size=${relSize} entsize=${relEntsize} numRels=${relSize / relEntsize}`);
     const numRels = relSize / relEntsize;
 
     for (let r = 0; r < numRels; r++) {
@@ -337,5 +406,5 @@ function applyRelocations(
     }
   }
 
-  console.log(`[ELF] Found ${relSectionCount} REL sections, applied ${relocCount} relocations`);
+  log.info(`Found ${relSectionCount} REL sections, applied ${relocCount} relocations`);
 }

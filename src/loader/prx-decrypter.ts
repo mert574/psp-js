@@ -2,6 +2,9 @@
 // PSP PRX decryption implementation
 
 import { kirk7, kirkCMD1 } from "./kirk.js";
+import { Logger } from "../utils/logger.js";
+
+const log = Logger.get("PRX");
 
 function readU32LE(buf: Uint8Array, off: number): number {
   return (buf[off]! | (buf[off+1]! << 8) | (buf[off+2]! << 16) | (buf[off+3]! << 24)) >>> 0;
@@ -672,14 +675,14 @@ async function pspDecryptType0(inbuf: Uint8Array, size: number): Promise<number>
 
   // SHA1 verification
   const shaData = concatBytes(xorbuf.slice(0, 0x14), type0.unused, type0.kirkBlock, type0.prxHeader);
-  console.log(`[PRX:type0] shaData length=${shaData.length} (expect 0x14C=${0x14C})`);
-  console.log(`[PRX:type0] xorbuf[0:20]=${Array.from(xorbuf.slice(0,20)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type0] unused[0:8]=${Array.from(type0.unused.slice(0,8)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type0] kirkBlock[0:16]=${Array.from(type0.kirkBlock.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type0] prxHeader[0:16]=${Array.from(type0.prxHeader.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type0: shaData length=${shaData.length} (expect 0x14C=${0x14C})`);
+  log.debug(`type0: xorbuf[0:20]=${Array.from(xorbuf.slice(0,20)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type0: unused[0:8]=${Array.from(type0.unused.slice(0,8)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type0: kirkBlock[0:16]=${Array.from(type0.kirkBlock.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type0: prxHeader[0:16]=${Array.from(type0.prxHeader.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
   const computedSha1 = await sha1(shaData);
-  console.log(`[PRX:type0] computed SHA1=${Array.from(computedSha1).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type0] expected SHA1=${Array.from(type0.sha1Hash).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type0: computed SHA1=${Array.from(computedSha1).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type0: expected SHA1=${Array.from(type0.sha1Hash).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
   if (!arraysEqual(computedSha1, type0.sha1Hash)) return -3;
 
   // Build kirk CMD1 buffer
@@ -756,11 +759,11 @@ async function pspDecryptType1(inbuf: Uint8Array, size: number): Promise<number>
   const ds = readU32LE(kirkInput, 0x70);
   const doff = readU32LE(kirkInput, 0x74);
   const mode = readU32LE(kirkInput, 0x60);
-  console.log(`[PRX:type1] mode=${mode} data_size=${ds} data_offset=${doff} kirkInput.len=${kirkInput.length}`);
-  console.log(`[PRX:type1] kirk header[0:16]=${Array.from(kirkInput.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type1] kirk header[0x20:0x30]=${Array.from(kirkInput.slice(0x20,0x30)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type1] kirk header[0x30:0x40]=${Array.from(kirkInput.slice(0x30,0x40)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type1] kirk header[0x60:0x80]=${Array.from(kirkInput.slice(0x60,0x80)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type1: mode=${mode} data_size=${ds} data_offset=${doff} kirkInput.len=${kirkInput.length}`);
+  log.debug(`type1: kirk header[0:16]=${Array.from(kirkInput.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type1: kirk header[0x20:0x30]=${Array.from(kirkInput.slice(0x20,0x30)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type1: kirk header[0x30:0x40]=${Array.from(kirkInput.slice(0x30,0x40)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type1: kirk header[0x60:0x80]=${Array.from(kirkInput.slice(0x60,0x80)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
   const decrypted = await kirkCMD1(kirkInput);
   if (!decrypted) return -4;
 
@@ -817,13 +820,13 @@ async function pspDecryptType2(inbuf: Uint8Array, size: number): Promise<number>
   outbuf.set(header, offset);
 
   const kirkInput = outbuf.slice(offset, size);
-  console.log(`[PRX:type2] kirkInput offset=${offset} len=${kirkInput.length}`);
-  console.log(`[PRX:type2] header[0:16]=${Array.from(header.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type2] header[0x10:0x20]=${Array.from(header.slice(0x10,0x20)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type2] header[0x20:0x30]=${Array.from(header.slice(0x20,0x30)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type2] header[0x30:0x40]=${Array.from(header.slice(0x30,0x40)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type2] header[0x60:0x70]=${Array.from(header.slice(0x60,0x70)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
-  console.log(`[PRX:type2] header[0x70:0x80]=${Array.from(header.slice(0x70,0x80)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type2: kirkInput offset=${offset} len=${kirkInput.length}`);
+  log.debug(`type2: header[0:16]=${Array.from(header.slice(0,16)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type2: header[0x10:0x20]=${Array.from(header.slice(0x10,0x20)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type2: header[0x20:0x30]=${Array.from(header.slice(0x20,0x30)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type2: header[0x30:0x40]=${Array.from(header.slice(0x30,0x40)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type2: header[0x60:0x70]=${Array.from(header.slice(0x60,0x70)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
+  log.debug(`type2: header[0x70:0x80]=${Array.from(header.slice(0x70,0x80)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`);
   const decrypted = await kirkCMD1(kirkInput);
   if (!decrypted) return -4;
 
@@ -957,7 +960,7 @@ export async function pspDecryptPRX(inbuf: Uint8Array, seed?: Uint8Array): Promi
 
   const tag = readU32LE(inbuf, 0xD0);
   const decryptSize = readU32LE(inbuf, 0xB0);
-  console.log(`[PRX] tag=0x${tag.toString(16).padStart(8,'0')} decryptSize=${decryptSize} totalSize=${size}`);
+  log.debug(`tag=0x${tag.toString(16).padStart(8,'0')} decryptSize=${decryptSize} totalSize=${size}`);
 
   const types = [
     ["type0", () => pspDecryptType0(inbuf, size)] as const,
@@ -971,15 +974,15 @@ export async function pspDecryptPRX(inbuf: Uint8Array, seed?: Uint8Array): Promi
     try {
       const res = await fn();
       if (res >= 0) {
-        console.log(`[PRX] ${name} succeeded, decrypted ${res} bytes`);
+        log.debug(`${name} succeeded, decrypted ${res} bytes`);
         return inbuf.slice(0, res);
       }
-      console.log(`[PRX] ${name} returned ${res} (no match)`);
+      log.debug(`${name} returned ${res} (no match)`);
     } catch (err) {
-      console.log(`[PRX] ${name} threw: ${err}`);
+      log.debug(`${name} threw: ${err}`);
     }
   }
 
-  console.warn(`[PRX] All decrypt types failed for tag 0x${tag.toString(16).padStart(8,'0')}`);
+  log.warn(`All decrypt types failed for tag 0x${tag.toString(16).padStart(8,'0')}`);
   return null;
 }

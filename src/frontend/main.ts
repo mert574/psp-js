@@ -1,10 +1,13 @@
 import "./style.css";
+import { Logger } from "../utils/logger.js";
 import { parseIso, readFile } from "../iso/iso9660.js";
 import { parseSfo, extractGameInfo } from "../iso/sfo.js";
 import { setStatus, showError, clearError, showGameView, showDropZone, showFileTree, clearGameVideo, clearGameAudio, playGameAudio, showAudioLoading, showAudioError, setMediaLoading, setGameVideo, unlockAudio, showGameplayView, exitGameplayView, toggleGameplayHud } from "./ui.js";
 import { InputHandler } from "./input.js";
 import { transcodepmf, transcodeAt3 } from "./pmf.js";
 import { PSPEmulator } from "../emulator.js";
+
+const log = Logger.get("MAIN");
 
 const dropZone   = document.getElementById("drop-zone")   as HTMLElement;
 const fileInput  = document.getElementById("file-input")  as HTMLInputElement;
@@ -180,9 +183,9 @@ async function handleFile(file: File): Promise<void> {
     if (ebootEntry) {
       try {
         ebootBytes = readFile(buffer, ebootEntry).slice();
-        console.log(`[MAIN] EBOOT.BIN extracted: ${ebootBytes.byteLength} bytes`);
+        log.info(`EBOOT.BIN extracted: ${ebootBytes.byteLength} bytes`);
       } catch (err) {
-        console.warn(`[MAIN] Could not read EBOOT.BIN: ${err}`);
+        log.warn(`Could not read EBOOT.BIN: ${err}`);
       }
     }
   }
@@ -243,7 +246,7 @@ async function handleFile(file: File): Promise<void> {
         setGameVideo(url);
       } catch (err) {
         if (abort.signal.aborted) return;
-        console.warn("PMF transcode failed:", err);
+        log.warn("PMF transcode failed:", err);
         setMediaLoading(false);
       }
     }
@@ -257,7 +260,7 @@ async function handleFile(file: File): Promise<void> {
         playGameAudio(url);
       } catch (err) {
         if (abort.signal.aborted) return;
-        console.warn("AT3 transcode failed:", err);
+        log.warn("AT3 transcode failed:", err);
         showAudioError();
       }
     }
