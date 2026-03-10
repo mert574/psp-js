@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PSP.js</title>
+  </head>
+  <body>
+    <header>
+      <span class="header-logo">PSP.js</span>
+    </header>
+
+    <div id="error-banner">
+      <span id="error-message"></span>
+      <button class="error-banner__close" id="error-close" aria-label="Dismiss">✕</button>
+    </div>
+
+    <main>
+      <!-- Shown when no ISO is loaded -->
+      <section id="drop-zone" class="drop-zone">
+        <div class="drop-zone__icon">💿</div>
+        <p class="drop-zone__label">Drop a PSP ISO here</p>
+        <p class="drop-zone__sub">or <label for="file-input" class="drop-zone__browse">click to browse</label></p>
+        <input id="file-input" type="file" accept=".iso,.ISO" hidden />
+      </section>
+
+      <!-- Shown after ISO is loaded -->
+      <section id="game-view" class="game-view" hidden>
+        <div class="game-card">
+          <!-- Left: static icon (ICON0.PNG) -->
+          <div class="game-card__media">
+            <video id="game-video" class="game-card__video" autoplay loop muted playsinline hidden></video>
+            <img id="game-icon" class="game-card__icon" src="" alt="" hidden />
+            <div id="game-media-placeholder" class="game-card__placeholder" hidden></div>
+            <div id="game-media-spinner" class="game-card__spinner" hidden></div>
+          </div>
+
+          <!-- Right: metadata + actions -->
+          <div class="game-card__body">
+            <h2 id="game-title" class="game-card__title"></h2>
+            <dl class="game-card__meta">
+              <dt>Disc ID</dt>   <dd id="game-disc-id">—</dd>
+              <dt>Region</dt>    <dd id="game-region">—</dd>
+              <dt>Version</dt>   <dd id="game-version">—</dd>
+              <dt>Rating</dt>    <dd id="game-rating">—</dd>
+              <dt id="game-save-title-label" hidden>Save</dt> <dd id="game-save-title" hidden>—</dd>
+            </dl>
+            <div class="game-card__actions">
+              <button id="boot-btn"   class="btn btn--primary">▶&nbsp;Boot</button>
+              <button id="change-btn" class="btn btn--ghost">Change ISO</button>
+              <button id="audio-btn"  class="btn btn--ghost audio-btn--loading" hidden>🔊…</button>
+            </div>
+          </div>
+        </div>
+
+        <audio id="game-audio" loop hidden></audio>
+
+        <!-- Collapsible ISO file tree -->
+        <details class="iso-tree">
+          <summary class="iso-tree__summary">ISO Contents</summary>
+          <div id="file-tree" class="iso-tree__body"></div>
+        </details>
+      </section>
+
+      <!-- Shown when game is running -->
+      <section id="gameplay-view" class="gameplay-view" hidden>
+
+        <div class="gameplay-screen">
+          <canvas id="psp-canvas" width="480" height="272"></canvas>
+
+          <div id="gameplay-hud" class="gameplay-hud" hidden>
+            <div class="gameplay-hud__inner">
+              <h3 class="gameplay-hud__title">Controls</h3>
+              <table class="gameplay-hud__table">
+                <tbody>
+                  <tr><td>Arrow Keys</td><td>D-Pad</td></tr>
+                  <tr><td>Z</td>        <td>Cross ✕</td></tr>
+                  <tr><td>X</td>        <td>Circle ○</td></tr>
+                  <tr><td>A</td>        <td>Square □</td></tr>
+                  <tr><td>S</td>        <td>Triangle △</td></tr>
+                  <tr><td>Q</td>        <td>L Trigger</td></tr>
+                  <tr><td>E</td>        <td>R Trigger</td></tr>
+                  <tr><td>Enter</td>    <td>Start</td></tr>
+                  <tr><td>Shift</td>    <td>Select</td></tr>
+                  <tr><td>WASD</td>     <td>Analog Stick</td></tr>
+                </tbody>
+              </table>
+              <p class="gameplay-hud__hint">Press Tab or H to hide</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="gameplay-toolbar">
+          <button id="exit-btn" class="btn btn--ghost">← Back</button>
+          <span class="gameplay-toolbar__hint">Tab / H — toggle controls</span>
+        </div>
+
+      </section>
+    </main>
+
+    <div id="status-bar" class="status-bar"></div>
+
+    <script type="module" src="/src/frontend/main.ts"></script>
+  </body>
+</html>
