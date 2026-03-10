@@ -24,6 +24,10 @@
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",
     "@ffmpeg/ffmpeg": "^0.12.15",
-    "@ffmpeg/util": "^0.12.2"
+    "@ffmpeg/util": "^0.12.2",
+    "@libav.js/types": "^6.8.8",
+    "libav.js": "^6.8.8",
+    "libavjs-webcodecs-bridge": "^0.3.2",
+    "twgl.js": "^7.0.0"
   }
 }

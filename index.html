@@ -29,7 +29,6 @@
         <div class="game-card">
           <!-- Left: static icon (ICON0.PNG) -->
           <div class="game-card__media">
-            <video id="game-video" class="game-card__video" autoplay loop muted playsinline hidden></video>
             <img id="game-icon" class="game-card__icon" src="" alt="" hidden />
             <div id="game-media-placeholder" class="game-card__placeholder" hidden></div>
             <div id="game-media-spinner" class="game-card__spinner" hidden></div>
@@ -67,6 +66,12 @@
 
         <div class="gameplay-screen">
           <canvas id="psp-canvas" width="480" height="272"></canvas>
+          <table id="fps-counter" style="position:absolute;top:4px;left:4px;color:#0f0;font:12px monospace;background:rgba(0,0,0,0.5);padding:2px 6px;pointer-events:none;z-index:10;border-collapse:collapse;">
+            <tr><td>FPS</td><td id="hud-fps" style="text-align:right;padding-left:8px">0</td></tr>
+            <tr><td>Frame</td><td id="hud-frame" style="text-align:right;padding-left:8px">0</td></tr>
+            <tr><td>Thread</td><td id="hud-tid" style="text-align:right;padding-left:8px">-</td></tr>
+            <tr><td>PC</td><td id="hud-pc" style="text-align:right;padding-left:8px">-</td></tr>
+          </table>
 
           <div id="gameplay-hud" class="gameplay-hud" hidden>
             <div class="gameplay-hud__inner">
@@ -76,8 +81,8 @@
                   <tr><td>Arrow Keys</td><td>D-Pad</td></tr>
                   <tr><td>Z</td>        <td>Cross ✕</td></tr>
                   <tr><td>X</td>        <td>Circle ○</td></tr>
-                  <tr><td>A</td>        <td>Square □</td></tr>
-                  <tr><td>S</td>        <td>Triangle △</td></tr>
+                  <tr><td>J</td>        <td>Square □</td></tr>
+                  <tr><td>K</td>        <td>Triangle △</td></tr>
                   <tr><td>Q</td>        <td>L Trigger</td></tr>
                   <tr><td>E</td>        <td>R Trigger</td></tr>
                   <tr><td>Enter</td>    <td>Start</td></tr>

@@ -2,10 +2,12 @@ import "./style.css";
 import { Logger } from "../utils/logger.js";
 import { parseIso, readFile } from "../iso/iso9660.js";
 import { parseSfo, extractGameInfo } from "../iso/sfo.js";
-import { setStatus, showError, clearError, showGameView, showDropZone, showFileTree, clearGameVideo, clearGameAudio, playGameAudio, showAudioLoading, showAudioError, setMediaLoading, setGameVideo, unlockAudio, showGameplayView, exitGameplayView, toggleGameplayHud } from "./ui.js";
+import { setStatus, showError, clearError, showGameView, showDropZone, showFileTree, clearGameVideo, clearGameAudio, playGameAudio, showAudioLoading, showAudioError, setMediaLoading, setGameCanvas, unlockAudio, showGameplayView, exitGameplayView, toggleGameplayHud } from "./ui.js";
 import { InputHandler } from "./input.js";
-import { transcodepmf, transcodeAt3 } from "./pmf.js";
+import { transcodeAt3 } from "./pmf.js";
+import { decodePmfNative, type PmfPlayer } from "./pmf-native.js";
 import { PSPEmulator } from "../emulator.js";
+import { FramebufferRenderer } from "../gpu/framebuffer-renderer.js";
 
 const log = Logger.get("MAIN");
 
@@ -17,9 +19,11 @@ const errorClose = document.getElementById("error-close")!;
 
 let inputHandler: InputHandler | null = null;
 let emulator: PSPEmulator | null = null;
+let renderer: FramebufferRenderer | null = null;
 let rafHandle: number = 0;
 let ebootBytes: Uint8Array | null = null;
 let mediaAbort: AbortController | null = null;
+let pmfPlayer: PmfPlayer | null = null;
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
 // The <label for="file-input"> handles click-to-browse natively.
@@ -52,6 +56,7 @@ bootBtn.addEventListener("click", () => {
   // Cancel any in-progress media transcoding
   mediaAbort?.abort();
   mediaAbort = null;
+  if (pmfPlayer) { pmfPlayer.stop(); pmfPlayer = null; }
   clearGameVideo();
   clearGameAudio();
 
@@ -60,7 +65,11 @@ bootBtn.addEventListener("click", () => {
   inputHandler = new InputHandler();
   window.addEventListener("keydown", onHudToggle);
 
+  const canvas = document.getElementById("psp-canvas") as HTMLCanvasElement;
+  renderer = new FramebufferRenderer(canvas);
+
   emulator = new PSPEmulator();
+  (window as any)._dbgEmu = emulator; // debug: expose for console inspection
   emulator.hle.inputSnapshot = () => inputHandler!.snapshot();
 
   void (async () => {
@@ -76,7 +85,7 @@ bootBtn.addEventListener("click", () => {
     startRafLoop();
   })();
 });
-changeBtn.addEventListener("click",  () => { mediaAbort?.abort(); mediaAbort = null; showDropZone(); fileInput.value = ""; clearError(); setStatus(""); clearGameVideo(); clearGameAudio(); });
+changeBtn.addEventListener("click",  () => { mediaAbort?.abort(); mediaAbort = null; if (pmfPlayer) { pmfPlayer.stop(); pmfPlayer = null; } showDropZone(); fileInput.value = ""; clearError(); setStatus(""); clearGameVideo(); clearGameAudio(); });
 errorClose.addEventListener("click", () => clearError());
 
 const exitBtn = document.getElementById("exit-btn")!;
@@ -94,6 +103,8 @@ function onHudToggle(e: KeyboardEvent): void {
 
 function teardownGameplay(): void {
   stopRafLoop();
+  renderer?.destroy();
+  renderer = null;
   emulator = null;
   inputHandler?.destroy();
   inputHandler = null;
@@ -102,11 +113,43 @@ function teardownGameplay(): void {
 
 const STEPS_PER_FRAME = 500_000;
 
+let _frameCount = 0;
+let _fpsLastTime = 0;
+let _fpsFrames = 0;
+let _fpsValue = 0;
+let _lastFrameTime = 0;
+const FRAME_INTERVAL = 1000 / 60; // ~16.67ms for 60fps
+
 function startRafLoop(): void {
   if (rafHandle !== 0) return;
+  _frameCount = 0;
+  _fpsLastTime = performance.now();
+  _lastFrameTime = performance.now();
+  _fpsFrames = 0;
+  _fpsValue = 0;
 
   function frame(): void {
     if (!emulator) return;
+
+    // Throttle to ~60fps
+    const now = performance.now();
+    const elapsed = now - _lastFrameTime;
+    if (elapsed < FRAME_INTERVAL) {
+      rafHandle = requestAnimationFrame(frame);
+      return;
+    }
+    _lastFrameTime = now - (elapsed % FRAME_INTERVAL);
+
+    _frameCount++;
+    if (_frameCount >= 1_000_000_000) _frameCount = 0;
+    _fpsFrames++;
+
+    // FPS counter
+    if (now - _fpsLastTime >= 1000) {
+      _fpsValue = _fpsFrames;
+      _fpsFrames = 0;
+      _fpsLastTime = now;
+    }
 
     try {
       emulator.runFrame(STEPS_PER_FRAME);
@@ -115,6 +158,22 @@ function startRafLoop(): void {
       showError(`CPU error: ${String(err)}`);
       return;
     }
+
+    // Render VRAM framebuffer to canvas
+    const hle = emulator.hle;
+    if (hle.framebufAddr !== 0 && renderer) {
+      renderer.render(emulator.bus.vramBuffer, hle.framebufAddr, hle.framebufWidth, hle.framebufFormat);
+    }
+
+    // Update HUD overlay
+    const hudFps = document.getElementById("hud-fps");
+    const hudFrame = document.getElementById("hud-frame");
+    const hudTid = document.getElementById("hud-tid");
+    const hudPc = document.getElementById("hud-pc");
+    if (hudFps) hudFps.textContent = String(_fpsValue);
+    if (hudFrame) hudFrame.textContent = String(_frameCount);
+    if (hudTid) hudTid.textContent = String(emulator.hle.currentThreadId);
+    if (hudPc) hudPc.textContent = emulator.cpu.regs.pc.toString(16);
 
     if (emulator.halted) {
       stopRafLoop();
@@ -241,12 +300,16 @@ async function handleFile(file: File): Promise<void> {
     if (pmfData) {
       setMediaLoading(true);
       try {
-        const url = await transcodepmf(pmfData);
-        if (abort.signal.aborted) { URL.revokeObjectURL(url); return; }
-        setGameVideo(url);
+        // Stop any previous player
+        if (pmfPlayer) { pmfPlayer.stop(); pmfPlayer = null; }
+        const player = await decodePmfNative(pmfData);
+        if (abort.signal.aborted) { player.stop(); return; }
+        pmfPlayer = player;
+        setGameCanvas(player.canvas);
+        player.play();
       } catch (err) {
         if (abort.signal.aborted) return;
-        log.warn("PMF transcode failed:", err);
+        log.warn("PMF decode failed:", err);
         setMediaLoading(false);
       }
     }

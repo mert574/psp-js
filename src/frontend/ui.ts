@@ -90,7 +90,7 @@ const PARENTAL_LABELS: Record<number, string> = {
   9: "Adults Only 18+",
 };
 
-export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string, videoUrl?: string): void {
+export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string): void {
   document.getElementById("game-title")!.textContent    = info.title;
   document.getElementById("game-disc-id")!.textContent  = info.discId   || "—";
   document.getElementById("game-version")!.textContent  = info.version  || "—";
@@ -116,19 +116,13 @@ export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string, v
     ? `linear-gradient(rgba(22,27,34,0.72), rgba(22,27,34,0.72)), url(${bgUrl})`
     : "";
 
-  const video       = document.getElementById("game-video")       as HTMLVideoElement;
   const icon        = document.getElementById("game-icon")        as HTMLImageElement;
   const placeholder = document.getElementById("game-media-placeholder") as HTMLElement;
 
-  video.hidden       = true;
   icon.hidden        = true;
   placeholder.hidden = false;
 
-  if (videoUrl) {
-    video.src    = videoUrl;
-    video.hidden = false;
-    placeholder.hidden = true;
-  } else if (iconUrl) {
+  if (iconUrl) {
     icon.src    = iconUrl;
     icon.alt    = info.title;
     icon.hidden = false;
@@ -140,10 +134,9 @@ export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string, v
 }
 
 export function clearGameVideo(): void {
-  const video   = document.getElementById("game-video")        as HTMLVideoElement;
+  const canvas  = document.getElementById("game-video-canvas") as HTMLCanvasElement | null;
   const spinner = document.getElementById("game-media-spinner") as HTMLElement;
-  if (video && video.src.startsWith("blob:")) URL.revokeObjectURL(video.src);
-  if (video)   { video.src = ""; video.hidden = true; }
+  if (canvas)  canvas.remove();
   if (spinner) spinner.hidden = true;
 }
 
@@ -152,14 +145,22 @@ export function setMediaLoading(loading: boolean): void {
   spinner.hidden = !loading;
 }
 
-export function setGameVideo(videoUrl: string): void {
-  const video       = document.getElementById("game-video")            as HTMLVideoElement;
+/** Insert a WebCodecs-rendered canvas into the media area */
+export function setGameCanvas(canvas: HTMLCanvasElement): void {
+  const mediaContainer = document.querySelector(".game-card__media") as HTMLElement;
   const icon        = document.getElementById("game-icon")             as HTMLImageElement;
   const placeholder = document.getElementById("game-media-placeholder") as HTMLElement;
   const spinner     = document.getElementById("game-media-spinner")    as HTMLElement;
 
-  video.src    = videoUrl;
-  video.hidden = false;
+  canvas.className = "game-card__video";
+  canvas.id = "game-video-canvas";
+  canvas.style.objectFit = "cover";
+
+  const prev = document.getElementById("game-video-canvas");
+  if (prev) prev.remove();
+
+  mediaContainer.insertBefore(canvas, mediaContainer.firstChild);
+  canvas.hidden = false;
   icon.hidden        = true;
   placeholder.hidden = true;
   spinner.hidden     = true;
@@ -176,20 +177,6 @@ export function showFileTree(root: IsoFile): void {
 export function showGameplayView(): void {
   const audio = document.getElementById("game-audio") as HTMLAudioElement;
   if (!audio.paused) audio.pause();
-
-  const canvas = document.getElementById("psp-canvas") as HTMLCanvasElement;
-  const ctx    = canvas.getContext("2d");
-  if (ctx) {
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, 480, 272);
-    ctx.fillStyle = "#58a6ff";
-    ctx.font      = "bold 18px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText("Emulation not yet implemented", 240, 130);
-    ctx.fillStyle = "#8b949e";
-    ctx.font      = "13px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.fillText("CPU execution pipeline is under construction", 240, 158);
-  }
 
   gameViewEl.hidden      = true;
   gameplayViewEl.hidden  = false;

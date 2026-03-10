@@ -1,5 +1,6 @@
 import type { MemoryBus } from "../memory/memory-bus.js";
 import type { AllegrexRegisters } from "../cpu/registers.js";
+import { GEProcessor } from "../gpu/ge-processor.js";
 import { Logger } from "../utils/logger.js";
 
 const log = Logger.get("HLE");
@@ -86,6 +87,9 @@ export class HLEKernel {
   /** GE IDs */
   private nextGeCallbackId = 1;
   private nextGeListId = 1;
+  private readonly geProcessor: GEProcessor;
+  /** Pending GE lists: listId → { pc, stallAddr } (-1 pc = completed) */
+  private geLists = new Map<number, { pc: number; stallAddr: number }>();
 
   /** Scheduling / timing */
   vblankCount: number = 0;
@@ -98,6 +102,7 @@ export class HLEKernel {
   framebufFormat: number = 3;
 
   constructor(readonly bus: MemoryBus) {
+    this.geProcessor = new GEProcessor(bus);
     this.registerBuiltins();
   }
 
@@ -136,8 +141,28 @@ export class HLEKernel {
     log.info(`Remapped ${mapped} syscalls (${unmapped} unimplemented NIDs)`);
   }
 
+  // Debug: syscall frequency tracking
+  private _syscallFreq = new Map<number, number>();
+  private _syscallFreqTimer = 0;
+
   /** Dispatch a syscall. The syscall code is the lower 20 bits of the SYSCALL instruction. */
   dispatch(syscallCode: number, regs: AllegrexRegisters): void {
+    // Track frequency
+    this._syscallFreq.set(syscallCode, (this._syscallFreq.get(syscallCode) ?? 0) + 1);
+    const now = performance.now();
+    if (now - this._syscallFreqTimer > 3000) {
+      this._syscallFreqTimer = now;
+      const entries = [...this._syscallFreq.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([code, cnt]) => {
+          const nid = this.syscallToNid.get(code);
+          return `0x${code.toString(16)}(${nid ? '0x' + nid.toString(16) : '?'})=${cnt}`;
+        });
+      log.info(`Syscall freq: ${entries.join(', ')}`);
+      this._syscallFreq.clear();
+    }
+
     const handler = this.handlers.get(syscallCode);
     if (!handler) {
       const nid = this.syscallToNid.get(syscallCode);
@@ -424,6 +449,40 @@ export class HLEKernel {
       }
       regs.setGpr(2, 0);
     });
+
+    // sceKernelGetThreadExitStatus(thid) — return exit status or error
+    this.register(0x3b183e26, (regs) => {
+      const thid = regs.getGpr(4);
+      const t = this.threads.get(thid);
+      if (t && t.state === ThreadState.DEAD) {
+        regs.setGpr(2, 0); // exit status 0
+      } else if (t) {
+        regs.setGpr(2, 0x800201a4 >>> 0); // SCE_KERNEL_ERROR_NOT_DORMANT
+      } else {
+        regs.setGpr(2, 0x800201bc >>> 0); // SCE_KERNEL_ERROR_UNKNOWN_THID
+      }
+    });
+
+    // sceKernelWaitThreadEnd(thid, timeout) — wait for thread to exit
+    this.register(0x278c0df5, (regs) => {
+      const thid = regs.getGpr(4);
+      const t = this.threads.get(thid);
+      if (t && t.state === ThreadState.DEAD) {
+        regs.setGpr(2, 0); // already dead
+      } else if (t) {
+        // Thread still running — for now just return success (instant)
+        regs.setGpr(2, 0);
+      } else {
+        regs.setGpr(2, 0x800201bc >>> 0);
+      }
+    });
+
+    // sceKernelDeleteThread(thid) — remove thread
+    this.register(0x9fa03cd3, (regs) => {
+      const thid = regs.getGpr(4);
+      this.threads.delete(thid);
+      regs.setGpr(2, 0);
+    });
   }
 
   // ── SysMemUserForUser (memory management) ──────────────────────────────
@@ -658,7 +717,26 @@ export class HLEKernel {
 
     // sceGeListEnQueue(list, stall, cbid, arg) — queue display list, return list ID
     this.register(0xab49e76a, (regs) => {
-      regs.setGpr(2, this.nextGeListId++);
+      const listAddr = regs.getGpr(4);
+      const stallAddr = regs.getGpr(5);
+      const listId = this.nextGeListId++;
+      const stoppedPc = this.geProcessor.executeList(listAddr, stallAddr);
+      this.geLists.set(listId, { pc: stoppedPc, stallAddr });
+      regs.setGpr(2, listId);
+    });
+
+    // sceGeListUpdateStallAddr(listId, stallAddr) — update stall and resume
+    this.register(0xe0d68148, (regs) => {
+      const listId = regs.getGpr(4);
+      const newStall = regs.getGpr(5);
+      const entry = this.geLists.get(listId);
+      if (entry && entry.pc >= 0) {
+        // Resume execution from where we stalled
+        entry.stallAddr = newStall;
+        const stoppedPc = this.geProcessor.executeList(entry.pc, newStall);
+        entry.pc = stoppedPc;
+      }
+      regs.setGpr(2, 0);
     });
 
     // sceGeListSync(listId, syncType) — return 0 (completed)
@@ -1127,6 +1205,66 @@ export class HLEKernel {
 
     // sceKernelUnlockLwMutex(workarea, count) — stub
     this.register(0x60107536, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelCpuSuspendIntr — disable interrupts, return previous state
+    this.register(0x092968f4, (regs) => {
+      regs.setGpr(2, 0); // return previous intr state (0 = was enabled)
+    });
+
+    // sceKernelCpuResumeIntr — restore interrupt state
+    this.register(0x5f10d406, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceGeEdramSetAddrTranslation(size) — stub
+    this.register(0xb77905ea, (regs) => {
+      regs.setGpr(2, 0x400); // return previous translation size
+    });
+
+    // scePower_469989ad (scePowerGetBatteryLifePercent or similar) — return 100%
+    this.register(0x469989ad, (regs) => {
+      regs.setGpr(2, 100);
+    });
+
+    // sceUmdWaitDriveStatWithTimer(stat, timeout) — return 0 immediately
+    this.register(0x56202973, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceUmdWaitDriveStatCB(stat) — return 0 immediately
+    this.register(0x4a9e5e29, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceIoOpenAsync(file, flags, mode) — return fake fd
+    this.register(0x89aa9906, (regs) => {
+      regs.setGpr(2, this.nextBlockId++);
+    });
+
+    // sceIoReadAsync(fd, data, size) — return 0 (no data)
+    this.register(0xa0b5a7c2, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelCheckCallback — process callbacks, return count
+    this.register(0x349d6d6c, (regs) => {
+      regs.setGpr(2, 0); // 0 callbacks processed
+    });
+
+    // sceUtilityLoadModule(moduleId) — stub success
+    this.register(0x2a2b3de0, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceKernelSetCompiledSdkVersion (various) — stub
+    this.register(0xa5da2406, (regs) => {
+      regs.setGpr(2, 0);
+    });
+
+    // sceUmdDeactivate(mode) — stub success
+    this.register(0xe83742ba, (regs) => {
       regs.setGpr(2, 0);
     });
   }
