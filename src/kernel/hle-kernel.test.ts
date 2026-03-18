@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryBus } from "../memory/memory-bus.js";
 import { AllegrexRegisters } from "../cpu/registers.js";
-import { HLEKernel, ThreadState, WaitType } from "./hle-kernel.js";
+import { HLEKernel, ThreadState, WaitType, type Thread } from "./hle-kernel.js";
 
 describe("HLEKernel — Thread Scheduler", () => {
   let bus: MemoryBus;
@@ -9,7 +9,7 @@ describe("HLEKernel — Thread Scheduler", () => {
   let regs: AllegrexRegisters;
 
   beforeEach(() => {
-    bus = new MemoryBus();
+    bus = MemoryBus.create();
     hle = new HLEKernel(bus);
     regs = new AllegrexRegisters();
   });
@@ -83,7 +83,7 @@ describe("HLEKernel — Thread Scheduler", () => {
     expect(hle.vblankCount).toBe(1);
   });
 
-  it("onVblank wakes DELAY-waiting threads", () => {
+  it("onVblank does NOT wake DELAY-waiting threads (woken by CoreTiming instead)", () => {
     const t = createDummyThread(hle, 1, 0x20);
     t.state = ThreadState.WAITING;
     t.waitType = WaitType.DELAY;
@@ -91,13 +91,14 @@ describe("HLEKernel — Thread Scheduler", () => {
 
     hle.onVblank(regs);
 
-    expect(t.state).toBe(ThreadState.RUNNING);
+    // DELAY threads are now woken via CoreTiming WakeThread events, not VBlank.
+    expect(t.state).toBe(ThreadState.WAITING);
   });
 });
 
 // Helper to create a thread directly in the HLE kernel's internal state
 function createDummyThread(hle: HLEKernel, id: number = 1, priority: number = 0x20) {
-  const thread = {
+  const thread: Thread = {
     id,
     entry: 0x08000000,
     stackSize: 4096,
@@ -105,17 +106,36 @@ function createDummyThread(hle: HLEKernel, id: number = 1, priority: number = 0x
     stackTop: 0x09000F00,
     k0: 0x09001000,
     priority,
-    state: ThreadState.DORMANT as ThreadState,
-    waitType: WaitType.NONE as WaitType,
+    state: ThreadState.DORMANT,
+    waitType: WaitType.NONE,
     context: {
       gpr: new Uint32Array(32),
       hi: 0, lo: 0, pc: 0,
       fpr: new Uint32Array(32),
       fcr31: 0,
+      vfpr: new Float32Array(128),
+      vfpuCtrl: new Uint32Array(16),
+      vfpuCc: 0,
+      vpfxs: 0, vpfxt: 0, vpfxd: 0,
+      vpfxsEnabled: false, vpfxtEnabled: false, vpfxdEnabled: false,
     },
     wakeupCount: 0,
+    waitSemaId: 0,
+    waitSemaCount: 0,
+    waitEvfId: 0,
+    waitEvfBits: 0,
+    waitEvfMode: 0,
+    waitEvfOutPtr: 0,
+    callbacks: [],
+    isProcessingCallbacks: false,
+    waitGeListId: 0,
+    waitDeadlineVbl: 0,
+    waitWakeTimeMs: 0,
+    waitThreadEndId: 0,
+    waitMutexId: 0,
+    waitMutexCount: 0,
+    pendingWakeCallback: undefined,
   };
-  // Access private threads map via any cast
-  (hle as any).threads.set(id, thread);
+  hle.addThreadForTest(thread);
   return thread;
 }

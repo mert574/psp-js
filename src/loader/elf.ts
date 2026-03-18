@@ -1,6 +1,22 @@
 import { MemoryBus } from "../memory/memory-bus.js";
 import { Logger } from "../utils/logger.js";
 
+declare global {
+  interface Window {
+    __elfDebug?: {
+      modinfoAddr: number;
+      pPaddr: number;
+      pVaddr0: number;
+      pOffset0: number;
+      libent: number;
+      libentend: number;
+      libstub: number;
+      libstubend: number;
+      modName: string;
+    };
+  }
+}
+
 const log = Logger.get("ELF");
 
 /**
@@ -37,8 +53,7 @@ const ET_PRX    = 0xFFA0;     // PSP PRX relocatable module
 const PRX_BASE  = 0x08804000; // Default load address for PSP executables
 
 // Section header types
-const SHT_REL     = 9;          // Standard relocation entries (no addend)
-const SHT_PRXREL  = 0x700000A0; // PSP PRX relocation type
+const SHT_PRXREL  = 0x700000A0; // PSP PRX relocation type (SHT_PSPREL in PPSSPP)
 // MIPS relocation types
 const R_MIPS_NONE    = 0;
 const R_MIPS_16      = 1;
@@ -64,6 +79,8 @@ export interface LoadResult {
   gp: number;
   /** Map from syscall code → NID, for wiring up HLE handlers */
   nidBySyscall: Map<number, number>;
+  /** Highest address written by any PT_LOAD segment (aligned to 256 bytes) */
+  loadedEnd: number;
 }
 
 export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
@@ -109,6 +126,7 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
   }
 
   // Load PT_LOAD segments
+  let loadedEnd = 0;
   for (let i = 0; i < phnum; i++) {
     const ph = phoff + i * phentsize;
     const pType   = view.getUint32(ph + 0x00, le);
@@ -128,6 +146,8 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
     for (let b = pFilesz; b < pMemsz; b++) {
       bus.writeU8(loadAddr + b, 0);
     }
+    const segEnd = (loadAddr + pMemsz + 0xFF) & ~0xFF;
+    if (segEnd > loadedEnd) loadedEnd = segEnd;
   }
 
   // Apply MIPS relocations for PRX modules
@@ -164,12 +184,24 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
     //   0x28: libentend (u32)
     //   0x2C: libstub (u32)
     //   0x30: libstubend (u32)
-    const gpValue    = bus.readU32(modinfoAddr + 0x20);
+    // libent/libstub pointer fields are absolute PSP addresses: the R_MIPS_32
+    // relocation pass has already added baseAddr to each pointer field in the
+    // SceModuleInfo struct.  Reading them and adding baseAddr again would push
+    // them out of the valid PSP RAM range (see PPSSPP sceKernelModule.cpp:1293+).
+    const gpRaw      = bus.readU32(modinfoAddr + 0x20);
     const libent     = bus.readU32(modinfoAddr + 0x24);
     const libentend  = bus.readU32(modinfoAddr + 0x28);
     const libstub    = bus.readU32(modinfoAddr + 0x2C);
     const libstubend = bus.readU32(modinfoAddr + 0x30);
-    log.info(`gp=0x${gpValue.toString(16)}`);
+
+    // gp_value in SceModuleInfo is stored as a relative offset from the
+    // segment base, not as a pointer with a relocation entry.  When it reads
+    // as 0 it means "start of segment" — the absolute GP is therefore baseAddr.
+    const gpValue = gpRaw !== 0 ? gpRaw : baseAddr;
+
+    log.info(`[ELF] Module Info found at 0x${modinfoAddr.toString(16)}:`);
+    log.info(`[ELF]   gp_raw=0x${gpRaw.toString(16)} → gp_abs=0x${gpValue.toString(16)}`);
+    log.info(`[ELF]   libent=0x${libent.toString(16)} libstub=0x${libstub.toString(16)}`);
 
     // Read module name for logging
     let modName = "";
@@ -178,10 +210,12 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
       if (b === 0) break;
       modName += String.fromCharCode(b);
     }
-    log.info(`module="${modName}" libent=0x${libent.toString(16)}-0x${libentend.toString(16)} libstub=0x${libstub.toString(16)}-0x${libstubend.toString(16)}`);
+    log.info(`[ELF] Module name: "${modName}"`);
 
     // Store debug info globally for inspection
-    (globalThis as any).__elfDebug = { modinfoAddr, pPaddr, pVaddr0, pOffset0, libent, libentend, libstub, libstubend, modName };
+    if (typeof window !== "undefined") {
+      (window as any).__elfDebug = { modinfoAddr, pPaddr, pVaddr0, pOffset0, libent, libentend, libstub, libstubend, modName };
+    }
 
     // Parse export table to find module_start_func
     let moduleStartFunc: number | null = null;
@@ -200,10 +234,10 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
       log.debug(`module_start_func=0x${moduleStartFunc.toString(16)} differs from ELF entry=0x${elfEntry.toString(16)}`);
     }
 
-    return { entryPoint: elfEntry, moduleStartFunc, gp: gpValue, nidBySyscall };
+    return { entryPoint: elfEntry, moduleStartFunc, gp: gpValue, nidBySyscall, loadedEnd };
   }
 
-  return { entryPoint: (entryPoint + baseAddr) >>> 0, moduleStartFunc: null, gp: 0, nidBySyscall };
+  return { entryPoint: (entryPoint + baseAddr) >>> 0, moduleStartFunc: null, gp: 0, nidBySyscall, loadedEnd };
 }
 
 /**
@@ -338,7 +372,10 @@ function applyRelocations(
   for (let s = 0; s < shnum; s++) {
     const sh = shoff + s * shentsize;
     const shType = view.getUint32(sh + 0x04, le);
-    if (shType !== SHT_REL && shType !== SHT_PRXREL) continue;
+    // Only process PSP PRX relocations (SHT_PRXREL).
+    // SHT_REL uses a different r_info format (symbol index, not segment index)
+    // and is not supported for PSP PRX — PPSSPP skips them too.
+    if (shType !== SHT_PRXREL) continue;
     relSectionCount++;
 
     const relOffset = view.getUint32(sh + 0x10, le);

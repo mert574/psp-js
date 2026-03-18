@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 
 export default defineConfig({
@@ -19,5 +20,11 @@ export default defineConfig({
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
     },
+  },
+  test: {
+    testTimeout: 30_000,
+    teardownTimeout: 5_000,
+    pool: "forks",
+    exclude: ["**/node_modules/**", "**/.claude/**", "**/dist/**"],
   },
 });

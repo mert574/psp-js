@@ -6,7 +6,7 @@
  *   0x00000000 - 0x001FFFFF  Scratchpad RAM (not really — scratchpad is at 0x00010000)
  *   0x00010000 - 0x00013FFF  Scratchpad RAM (16 KB, fast SRAM on-chip)
  *   0x04000000 - 0x041FFFFF  VRAM (2 MB)
- *   0x08000000 - 0x09FFFFFF  Main RAM (32 MB on PSP-1000, 64 MB on PSP-2000+)
+ *   0x08000000 - 0x0BFFFFFF  Main RAM (64 MB, PSP-2000/3000 Slim)
  *   0x1C000000 - 0x1FBFFFFF  Hardware I/O registers
  *   0x1FC00000 - 0x1FFFFFFF  Kernel ROM (BIOS)
  *   0x88000000 - 0x89FFFFFF  Kernel RAM mirror (cached)

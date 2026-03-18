@@ -77,6 +77,28 @@ export class AllegrexRegisters {
     this.fpr[index] = value >>> 0;
   }
 
+  /** Read VFPU scalar raw bits as u32 */
+  getVfprBits(index: number): number {
+    const view = new DataView(this.vfpr.buffer, this.vfpr.byteOffset);
+    return view.getUint32(index * 4, true);
+  }
+
+  /** Write VFPU scalar raw bits from u32 */
+  setVfprBits(index: number, value: number): void {
+    const view = new DataView(this.vfpr.buffer, this.vfpr.byteOffset);
+    view.setUint32(index * 4, value, true);
+  }
+
+  /** Read VFPU scalar as float */
+  getVfpr(index: number): number {
+    return this.vfpr[index]!;
+  }
+
+  /** Write VFPU scalar as float */
+  setVfpr(index: number, value: number): void {
+    this.vfpr[index] = value;
+  }
+
   // ── CP0 registers we care about ─────────────────────────────────────────
 
   /** CP0 r12 — Status register (interrupt enable, operating mode, …) */
