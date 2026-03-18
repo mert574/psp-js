@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryBus } from "../src/memory/memory-bus.js";
 import { GEProcessor } from "../src/gpu/ge-processor.js";
 import { GE_CMD } from "../src/gpu/ge-commands.js";
+import { computeVertexLighting, type LightingState } from "../src/gpu/ge-lighting.js";
+import { tessellateBezier, tessellateSpline } from "../src/gpu/ge-patches.js";
 
 /**
  * Helper: build a GE command word (opcode in top 8 bits, param in bottom 24).
@@ -51,7 +53,7 @@ describe("GEProcessor", () => {
   let ge: GEProcessor;
 
   beforeEach(() => {
-    bus = new MemoryBus();
+    bus = MemoryBus.create();
     ge = new GEProcessor(bus);
   });
 
@@ -81,31 +83,38 @@ describe("GEProcessor", () => {
   });
 
   describe("framebuffer clear", () => {
-    it("should clear VRAM with doClear when CLEAR command has enable+flag bits", () => {
-      // Set framebuffer to VRAM base, format ABGR8888
-      // CLEAR with param bit0=enable, bit8=color flag → param = 0x101
+    it("should clear VRAM via PRIM sprite in clear mode (green)", () => {
+      // PSP clear mode: CLEARMODE + PRIM type=6 sprite with vertex color.
+      // Vertex color ABGR8888: green = R=0, G=0xFF, B=0, A=0xFF → 0xFF00FF00
+      const GREEN_ABGR = 0xFF00FF00;
+      let vaddr = VERT_ADDR;
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 0, 0, 0, GREEN_ABGR);
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 480, 272, 0, GREEN_ABGR);
+
       writeCommandList(bus, LIST_ADDR, [
-        geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),        // low 24 bits
-        geCmd(GE_CMD.FRAMEBUFWIDTH, (512 & 0x7FF) | ((VRAM_BASE >>> 8) & 0xFF0000)), // width + high bits
-        geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),                                          // pixel format = ABGR8888
-        geCmd(GE_CMD.CLEARCOLOR, 0x00FF00),                   // clear color = green (RGB)
-        geCmd(GE_CMD.CLEARDEPTH, 0xFF),                       // clear alpha = 255
-        geCmd(GE_CMD.CLEAR, 0x101),                              // enable clear + color flag
+        geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),
+        geCmd(GE_CMD.FRAMEBUFWIDTH, (512 & 0x7FF) | ((VRAM_BASE >>> 8) & 0xFF0000)),
+        geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
+        geCmd(GE_CMD.CLEAR, 0x101),  // enable clear mode + color write
+        geCmd(GE_CMD.BASE, (VERT_ADDR >>> 8) & 0xFFFFFF),
+        geCmd(GE_CMD.VTYPE, (1 << 23) | (7 << 2) | (2 << 7)), // through+color8888+pos16
+        geCmd(GE_CMD.VADDR, VERT_ADDR & 0xFFFFFF),
+        geCmd(GE_CMD.PRIM, (6 << 16) | 2),
+        geCmd(GE_CMD.CLEAR, 0x000),  // exit clear mode
         geCmd(GE_CMD.FINISH),
         geCmd(GE_CMD.END),
       ]);
 
       ge.executeList(LIST_ADDR, 0);
 
-      // Check a few pixels in VRAM — should be green (R=0, G=0xFF, B=0, A=0xFF)
+      // Pixel (0,0): green vertex → stored as [B=0, G=0xFF, R=0, A=0xFF]
       const vram = bus.vramBuffer;
-      // Pixel at (0,0): offset 0 in VRAM
-      expect(vram[0]).toBe(0x00); // R
+      expect(vram[0]).toBe(0x00); // B of vertex (byte0)
       expect(vram[1]).toBe(0xFF); // G
-      expect(vram[2]).toBe(0x00); // B
+      expect(vram[2]).toBe(0x00); // R of vertex (byte2)
       expect(vram[3]).toBe(0xFF); // A
 
-      // Pixel at (100, 50): offset = (50*512 + 100)*4
+      // Pixel at (100, 50) same
       const off = (50 * 512 + 100) * 4;
       expect(vram[off]).toBe(0x00);
       expect(vram[off + 1]).toBe(0xFF);
@@ -113,24 +122,34 @@ describe("GEProcessor", () => {
       expect(vram[off + 3]).toBe(0xFF);
     });
 
-    it("should clear to red using CLEARCOLOR", () => {
+    it("should clear to red via PRIM sprite in clear mode", () => {
+      // Red vertex: ABGR8888: R=0xFF, G=0, B=0, A=0xFF → 0xFF0000FF
+      const RED_ABGR = 0xFF0000FF;
+      let vaddr = VERT_ADDR;
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 0, 0, 0, RED_ABGR);
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 480, 272, 0, RED_ABGR);
+
       writeCommandList(bus, LIST_ADDR, [
         geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),
         geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | ((VRAM_BASE >>> 8) & 0xFF0000)),
         geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
-        geCmd(GE_CMD.CLEARCOLOR, 0x0000FF), // clear color RGB = R=0xFF, G=0, B=0
-        geCmd(GE_CMD.CLEARDEPTH, 0xFF),
         geCmd(GE_CMD.CLEAR, 0x101),
+        geCmd(GE_CMD.BASE, (VERT_ADDR >>> 8) & 0xFFFFFF),
+        geCmd(GE_CMD.VTYPE, (1 << 23) | (7 << 2) | (2 << 7)),
+        geCmd(GE_CMD.VADDR, VERT_ADDR & 0xFFFFFF),
+        geCmd(GE_CMD.PRIM, (6 << 16) | 2),
+        geCmd(GE_CMD.CLEAR, 0x000),
         geCmd(GE_CMD.FINISH),
         geCmd(GE_CMD.END),
       ]);
 
       ge.executeList(LIST_ADDR, 0);
 
+      // Red vertex stored as [B=0, G=0, R=0xFF, A=0xFF]
       const vram = bus.vramBuffer;
-      expect(vram[0]).toBe(0xFF); // R
+      expect(vram[0]).toBe(0x00); // B of vertex
       expect(vram[1]).toBe(0x00); // G
-      expect(vram[2]).toBe(0x00); // B
+      expect(vram[2]).toBe(0xFF); // R of vertex
       expect(vram[3]).toBe(0xFF); // A
     });
   });
@@ -196,34 +215,30 @@ describe("GEProcessor", () => {
       ge.executeList(LIST_ADDR, 0);
 
       const vram = bus.vramBuffer;
-      // Pixel (0,0): sprite uses v1 color
-      expect(vram[0]).toBe(0xFF); // R (low byte of ABGR)
+      // Pixel (0,0): sprite uses v1 color (RED_ABGR = R=0xFF, G=0, B=0, A=0xFF).
+      // writePixel stores bytes as [B_vertex, G_vertex, R_vertex, A] so the
+      // shader swizzle (c.b, c.g, c.r, c.a) produces correct RGB on screen.
+      expect(vram[0]).toBe(0x00); // B of vertex → byte0
       expect(vram[1]).toBe(0x00); // G
-      expect(vram[2]).toBe(0x00); // B
+      expect(vram[2]).toBe(0xFF); // R of vertex → byte2 → displayed as Red
       expect(vram[3]).toBe(0xFF); // A
     });
 
-    it("should clear via PRIM in clear mode", () => {
-      // Clear mode: set clear color, enable clear, then PRIM sprite fills rect
-      const VTYPE = (1 << 23) | (2 << 7); // through + pos_s16, no color
-      // Write vertices with pos_s16 only (no color): x(s16) y(s16) z(s16) = 6 bytes each
+    it("should clear via PRIM in clear mode using vertex color", () => {
+      // Per PPSSPP, clear mode uses vertex color (not a separate CLEARCOLOR command).
+      // Cyan: ABGR8888: R=0xFF, G=0xFF, B=0, A=0xFF → 0xFF00FFFF
+      const CYAN_ABGR = 0xFF00FFFF;
       let vaddr = VERT_ADDR;
-      // Align to 2 (already aligned). v0 = (0,0,0)
-      bus.writeU16(vaddr, 0); bus.writeU16(vaddr+2, 0); bus.writeU16(vaddr+4, 0);
-      vaddr += 6;
-      // v1 = (480,272,0)
-      bus.writeU16(vaddr, 480); bus.writeU16(vaddr+2, 272); bus.writeU16(vaddr+4, 0);
-      vaddr += 6;
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 0, 0, 0, CYAN_ABGR);
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 480, 272, 0, CYAN_ABGR);
 
       writeCommandList(bus, LIST_ADDR, [
         geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),
         geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | ((VRAM_BASE >>> 8) & 0xFF0000)),
         geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
-        geCmd(GE_CMD.CLEARCOLOR, 0x00FFFF),  // cyan
-        geCmd(GE_CMD.CLEARDEPTH, 0xFF),
-        geCmd(GE_CMD.CLEAR, 0x01),               // enable clear mode (no flag → PRIM does it)
+        geCmd(GE_CMD.CLEAR, 0x101),              // enable clear mode + color write
         geCmd(GE_CMD.BASE, (VERT_ADDR >>> 8) & 0xFFFFFF),
-        geCmd(GE_CMD.VTYPE, VTYPE),
+        geCmd(GE_CMD.VTYPE, (1 << 23) | (7 << 2) | (2 << 7)), // through+color8888+pos16
         geCmd(GE_CMD.VADDR, VERT_ADDR & 0xFFFFFF),
         geCmd(GE_CMD.PRIM, (6 << 16) | 2),       // SPRITES, 2 verts
         geCmd(GE_CMD.CLEAR, 0x00),                // disable clear mode
@@ -234,11 +249,12 @@ describe("GEProcessor", () => {
       ge.executeList(LIST_ADDR, 0);
 
       const vram = bus.vramBuffer;
-      // Check middle of screen
+      // Check middle of screen — cyan: R=0xFF, G=0xFF, B=0, A=0xFF
+      // writePixel swaps R/B: stored as [B=0, G=0xFF, R=0xFF, A=0xFF]
       const mid = (136 * 512 + 240) * 4;
-      expect(vram[mid]).toBe(0xFF);     // R (cyan low byte)
+      expect(vram[mid]).toBe(0x00);     // B of vertex → byte0
       expect(vram[mid + 1]).toBe(0xFF); // G
-      expect(vram[mid + 2]).toBe(0x00); // B
+      expect(vram[mid + 2]).toBe(0xFF); // R of vertex → byte2
       expect(vram[mid + 3]).toBe(0xFF); // A
     });
   });
@@ -247,27 +263,36 @@ describe("GEProcessor", () => {
     it("should follow JUMP to a different address", () => {
       const JUMP_TARGET = LIST_ADDR + 0x1000;
 
-      // Main list: set BASE, clear color green, then JUMP to target
+      // Green vertex: ABGR8888: R=0, G=0xFF, B=0, A=0xFF → 0xFF00FF00
+      const GREEN_ABGR = 0xFF00FF00;
+      let vaddr = VERT_ADDR;
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 0, 0, 0, GREEN_ABGR);
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 480, 272, 0, GREEN_ABGR);
+
+      // Main list: set BASE and fb, then JUMP to target
       writeCommandList(bus, LIST_ADDR, [
-        geCmd(GE_CMD.BASE, (LIST_ADDR >>> 8) & 0xFFFFFF), // BASE = high bits
+        geCmd(GE_CMD.BASE, (LIST_ADDR >>> 8) & 0xFFFFFF),
         geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),
         geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | ((VRAM_BASE >>> 8) & 0xFF0000)),
         geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
-        geCmd(GE_CMD.CLEARCOLOR, 0x00FF00),
-        geCmd(GE_CMD.CLEARDEPTH, 0xFF),
-        geCmd(GE_CMD.JUMP, JUMP_TARGET & 0xFFFFFF), // jump
+        geCmd(GE_CMD.JUMP, JUMP_TARGET & 0xFFFFFF),
       ]);
 
-      // At jump target: do CLEAR + FINISH + END
+      // At jump target: draw green sprite in clear mode + END
       writeCommandList(bus, JUMP_TARGET, [
         geCmd(GE_CMD.CLEAR, 0x101),
+        geCmd(GE_CMD.BASE, (VERT_ADDR >>> 8) & 0xFFFFFF),
+        geCmd(GE_CMD.VTYPE, (1 << 23) | (7 << 2) | (2 << 7)),
+        geCmd(GE_CMD.VADDR, VERT_ADDR & 0xFFFFFF),
+        geCmd(GE_CMD.PRIM, (6 << 16) | 2),
+        geCmd(GE_CMD.CLEAR, 0x000),
         geCmd(GE_CMD.FINISH),
         geCmd(GE_CMD.END),
       ]);
 
       ge.executeList(LIST_ADDR, 0);
 
-      // If JUMP worked, VRAM should be green
+      // Green: stored as [B=0, G=0xFF, R=0, A=0xFF]
       const vram = bus.vramBuffer;
       expect(vram[1]).toBe(0xFF); // G
     });
@@ -275,33 +300,43 @@ describe("GEProcessor", () => {
     it("should handle CALL and RET", () => {
       const CALL_TARGET = LIST_ADDR + 0x2000;
 
-      // Main list: setup fb, CALL subroutine, then FINISH+END
+      // Blue vertex: ABGR8888: R=0, G=0, B=0xFF, A=0xFF → 0xFFFF0000
+      const BLUE_ABGR = 0xFFFF0000;
+      let vaddr = VERT_ADDR;
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 0, 0, 0, BLUE_ABGR);
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 480, 272, 0, BLUE_ABGR);
+
+      // Main list: setup fb, CALL subroutine, draw blue after return
       writeCommandList(bus, LIST_ADDR, [
         geCmd(GE_CMD.BASE, (LIST_ADDR >>> 8) & 0xFFFFFF),
         geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),
         geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | ((VRAM_BASE >>> 8) & 0xFF0000)),
         geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
         geCmd(GE_CMD.CALL, CALL_TARGET & 0xFFFFFF),
-        // After RET, execution continues here:
-        geCmd(GE_CMD.CLEAR, 0x101),   // clear with color set by subroutine
+        // After RET: draw blue sprite
+        geCmd(GE_CMD.CLEAR, 0x101),
+        geCmd(GE_CMD.BASE, (VERT_ADDR >>> 8) & 0xFFFFFF),
+        geCmd(GE_CMD.VTYPE, (1 << 23) | (7 << 2) | (2 << 7)),
+        geCmd(GE_CMD.VADDR, VERT_ADDR & 0xFFFFFF),
+        geCmd(GE_CMD.PRIM, (6 << 16) | 2),
+        geCmd(GE_CMD.CLEAR, 0x000),
         geCmd(GE_CMD.FINISH),
         geCmd(GE_CMD.END),
       ]);
 
-      // Subroutine: set clear color blue, then RET
+      // Subroutine: NOP and RET (drawing happens after return)
       writeCommandList(bus, CALL_TARGET, [
-        geCmd(GE_CMD.CLEARCOLOR, 0xFF0000),  // blue (B=0xFF in bits 16-23)
-        geCmd(GE_CMD.CLEARDEPTH, 0xFF),
+        geCmd(GE_CMD.NOP),
         geCmd(GE_CMD.RET),
       ]);
 
       ge.executeList(LIST_ADDR, 0);
 
-      // VRAM should be blue (R=0, G=0, B=0xFF, A=0xFF)
+      // Blue: stored as [B=0xFF, G=0, R=0, A=0xFF]
       const vram = bus.vramBuffer;
-      expect(vram[0]).toBe(0x00); // R
+      expect(vram[0]).toBe(0xFF); // B of vertex → byte0
       expect(vram[1]).toBe(0x00); // G
-      expect(vram[2]).toBe(0xFF); // B
+      expect(vram[2]).toBe(0x00); // R of vertex
       expect(vram[3]).toBe(0xFF); // A
     });
   });
@@ -329,7 +364,7 @@ describe("GEProcessor", () => {
         geCmd(GE_CMD.TRANSFERSRCPOS, 0 | (0 << 10)),      // srcX=0, srcY=0
         geCmd(GE_CMD.TRANSFERDSTPOS, 100 | (0 << 10)),     // dstX=100, dstY=0
         geCmd(GE_CMD.TRANSFERSIZE, (4 - 1) | ((1 - 1) << 10)), // width=4, height=1
-        geCmd(GE_CMD.TRANSFERSTART),
+        geCmd(GE_CMD.TRANSFERSTART, 1), // param bit 0 = 1 → 32-bit pixels
         geCmd(GE_CMD.FINISH),
         geCmd(GE_CMD.END),
       ]);
@@ -345,16 +380,23 @@ describe("GEProcessor", () => {
     });
   });
 
-  describe("framebuffer address calculation", () => {
-    it("should handle fbPtr=0 as VRAM offset 0 for clear", () => {
-      // When fbPtr is set to 0x04000000 (VRAM base), offset should be 0
+  describe("immediate mode vertices", () => {
+    it("should draw a point via VSCX/VSCY/VCV/VAP commands", () => {
+      // Set up framebuffer
       writeCommandList(bus, LIST_ADDR, [
-        geCmd(GE_CMD.FRAMEBUFPTR, 0x000000),  // low 24 bits of 0x04000000
-        geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | (0x04 << 16)), // high byte = 0x04
+        geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),
+        geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | ((VRAM_BASE >>> 8) & 0xFF0000)),
         geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
-        geCmd(GE_CMD.CLEARCOLOR, 0x123456),
-        geCmd(GE_CMD.CLEARDEPTH, 0xFF),
-        geCmd(GE_CMD.CLEAR, 0x101),
+        geCmd(GE_CMD.VTYPE, (1 << 23)), // through mode
+        // Set immediate vertex: screen position (50, 50) with white color
+        // Through mode: x = ((vscx & 0xFFFF) - 0x8000) / 16.0
+        // So for x=50: vscx = 50*16 + 0x8000 = 800 + 32768 = 33568 = 0x8320
+        geCmd(GE_CMD.VSCX, 50 * 16 + 0x8000),
+        geCmd(GE_CMD.VSCY, 50 * 16 + 0x8000),
+        geCmd(GE_CMD.VSCZ, 0),
+        geCmd(GE_CMD.VCV, 0xFFFFFF),   // white RGB
+        // VAP: prim=POINTS(0) in bits[10:8], alpha=0xFF in bits[7:0]
+        geCmd(GE_CMD.VAP, (0 << 8) | 0xFF),
         geCmd(GE_CMD.FINISH),
         geCmd(GE_CMD.END),
       ]);
@@ -362,10 +404,347 @@ describe("GEProcessor", () => {
       ge.executeList(LIST_ADDR, 0);
 
       const vram = bus.vramBuffer;
-      expect(vram[0]).toBe(0x56); // R
-      expect(vram[1]).toBe(0x34); // G
-      expect(vram[2]).toBe(0x12); // B
+      const off = (50 * 512 + 50) * 4;
+      expect(vram[off]).toBe(0xFF);     // R
+      expect(vram[off + 1]).toBe(0xFF); // G
+      expect(vram[off + 2]).toBe(0xFF); // B
+      expect(vram[off + 3]).toBe(0xFF); // A
+    });
+  });
+
+  describe("TEXLODSLOPE (0xD0) replaces old CLEARCOLOR", () => {
+    it("should not crash when opcode 0xD0 is sent (TEXLODSLOPE, not CLEARCOLOR)", () => {
+      writeCommandList(bus, LIST_ADDR, [
+        geCmd(0xD0, 0x3F0000), // TEXLODSLOPE with float24 value
+        geCmd(0xD1, 0),        // UNKNOWN_D1 — NOP
+        geCmd(GE_CMD.FINISH),
+        geCmd(GE_CMD.END),
+      ]);
+      // Should not throw
+      ge.executeList(LIST_ADDR, 0);
+    });
+  });
+
+  describe("BJUMP (0x09)", () => {
+    it("should be a NOP since bboxResult is always true", () => {
+      // BJUMP jumps when bbox fails — since we always pass, it should be ignored
+      writeCommandList(bus, LIST_ADDR, [
+        geCmd(GE_CMD.BJUMP, 0xFFFFFF), // would jump to invalid addr if executed
+        geCmd(GE_CMD.FINISH),
+        geCmd(GE_CMD.END),
+      ]);
+      // Should complete normally without jumping
+      ge.executeList(LIST_ADDR, 0);
+    });
+  });
+
+  describe("framebuffer address calculation", () => {
+    it("should handle fbPtr=0x04000000 as VRAM offset 0 for PRIM drawing", () => {
+      // When fbPtr is set to 0x04000000 (VRAM base), offset should be 0.
+      // Use a blue vertex to verify the framebuffer address calculation.
+      // Blue ABGR8888: R=0, G=0, B=0xFF, A=0xFF → 0xFFFF0000
+      const BLUE_ABGR = 0xFFFF0000;
+      let vaddr = VERT_ADDR;
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 0, 0, 0, BLUE_ABGR);
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 2, 2, 0, BLUE_ABGR);
+
+      writeCommandList(bus, LIST_ADDR, [
+        geCmd(GE_CMD.FRAMEBUFPTR, 0x000000),          // low 24 bits of 0x04000000
+        geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | (0x04 << 16)), // high byte = 0x04
+        geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
+        geCmd(GE_CMD.CLEAR, 0x101),
+        geCmd(GE_CMD.BASE, (VERT_ADDR >>> 8) & 0xFFFFFF),
+        geCmd(GE_CMD.VTYPE, (1 << 23) | (7 << 2) | (2 << 7)),
+        geCmd(GE_CMD.VADDR, VERT_ADDR & 0xFFFFFF),
+        geCmd(GE_CMD.PRIM, (6 << 16) | 2),
+        geCmd(GE_CMD.CLEAR, 0x000),
+        geCmd(GE_CMD.FINISH),
+        geCmd(GE_CMD.END),
+      ]);
+
+      ge.executeList(LIST_ADDR, 0);
+
+      // Blue stored as [B=0xFF, G=0, R=0, A=0xFF] at VRAM offset 0
+      const vram = bus.vramBuffer;
+      expect(vram[0]).toBe(0xFF); // B of vertex → byte0
+      expect(vram[1]).toBe(0x00); // G
+      expect(vram[2]).toBe(0x00); // R of vertex
       expect(vram[3]).toBe(0xFF); // A
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lighting unit tests (standalone, no GE processor needed)
+// ---------------------------------------------------------------------------
+
+function makeLightingState(overrides: Partial<LightingState> = {}): LightingState {
+  return {
+    lightingEnable: true,
+    lightEnable: [false, false, false, false],
+    lightType: [0, 0, 0, 0],
+    lightPos: new Float32Array(12),
+    lightDir: new Float32Array(12),
+    lightAtt: new Float32Array(12),
+    lightSpotExp: new Float32Array(4),
+    lightSpotCutoff: new Float32Array(4),
+    lightAmbientColor: new Uint32Array(4),
+    lightDiffuseColor: new Uint32Array(4),
+    lightSpecularColor: new Uint32Array(4),
+    ambientColor: 0,
+    ambientAlpha: 0,
+    materialEmissive: 0,
+    materialAmbient: 0xFFFFFF,
+    materialAlpha: 0xFF,
+    materialDiffuse: 0xFFFFFF,
+    materialSpecular: 0xFFFFFF,
+    materialSpecCoef: 1.0,
+    lightMode: 0,
+    materialUpdate: 0,
+    reverseNormals: false,
+    ...overrides,
+  };
+}
+
+describe("computeVertexLighting", () => {
+  it("should return emissive color when no lights are enabled", () => {
+    const state = makeLightingState({
+      materialEmissive: 0x804020, // R=0x20, G=0x40, B=0x80
+    });
+    const result = computeVertexLighting(state, [0, 0, 0], [0, 0, 1], 0xFFFFFFFF, false);
+    const r = result & 0xFF;
+    const g = (result >>> 8) & 0xFF;
+    const b = (result >>> 16) & 0xFF;
+    expect(r).toBe(0x20);
+    expect(g).toBe(0x40);
+    expect(b).toBe(0x80);
+  });
+
+  it("should include global ambient contribution", () => {
+    const state = makeLightingState({
+      ambientColor: 0xFFFFFF, // white global ambient
+      ambientAlpha: 0xFF,
+      materialAmbient: 0xFFFFFF,
+      materialAlpha: 0xFF,
+      materialEmissive: 0,
+    });
+    const result = computeVertexLighting(state, [0, 0, 0], [0, 0, 1], 0xFFFFFFFF, false);
+    const r = result & 0xFF;
+    const g = (result >>> 8) & 0xFF;
+    const b = (result >>> 16) & 0xFF;
+    const a = (result >>> 24) & 0xFF;
+    // (mac * base) >> 10: mac = 0xFF*2+1=511, base = 0xFF*2+1=511
+    // 511 * 511 >> 10 = 261121 >> 10 = 255 (clamped)
+    expect(r).toBe(255);
+    expect(g).toBe(255);
+    expect(b).toBe(255);
+    expect(a).toBe(255);
+  });
+
+  it("should compute directional light diffuse contribution", () => {
+    // Light 0: directional, pointing in +Z direction, white diffuse
+    // lightType: bits[1:0]=1 (GE_LIGHTCOMP_BOTH), bits[9:8]=0 (directional)
+    const state = makeLightingState({
+      lightEnable: [true, false, false, false],
+      lightType: [1, 0, 0, 0], // comp=BOTH(1), type=directional(0<<8)
+      ambientColor: 0,
+      ambientAlpha: 0,
+      materialEmissive: 0,
+    });
+    // Light 0 position = (0, 0, 1) — directional light from +Z
+    state.lightPos[2] = 1.0;
+    // Light 0 diffuse = white
+    state.lightDiffuseColor[0] = 0xFFFFFF;
+
+    // Normal facing +Z → dot(L, N) = 1.0 → full diffuse
+    const result = computeVertexLighting(state, [0, 0, 0], [0, 0, 1], 0xFFFFFFFF, false);
+    const r = result & 0xFF;
+    const g = (result >>> 8) & 0xFF;
+    const b = (result >>> 16) & 0xFF;
+    // Should be bright (close to 255)
+    expect(r).toBeGreaterThan(200);
+    expect(g).toBeGreaterThan(200);
+    expect(b).toBeGreaterThan(200);
+  });
+
+  it("should produce zero diffuse when normal faces away from light", () => {
+    const state = makeLightingState({
+      lightEnable: [true, false, false, false],
+      lightType: [1, 0, 0, 0],
+      ambientColor: 0,
+      ambientAlpha: 0,
+      materialEmissive: 0,
+    });
+    state.lightPos[2] = 1.0;
+    state.lightDiffuseColor[0] = 0xFFFFFF;
+
+    // Normal facing -Z → dot(L, N) = -1.0 → no diffuse
+    const result = computeVertexLighting(state, [0, 0, 0], [0, 0, -1], 0xFFFFFFFF, false);
+    const r = result & 0xFF;
+    const g = (result >>> 8) & 0xFF;
+    const b = (result >>> 16) & 0xFF;
+    expect(r).toBe(0);
+    expect(g).toBe(0);
+    expect(b).toBe(0);
+  });
+
+  it("should not compute specular when lightComp != BOTH", () => {
+    const state = makeLightingState({
+      lightEnable: [true, false, false, false],
+      lightType: [0, 0, 0, 0], // comp=ONLYDIFFUSE(0), type=directional
+      ambientColor: 0,
+      ambientAlpha: 0,
+      materialEmissive: 0,
+      materialSpecCoef: 10.0,
+    });
+    state.lightPos[2] = 1.0;
+    state.lightDiffuseColor[0] = 0x808080;
+    state.lightSpecularColor[0] = 0xFFFFFF;
+
+    // Normal = +Z, same as light → max specular IF it were enabled
+    const result = computeVertexLighting(state, [0, 0, 0], [0, 0, 1], 0xFFFFFFFF, false);
+    const r = result & 0xFF;
+    // With only diffuse (no specular), result should be moderate, not boosted by specular
+    // Diffuse: 0x80 light * 0xFF material * attspot → ~127
+    expect(r).toBeLessThan(180); // no specular boost
+  });
+
+  it("should use correct light type bits (geom type in bits 9:8)", () => {
+    // lightType = 0x101: comp=BOTH(1), geomType=point(1<<8)
+    const state = makeLightingState({
+      lightEnable: [true, false, false, false],
+      lightType: [0x101, 0, 0, 0],
+      ambientColor: 0,
+      ambientAlpha: 0,
+      materialEmissive: 0,
+    });
+    // Point light at (0, 0, 5) — vertex at origin
+    state.lightPos[0] = 0;
+    state.lightPos[1] = 0;
+    state.lightPos[2] = 5;
+    // Attenuation: kA=1, kB=0, kC=0 → att = 1/(1+0+0) = 1
+    state.lightAtt[0] = 1.0;
+    state.lightAtt[1] = 0;
+    state.lightAtt[2] = 0;
+    state.lightDiffuseColor[0] = 0xFFFFFF;
+
+    // Normal facing +Z → dot(L, N) = 1.0
+    const result = computeVertexLighting(state, [0, 0, 0], [0, 0, 1], 0xFFFFFFFF, false);
+    const r = result & 0xFF;
+    expect(r).toBeGreaterThan(200); // point light illuminates
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Patch tessellation unit tests
+// ---------------------------------------------------------------------------
+
+describe("tessellateBezier", () => {
+  function makeControlPoint(x: number, y: number, z: number): import("../src/gpu/ge-types.js").Vertex {
+    return { x, y, z, u: x / 3, v: y / 3, color: 0xFFFFFFFF, nx: 0, ny: 0, nz: 1, clipw: 1.0 };
+  }
+
+  it("should return empty for uCount < 4", () => {
+    const cp = Array.from({ length: 12 }, (_, i) => makeControlPoint(i % 3, Math.floor(i / 3), 0));
+    expect(tessellateBezier(cp, 3, 4, 2, 2, false)).toHaveLength(0);
+  });
+
+  it("should tessellate a flat 4x4 patch into triangles", () => {
+    // Create a flat 4x4 grid of control points on the XY plane
+    const cp: import("../src/gpu/ge-types.js").Vertex[] = [];
+    for (let v = 0; v < 4; v++) {
+      for (let u = 0; u < 4; u++) {
+        cp.push(makeControlPoint(u, v, 0));
+      }
+    }
+
+    const tris = tessellateBezier(cp, 4, 4, 2, 2, false);
+    // divU=2, divV=2 → 3x3 grid → 2x2 quads → 8 triangles → 24 vertices
+    expect(tris.length).toBe(24);
+
+    // All Z values should be 0 (flat patch)
+    for (const v of tris) {
+      expect(v.z).toBeCloseTo(0, 5);
+    }
+
+    // Corner vertices should match control point corners
+    // The first vertex in the first triangle should be at (0, 0, 0)
+    expect(tris[0]!.x).toBeCloseTo(0, 3);
+    expect(tris[0]!.y).toBeCloseTo(0, 3);
+  });
+
+  it("should compute normals for a flat patch as (0, 0, ±1)", () => {
+    const cp: import("../src/gpu/ge-types.js").Vertex[] = [];
+    for (let v = 0; v < 4; v++) {
+      for (let u = 0; u < 4; u++) {
+        cp.push(makeControlPoint(u, v, 0));
+      }
+    }
+
+    const tris = tessellateBezier(cp, 4, 4, 2, 2, false);
+    for (const v of tris) {
+      // Normal should be close to (0, 0, 1) or (0, 0, -1) for a flat XY-plane patch
+      expect(Math.abs(v.nz)).toBeCloseTo(1, 2);
+      expect(Math.abs(v.nx)).toBeCloseTo(0, 2);
+      expect(Math.abs(v.ny)).toBeCloseTo(0, 2);
+    }
+  });
+
+  it("should flip normals when patchFacing is true", () => {
+    const cp: import("../src/gpu/ge-types.js").Vertex[] = [];
+    for (let v = 0; v < 4; v++) {
+      for (let u = 0; u < 4; u++) {
+        cp.push(makeControlPoint(u, v, 0));
+      }
+    }
+
+    const trisNormal = tessellateBezier(cp, 4, 4, 2, 2, false);
+    const trisFlipped = tessellateBezier(cp, 4, 4, 2, 2, true);
+
+    // Normals should be opposite
+    expect(trisNormal[0]!.nz).toBeCloseTo(-trisFlipped[0]!.nz, 3);
+  });
+});
+
+describe("tessellateSpline", () => {
+  function makeControlPoint(x: number, y: number, z: number): import("../src/gpu/ge-types.js").Vertex {
+    return { x, y, z, u: x / 3, v: y / 3, color: 0xFFFFFFFF, nx: 0, ny: 0, nz: 1, clipw: 1.0 };
+  }
+
+  it("should return empty for uCount < 4", () => {
+    const cp = Array.from({ length: 12 }, (_, i) => makeControlPoint(i % 3, Math.floor(i / 3), 0));
+    expect(tessellateSpline(cp, 3, 4, 0, 0, 2, 2, false)).toHaveLength(0);
+  });
+
+  it("should tessellate a flat 4x4 spline into triangles", () => {
+    const cp: import("../src/gpu/ge-types.js").Vertex[] = [];
+    for (let v = 0; v < 4; v++) {
+      for (let u = 0; u < 4; u++) {
+        cp.push(makeControlPoint(u, v, 0));
+      }
+    }
+
+    // 4 control points → 1 patch, divU=2, divV=2 → 3x3 grid → 2x2 quads → 8 tris
+    const tris = tessellateSpline(cp, 4, 4, 3, 3, 2, 2, false);
+    expect(tris.length).toBe(24);
+
+    // All Z values should be approximately 0
+    for (const v of tris) {
+      expect(v.z).toBeCloseTo(0, 3);
+    }
+  });
+
+  it("should handle larger control point grids (5x5)", () => {
+    const cp: import("../src/gpu/ge-types.js").Vertex[] = [];
+    for (let v = 0; v < 5; v++) {
+      for (let u = 0; u < 5; u++) {
+        cp.push(makeControlPoint(u, v, 0));
+      }
+    }
+
+    // 5 control points → 2 patches per axis, divU=2, divV=2
+    // totalU = 2*2+1=5, totalV = 2*2+1=5 → 4x4 quads → 32 tris → 96 verts
+    const tris = tessellateSpline(cp, 5, 5, 3, 3, 2, 2, false);
+    expect(tris.length).toBe(96);
   });
 });
