@@ -172,12 +172,12 @@ export async function aesCbcDecrypt(data: Uint8Array, key: Uint8Array, iv: Uint8
   const lastBlock = aligned.slice(alignedLen - 16);
   const paddingPlain = new Uint8Array(16).fill(0x10); // PKCS7 pad for full block
   const paddingEnc = await crypto.subtle.encrypt(
-    { name: 'AES-CBC', iv: lastBlock } as AesCbcParams, ck, paddingPlain as unknown as ArrayBuffer
+    { name: 'AES-CBC', iv: lastBlock } as unknown as AesCbcParams, ck, paddingPlain as unknown as ArrayBuffer
   );
   const padded = new Uint8Array(alignedLen + 16);
   padded.set(aligned);
   padded.set(new Uint8Array(paddingEnc).slice(0, 16), alignedLen);
-  const result = await crypto.subtle.decrypt({ name: 'AES-CBC', iv } as AesCbcParams, ck, padded as unknown as ArrayBuffer);
+  const result = await crypto.subtle.decrypt({ name: 'AES-CBC', iv } as unknown as AesCbcParams, ck, padded as unknown as ArrayBuffer);
 
   const out = new Uint8Array(data.length);
   out.set(new Uint8Array(result).slice(0, alignedLen));
@@ -187,7 +187,7 @@ export async function aesCbcDecrypt(data: Uint8Array, key: Uint8Array, iv: Uint8
 
 export async function aesCbcEncrypt(data: Uint8Array, key: Uint8Array, iv: Uint8Array = ZERO_IV): Promise<Uint8Array> {
   const ck = await importAesKey(key);
-  const result = await crypto.subtle.encrypt({ name: 'AES-CBC', iv } as AesCbcParams, ck, data as unknown as ArrayBuffer);
+  const result = await crypto.subtle.encrypt({ name: 'AES-CBC', iv } as unknown as AesCbcParams, ck, data as unknown as ArrayBuffer);
   return new Uint8Array(result).slice(0, data.length);
 }
 
@@ -195,7 +195,7 @@ export async function aesCbcEncrypt(data: Uint8Array, key: Uint8Array, iv: Uint8
 
 function xorBlock(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) out[i] = a[i] ^ b[i];
+  for (let i = 0; i < 16; i++) out[i] = a[i]! ^ b[i]!;
   return out;
 }
 
@@ -203,7 +203,7 @@ function shiftLeft1(block: Uint8Array): Uint8Array {
   const out = new Uint8Array(16);
   let carry = 0;
   for (let i = 15; i >= 0; i--) {
-    const b = block[i];
+    const b = block[i]!;
     out[i] = ((b << 1) | carry) & 0xFF;
     carry = (b >> 7) & 1;
   }
@@ -216,9 +216,9 @@ async function generateSubkeys(key: Uint8Array): Promise<[Uint8Array, Uint8Array
   const zero = new Uint8Array(16);
   const L = await aesCbcEncrypt(zero, key);
   let K1 = shiftLeft1(L);
-  if (L[0] & 0x80) K1 = xorBlock(K1, RB);
+  if (L[0]! & 0x80) K1 = xorBlock(K1, RB);
   let K2 = shiftLeft1(K1);
-  if (K1[0] & 0x80) K2 = xorBlock(K2, RB);
+  if (K1[0]! & 0x80) K2 = xorBlock(K2, RB);
   return [K1, K2];
 }
 
@@ -245,11 +245,11 @@ export async function aesCmac(data: Uint8Array, key: Uint8Array): Promise<Uint8A
   for (let i = 0; i < n - 1; i++) {
     const block = data.slice(i * 16, (i + 1) * 16);
     const Y = xorBlock(X, block);
-    const enc = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: ZERO_IV } as AesCbcParams, ck, Y as unknown as ArrayBuffer);
+    const enc = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: ZERO_IV } as unknown as AesCbcParams, ck, Y as unknown as ArrayBuffer);
     X = new Uint8Array(enc).slice(0, 16);
   }
   const Y = xorBlock(X, lastBlock);
-  const enc = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: ZERO_IV } as AesCbcParams, ck, Y as unknown as ArrayBuffer);
+  const enc = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: ZERO_IV } as unknown as AesCbcParams, ck, Y as unknown as ArrayBuffer);
   return new Uint8Array(enc).slice(0, 16);
 }
 
@@ -258,13 +258,13 @@ export async function aesCmac(data: Uint8Array, key: Uint8Array): Promise<Uint8A
 /** kirk7: AES-128-CBC decrypt using keyvault[keyId] with zero IV. No header overhead. */
 export async function kirk7(data: Uint8Array, keyId: number): Promise<Uint8Array> {
   if (keyId < 0 || keyId >= keyvault.length) throw new Error(`kirk7: invalid keyId ${keyId}`);
-  return aesCbcDecrypt(data, keyvault[keyId]);
+  return aesCbcDecrypt(data, keyvault[keyId]!);
 }
 
 /** kirk4: AES-128-CBC encrypt using keyvault[keyId] with zero IV. */
 export async function kirk4(data: Uint8Array, keyId: number): Promise<Uint8Array> {
   if (keyId < 0 || keyId >= keyvault.length) throw new Error(`kirk4: invalid keyId ${keyId}`);
-  return aesCbcEncrypt(data, keyvault[keyId]);
+  return aesCbcEncrypt(data, keyvault[keyId]!);
 }
 
 // KIRK_CMD1_HEADER offsets
@@ -277,7 +277,7 @@ const HEADER_SIZE = 0x90;
 const KIRK_MODE_CMD1 = 1;
 
 function readU32LE(buf: Uint8Array, off: number): number {
-  return buf[off] | (buf[off+1] << 8) | (buf[off+2] << 16) | ((buf[off+3] << 24) >>> 0);
+  return buf[off]! | (buf[off+1]! << 8) | (buf[off+2]! << 16) | ((buf[off+3]! << 24) >>> 0);
 }
 
 /**

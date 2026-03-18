@@ -35,7 +35,6 @@ const SLTU  = 0x2b;
 const SLL   = 0x00;
 const SRL   = 0x02;
 const SRA   = 0x03;
-const JR    = 0x08;
 const MFLO  = 0x12;
 const MULTU_FUNCT = 0x19;
 const ADDIU = 0x09;
@@ -50,7 +49,7 @@ describe("AllegrexCPU — ALU instructions", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("ADDU: r3 = r1 + r2", () => {
@@ -149,7 +148,7 @@ describe("AllegrexCPU — immediate instructions", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("ADDIU: r2 = r1 + imm", () => {
@@ -184,7 +183,7 @@ describe("AllegrexCPU — load/store", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("SW + LW round-trip", () => {
@@ -205,7 +204,7 @@ describe("AllegrexCPU — multiply", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("MULTU + MFLO: 6 * 7 = 42", () => {
@@ -224,7 +223,7 @@ describe("AllegrexCPU — LL/SC", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("LL loads a word from memory", () => {
@@ -253,7 +252,7 @@ describe("AllegrexCPU — MOVZ/MOVN", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("MOVZ: rd=rs when rt==0", () => {
@@ -298,7 +297,7 @@ describe("AllegrexCPU — FPU (COP1)", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("MTC1 + MFC1 round-trip", () => {
@@ -332,8 +331,9 @@ describe("AllegrexCPU — FPU (COP1)", () => {
     expect(cpu.regs.getFpr(2)).toBeCloseTo(21.0);
   });
 
-  it("CVT.W.S truncates float to int in FPR", () => {
+  it("CVT.W.S truncates float to int in FPR (FCR31 truncate mode)", () => {
     cpu.regs.setFpr(0, 3.7);
+    cpu.regs.fcr31 = 1; // rounding mode 1 = truncate toward zero
     // CVT.W.S fd=1, fs=0 → COP1 fmt=0x10, funct=0x24
     const cvt = ((0x11 << 26) | (0x10 << 21) | (0 << 16) | (0 << 11) | (1 << 6) | 0x24) >>> 0;
     loadProgram(cpu, [cvt]);
@@ -359,7 +359,7 @@ describe("AllegrexCPU — VFPU", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("LV.S loads float into VFPU register", () => {
@@ -392,17 +392,17 @@ describe("AllegrexCPU — VFPU", () => {
   });
 });
 
-describe("AllegrexCPU — SPECIAL2 (CLZ, MADD)", () => {
+describe("AllegrexCPU — SPECIAL (CLZ, MADD)", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("CLZ: count leading zeros of 0x00FF0000 = 8", () => {
     cpu.regs.setGpr(1, 0x00FF0000);
-    // CLZ rd=2, rs=1 → SPECIAL2(0x1c) funct=0x20
-    const clz = ((0x1c << 26) | (1 << 21) | (0 << 16) | (2 << 11) | 0x20) >>> 0;
+    // CLZ rd=2, rs=1 → SPECIAL(0x00) funct=0x16
+    const clz = ((0x00 << 26) | (1 << 21) | (0 << 16) | (2 << 11) | 0x16) >>> 0;
     loadProgram(cpu, [clz]);
     cpu.step();
     expect(cpu.regs.getGpr(2)).toBe(8);
@@ -410,7 +410,8 @@ describe("AllegrexCPU — SPECIAL2 (CLZ, MADD)", () => {
 
   it("CLZ of 0 = 32", () => {
     cpu.regs.setGpr(1, 0);
-    const clz = ((0x1c << 26) | (1 << 21) | (0 << 16) | (2 << 11) | 0x20) >>> 0;
+    // CLZ rd=2, rs=1 → SPECIAL(0x00) funct=0x16
+    const clz = ((0x00 << 26) | (1 << 21) | (0 << 16) | (2 << 11) | 0x16) >>> 0;
     loadProgram(cpu, [clz]);
     cpu.step();
     expect(cpu.regs.getGpr(2)).toBe(32);
@@ -421,7 +422,7 @@ describe("AllegrexCPU — SPECIAL3 (EXT, INS)", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("EXT: extract bits 4-7 from 0xFF", () => {
@@ -448,7 +449,7 @@ describe("AllegrexCPU — branches", () => {
   let cpu: AllegrexCPU;
 
   beforeEach(() => {
-    cpu = new AllegrexCPU(new MemoryBus());
+    cpu = new AllegrexCPU(MemoryBus.create());
   });
 
   it("BEQ taken: jumps over second instruction", () => {
