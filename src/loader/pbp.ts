@@ -20,7 +20,7 @@
  * The last entry's size is (totalFileSize - offset[7]).
  */
 
-const PBP_MAGIC   = 0x00504250; // "\x00PBP" as little-endian uint32
+const PBP_MAGIC   = 0x50425000; // bytes [00 50 42 50] as little-endian uint32
 const DATA_PSP_IDX = 6;         // index of data.psp in the offset table
 
 export interface PbpContents {

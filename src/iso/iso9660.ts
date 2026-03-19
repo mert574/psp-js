@@ -74,10 +74,13 @@ function readDirRecord(buffer: ArrayBuffer, recordOffset: number): IsoFile | nul
     name = identBytes[0] === 0x00 ? "." : "..";
   } else {
     name = decoder.decode(identBytes);
-    // Strip version suffix (e.g. ";1")
+    // Strip version suffix (e.g. ";1") and trailing dot (ISO 9660 Level 1)
     const semicolonIdx = name.indexOf(";");
     if (semicolonIdx !== -1) {
       name = name.slice(0, semicolonIdx);
+    }
+    if (name.endsWith(".")) {
+      name = name.slice(0, -1);
     }
   }
 
@@ -119,4 +122,90 @@ function readDirectory(buffer: ArrayBuffer, lba: number, size: number): IsoFile[
 export function readFile(buffer: ArrayBuffer, file: IsoFile): Uint8Array {
   const offset = file.lba * SECTOR_SIZE;
   return new Uint8Array(buffer, offset, file.size);
+}
+
+/**
+ * Parse ISO structure by reading only the needed sectors from a File.
+ * Uses file.slice() to avoid loading the entire ISO into memory.
+ */
+export async function parseIsoFromFile(file: File): Promise<IsoVolume> {
+  // Read PVD sector
+  const pvdBuf = await file.slice(PVD_SECTOR * SECTOR_SIZE, (PVD_SECTOR + 1) * SECTOR_SIZE).arrayBuffer();
+  const pvdView = new DataView(pvdBuf);
+
+  const type = pvdView.getUint8(0);
+  if (type !== 1) throw new Error(`Expected PVD type 1, got ${type}`);
+
+  const ident = decoder.decode(new Uint8Array(pvdBuf, 1, 5));
+  if (ident !== "CD001") throw new Error(`Invalid ISO 9660 identifier: "${ident}"`);
+
+  const volumeId = decoder.decode(new Uint8Array(pvdBuf, 40, 32)).trimEnd();
+
+  // Root directory record at PVD offset 156
+  const rootRecord = readDirRecordFromView(pvdView, 156);
+  if (!rootRecord) throw new Error("Failed to read root directory record from PVD");
+
+  rootRecord.children = await readDirectoryFromFile(file, rootRecord.lba, rootRecord.size);
+
+  return { volumeId, root: rootRecord };
+}
+
+function readDirRecordFromView(view: DataView, off: number): IsoFile | null {
+  const recordLength = view.getUint8(off);
+  if (recordLength === 0) return null;
+
+  const lba = view.getUint32(off + 2, true);
+  const size = view.getUint32(off + 10, true);
+  const flags = view.getUint8(off + 25);
+  const isDirectory = (flags & 0x02) !== 0;
+  const identLen = view.getUint8(off + 32);
+  const identBytes = new Uint8Array(view.buffer, view.byteOffset + off + 33, identLen);
+
+  let name: string;
+  if (identLen === 1 && (identBytes[0] === 0x00 || identBytes[0] === 0x01)) {
+    name = identBytes[0] === 0x00 ? "." : "..";
+  } else {
+    name = decoder.decode(identBytes);
+    const semi = name.indexOf(";");
+    if (semi !== -1) name = name.slice(0, semi);
+    if (name.endsWith(".")) name = name.slice(0, -1);
+  }
+
+  return { name, isDirectory, lba, size };
+}
+
+async function readDirectoryFromFile(file: File, lba: number, size: number): Promise<IsoFile[]> {
+  const sectorOffset = lba * SECTOR_SIZE;
+  const buf = await file.slice(sectorOffset, sectorOffset + size).arrayBuffer();
+  const view = new DataView(buf);
+  const files: IsoFile[] = [];
+  let pos = 0;
+
+  while (pos < size) {
+    const recordLength = view.getUint8(pos);
+    if (recordLength === 0) {
+      const nextSectorBoundary = (Math.floor(pos / SECTOR_SIZE) + 1) * SECTOR_SIZE;
+      if (nextSectorBoundary >= size) break;
+      pos = nextSectorBoundary;
+      continue;
+    }
+
+    const entry = readDirRecordFromView(view, pos);
+    if (entry && entry.name !== "." && entry.name !== "..") {
+      if (entry.isDirectory) {
+        entry.children = await readDirectoryFromFile(file, entry.lba, entry.size);
+      }
+      files.push(entry);
+    }
+    pos += recordLength;
+  }
+
+  return files;
+}
+
+/** Read a specific file from an ISO File object using slice (no full buffer needed). */
+export async function readFileFromIso(file: File, entry: IsoFile): Promise<Uint8Array> {
+  const offset = entry.lba * SECTOR_SIZE;
+  const buf = await file.slice(offset, offset + entry.size).arrayBuffer();
+  return new Uint8Array(buf);
 }

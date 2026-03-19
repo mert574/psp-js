@@ -307,6 +307,7 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
   gap: 0 16px;
   align-items: start;
   width: 100%;
+  min-height: calc(100vh - 60px - 40px);
 }
 @media (max-width: 1200px) {
   .gameplay-cols {
@@ -318,7 +319,9 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   min-width: 0;
+  align-self: stretch;
 }
 
 /* ── Perf bar (Steam Deck–style) ─────────────────────────────────────────── */
@@ -506,7 +509,7 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: calc(100vh - 80px);
+  height: calc(100vh - 60px - 40px);
   overflow-y: auto;
   position: sticky;
   top: 60px;

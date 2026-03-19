@@ -81,9 +81,37 @@ export interface LoadResult {
   nidBySyscall: Map<number, number>;
   /** Highest address written by any PT_LOAD segment (aligned to 256 bytes) */
   loadedEnd: number;
+  /** Next available syscall code (for loading additional modules) */
+  nextSyscallCode: number;
+  /** Module name from module_info */
+  moduleName: string;
 }
 
-export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
+/**
+ * Compute total memory size needed by ELF PT_LOAD segments without loading.
+ * Returns 0 if no loadable segments found.
+ */
+export function computeElfMemorySize(data: Uint8Array): number {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const le = data[5] === 1;
+  const phoff     = view.getUint32(0x1c, le);
+  const phentsize = view.getUint16(0x2a, le);
+  const phnum     = view.getUint16(0x2c, le);
+
+  let lo = 0xFFFFFFFF;
+  let hi = 0;
+  for (let i = 0; i < phnum; i++) {
+    const ph = phoff + i * phentsize;
+    if (view.getUint32(ph, le) !== PT_LOAD) continue;
+    const vaddr = view.getUint32(ph + 0x08, le);
+    const memsz = view.getUint32(ph + 0x14, le);
+    if (vaddr < lo) lo = vaddr;
+    if (vaddr + memsz > hi) hi = vaddr + memsz;
+  }
+  return hi > lo ? ((hi - lo + 0xFF) & ~0xFF) : 0;
+}
+
+export function loadElf(data: Uint8Array, bus: MemoryBus, baseAddress?: number, startSyscallCode?: number): LoadResult {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
 
   // Validate ELF magic
@@ -106,7 +134,7 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
 
   // PRX modules use relative addresses — relocate to a base address
   const isPrx = eType === ET_PRX;
-  const baseAddr = isPrx ? PRX_BASE : 0;
+  const baseAddr = isPrx ? (baseAddress ?? PRX_BASE) : 0;
 
   log.debug(`type=0x${eType.toString(16)} entry=0x${entryPoint.toString(16)} phoff=${phoff} phnum=${phnum} shoff=${shoff} shnum=${shnum} shentsize=${shentsize} isPrx=${isPrx}`);
   if (isPrx && shoff !== 0) {
@@ -223,8 +251,9 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
       moduleStartFunc = parseExportTable(bus, libent, libentend);
     }
 
+    let nextCode = startSyscallCode ?? 1;
     if (libstub !== 0 && libstubend > libstub) {
-      patchImportStubs(bus, libstub, libstubend, nidBySyscall);
+      nextCode = patchImportStubs(bus, libstub, libstubend, nidBySyscall, nextCode);
     } else {
       log.warn(`No import stubs found (libstub=0x${libstub.toString(16)} libstubend=0x${libstubend.toString(16)})`);
     }
@@ -234,10 +263,10 @@ export function loadElf(data: Uint8Array, bus: MemoryBus): LoadResult {
       log.debug(`module_start_func=0x${moduleStartFunc.toString(16)} differs from ELF entry=0x${elfEntry.toString(16)}`);
     }
 
-    return { entryPoint: elfEntry, moduleStartFunc, gp: gpValue, nidBySyscall, loadedEnd };
+    return { entryPoint: elfEntry, moduleStartFunc, gp: gpValue, nidBySyscall, loadedEnd, nextSyscallCode: nextCode, moduleName: modName };
   }
 
-  return { entryPoint: (entryPoint + baseAddr) >>> 0, moduleStartFunc: null, gp: 0, nidBySyscall, loadedEnd };
+  return { entryPoint: (entryPoint + baseAddr) >>> 0, moduleStartFunc: null, gp: 0, nidBySyscall, loadedEnd, nextSyscallCode: startSyscallCode ?? 1, moduleName: "" };
 }
 
 /**
@@ -306,9 +335,10 @@ function patchImportStubs(
   bus: MemoryBus,
   libstub: number, libstubend: number,
   nidBySyscall: Map<number, number>,
-): void {
+  startCode: number = 1,
+): number {
   let pos = libstub;
-  let nextSyscallCode = 1; // start at 1, 0 reserved
+  let nextSyscallCode = startCode;
   let totalPatched = 0;
 
   while (pos < libstubend) {
@@ -350,6 +380,7 @@ function patchImportStubs(
   }
 
   log.info(`Patched ${totalPatched} import stubs (${nextSyscallCode - 1} syscall codes assigned)`);
+  return nextSyscallCode;
 }
 
 /**

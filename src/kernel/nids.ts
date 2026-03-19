@@ -1608,6 +1608,26 @@ export const OPENPSID = {
   sceOpenPSIDGetProductCode: 0xb29330de,
 } as const;
 
+// ── REG ──────────────────────────────────────────────────────────────────
+export const REG = {
+  sceRegOpenRegistry: 0x92e41280,
+  sceRegCloseRegistry: 0xfa8a5739,
+  sceRegRemoveRegistry: 0xdeda92bf,
+  sceRegOpenCategory: 0x1d8a762e,
+  sceRegCloseCategory: 0x0cae832b,
+  sceRegFlushRegistry: 0x39461b4d,
+  sceRegFlushCategory: 0x0d69bf40,
+  sceRegCreateKey: 0x57641a81,
+  sceRegSetKeyValue: 0x17768e14,
+  sceRegGetKeyInfo: 0xd4475aa8,
+  sceRegGetKeyValue: 0x28a8e98a,
+  sceRegGetKeysNum: 0x2c0db9dd,
+  sceRegGetKeys: 0x2d211135,
+  sceRegGetKeyInfoByName: 0xc5768d02,
+  sceRegGetKeyValueByName: 0x30be0259,
+  sceRegRemoveCategory: 0x4ca16893,
+} as const;
+
 // ── P3DA ──────────────────────────────────────────────────────────────────
 export const P3DA = {
   sceP3daBridgeCore: 0x013016f3,
@@ -1757,7 +1777,7 @@ export const NID_NAMES = new Map<number, string>(
     JPEG, MD5, MP3, MP4, MT19937,
     NET_ADHOC_MATCHING, NET_INET, NET_LIB, NET_RESOLVER, NP2,
     NP_DRM, OPENPSID, P3DA, PARSE_HTTP, PARSE_URI,
-    PAUTH, SFMT19937, SHA256, SIRCS, SSL,
+    PAUTH, REG, SFMT19937, SHA256, SIRCS, SSL,
     USB, USB_ACC, USB_GPS, USB_MIC, VAUDIO,
   ].flatMap(obj => Object.entries(obj).map(([name, nid]) => [nid as number, name] as const))
 );

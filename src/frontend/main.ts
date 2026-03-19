@@ -1,7 +1,6 @@
 import "./style.css";
 import { Logger } from "../utils/logger.js";
-import { parseIso, readFile, type IsoVolume, type IsoFile } from "../iso/iso9660.js";
-import { extractFromBuffer } from "../iso/iso-metadata.js";
+import { parseIsoFromFile, readFileFromIso, type IsoVolume, type IsoFile } from "../iso/iso9660.js";
 import { setStatus, showError, clearError, showGameView, showFilePicker, showFileTree, clearGameVideo, clearGameAudio, playGameAudio, showAudioLoading, showAudioError, setMediaLoading, setGameCanvas, unlockAudio, showGameplayView, exitGameplayView, toggleGameplayHud, showAt3Loading, hideAt3Loading } from "./ui.js";
 import { InputHandler } from "./input.js";
 import { transcodeAt3, transcodePmfAudio } from "./pmf.js";
@@ -9,6 +8,7 @@ import { warmupAtracDecode, getDecodeConcurrency } from "../audio/atrac-decoder.
 import { decodePmfNative, type PmfPlayer } from "./pmf-native.js";
 import { PSPEmulator } from "../emulator.js";
 import { FramebufferRenderer } from "../gpu/framebuffer-renderer.js";
+import { WebGLGERenderer } from "../gpu/ge-webgl-renderer.js";
 import { DebugPanel } from "./debug-panel.js";
 import { SavedataOverlay } from "./savedata-overlay.js";
 import { SavedataList } from "./savedata-list.js";
@@ -35,8 +35,8 @@ const flash0Fonts = new Map<string, Uint8Array>();
 
 // ── Game library event ────────────────────────────────────────────────────────
 document.getElementById("game-library")?.addEventListener("game-select", (e: Event) => {
-  const file = (e as CustomEvent).detail.file as File;
-  void handleIso(file);
+  const detail = (e as CustomEvent).detail as { file: File; parentDir: FileSystemDirectoryHandle | null };
+  void handleIso(detail.file, detail.parentDir ?? undefined);
 });
 
 // Load bundled PPSSPP open-source replacement PGF fonts eagerly
@@ -82,14 +82,16 @@ function navTo(route: string, replace = false): void {
 let inputHandler: InputHandler | null = null;
 let emulator: PSPEmulator | null = null;
 let renderer: FramebufferRenderer | null = null;
+let geRenderer: WebGLGERenderer | null = null;
 let debugPanel: DebugPanel | null = null;
 let rafHandle: number = 0;
 let ebootBytes: Uint8Array | null = null;
 let mediaAbort: AbortController | null = null;
 let pmfPlayer: PmfPlayer | null = null;
-let lastIsoBuffer: ArrayBuffer | null = null;
 let lastIsoVolume: IsoVolume | null = null;
+let lastIsoFile: File | null = null;
 let pendingDirFiles: Map<string, Uint8Array> | null = null;
+let pendingStartDir: string | null = null;
 
 
 fileInputIso?.addEventListener("change", () => {
@@ -128,7 +130,9 @@ bootBtn.addEventListener("click", () => {
   window.addEventListener("keydown", onHudToggle);
 
   const canvas = document.getElementById("psp-canvas") as HTMLCanvasElement;
-  renderer = new FramebufferRenderer(canvas);
+
+  // Create WebGL GE renderer (GPU-accelerated primitives)
+  geRenderer = new WebGLGERenderer(canvas);
   debugPanel = new DebugPanel();
 
   emulator = new PSPEmulator();
@@ -154,25 +158,31 @@ bootBtn.addEventListener("click", () => {
     }
   });
 
-  // Register ISO filesystem for lazy file access by HLE
-  if (lastIsoVolume && lastIsoBuffer) {
-    registerIsoFileSystem(emulator.hle.fileData, lastIsoVolume.root, lastIsoBuffer);
-  }
-
-  // Register directory files loaded via "Open Directory"
-  if (pendingDirFiles) {
-    for (const [key, val] of pendingDirFiles) {
-      emulator.hle.fileData.set(key, val);
-    }
-    log.info(`Registered ${pendingDirFiles.size} directory files for HLE`);
-  }
-
-  // Register any PSP flash0 font files the user loaded
-  for (const [key, val] of flash0Fonts) {
-    emulator.hle.fileData.set(key, val);
-  }
-
   void (async () => {
+    // Register ISO filesystem for lazy file access by HLE
+    if (lastIsoVolume && lastIsoFile) {
+      await registerIsoFileSystem(emulator!.hle.fileData, lastIsoVolume.root, lastIsoFile);
+    }
+
+    // Register directory files loaded via "Open Directory" or PBP companion files
+    if (pendingDirFiles) {
+      for (const [key, val] of pendingDirFiles) {
+        emulator!.hle.fileData.set(key, val);
+      }
+      log.info(`Registered ${pendingDirFiles.size} directory files for HLE`);
+    }
+
+    // Set starting directory for homebrew PBP (ms0:/PSP/GAME/<dir>)
+    if (pendingStartDir) {
+      emulator!.hle.pspFs.setStartingDirectory(pendingStartDir);
+      log.info(`Starting directory: ${pendingStartDir}`);
+    }
+
+    // Register any PSP flash0 font files the user loaded
+    for (const [key, val] of flash0Fonts) {
+      emulator!.hle.fileData.set(key, val);
+    }
+
     if (!isAudioDisabled()) {
       // Unlock the Web Audio engine before starting the ELF so the AudioWorklet
       // is ready before the game's audio thread calls sceAudioOutputBlocking.
@@ -226,6 +236,12 @@ bootBtn.addEventListener("click", () => {
     }
 
     await emulator!.initWorker();
+
+    // Attach WebGL renderer to the GE processor for GPU-accelerated rendering
+    if (geRenderer) {
+      emulator!.hle.ensureGeProcessor().webglRenderer = geRenderer;
+    }
+
     startRafLoop();
   })();
 });
@@ -298,6 +314,8 @@ function onHudToggle(e: KeyboardEvent): void {
 
 function teardownGameplay(): void {
   stopRafLoop();
+  geRenderer?.destroy();
+  geRenderer = null;
   renderer?.destroy();
   renderer = null;
   debugPanel?.destroy();
@@ -342,6 +360,9 @@ function runOneFrame(): void {
   _frameCount++;
   if (_frameCount >= 1_000_000_000) _frameCount = 0;
 
+  // Invalidate textures that may have been modified in RAM since last frame
+  geRenderer?.onFrameStart();
+
   let cpuMs = 0;
   try {
     const cpuStart = performance.now();
@@ -356,69 +377,14 @@ function runOneFrame(): void {
 
   const hle = emulator.hle;
   const fbAddr = hle.framebufAddr !== 0 ? hle.framebufAddr : hle.geFbAddr;
-  if (fbAddr !== 0 && renderer) {
+
+  // Present: WebGL GE renderer → screen (GPU-accelerated path)
+  if (geRenderer) {
+    geRenderer.presentToScreen();
+  } else if (fbAddr !== 0 && renderer) {
+    // Fallback: upload VRAM bytes as texture
     renderer.render(emulator.bus.vramBuffer, fbAddr, hle.framebufWidth, hle.framebufFormat);
   }
-  // One-time VRAM diagnostic
-  if (_frameCount === 60) {
-    const vram = emulator.bus.vramBuffer;
-    const isShared = vram.buffer instanceof SharedArrayBuffer;
-    const off = fbAddr !== 0 ? (fbAddr & 0x1FFFFFFF) - 0x04000000 : -1;
-    let nz = 0;
-    if (off >= 0) for (let i = 0; i < Math.min(480*272*4, vram.length - off); i++) { if (vram[off+i] !== 0) nz++; }
-    console.log(`[VRAM-CHECK] shared=${isShared} fbAddr=0x${fbAddr.toString(16)} off=${off} nonZero=${nz}/${480*272*4} vramLen=${vram.length}`);
-  }
-
-  // Debug VRAM canvas: raw 2D pixel dump from VRAM at the framebuffer address
-  if (fbAddr !== 0) {
-    let dbgCanvas = document.getElementById("debug-vram") as HTMLCanvasElement | null;
-    if (!dbgCanvas) {
-      dbgCanvas = document.createElement("canvas");
-      dbgCanvas.id = "debug-vram";
-      dbgCanvas.width = 480;
-      dbgCanvas.height = 272;
-      dbgCanvas.style.cssText = "position:fixed;bottom:10px;right:10px;width:240px;height:136px;border:1px solid #0f0;z-index:9999;image-rendering:pixelated;background:#000;";
-      document.body.appendChild(dbgCanvas);
-    }
-    const ctx = dbgCanvas.getContext("2d")!;
-    const imgData = ctx.createImageData(480, 272);
-    const vram = emulator.bus.vramBuffer;
-    const offset = (fbAddr & 0x1FFFFFFF) - 0x04000000;
-    const stride = hle.framebufWidth || 512;
-    const fmt = hle.framebufFormat;
-    if (offset >= 0 && offset + stride * 272 * 4 <= vram.length) {
-      for (let y = 0; y < 272; y++) {
-        for (let x = 0; x < 480; x++) {
-          const dst = (y * 480 + x) * 4;
-          if (fmt === 3) {
-            // ABGR8888
-            const src = offset + (y * stride + x) * 4;
-            imgData.data[dst]     = vram[src + 2]!; // R from B
-            imgData.data[dst + 1] = vram[src + 1]!; // G
-            imgData.data[dst + 2] = vram[src]!;     // B from R
-            imgData.data[dst + 3] = 255;
-          } else if (fmt === 0) {
-            // BGR5650
-            const src = offset + (y * stride + x) * 2;
-            const px = vram[src]! | (vram[src + 1]! << 8);
-            imgData.data[dst]     = ((px >> 11) & 0x1F) << 3;
-            imgData.data[dst + 1] = ((px >> 5) & 0x3F) << 2;
-            imgData.data[dst + 2] = (px & 0x1F) << 3;
-            imgData.data[dst + 3] = 255;
-          } else {
-            // Fallback: read as ABGR8888
-            const src = offset + (y * stride + x) * 4;
-            imgData.data[dst]     = vram[src + 2]!;
-            imgData.data[dst + 1] = vram[src + 1]!;
-            imgData.data[dst + 2] = vram[src]!;
-            imgData.data[dst + 3] = 255;
-          }
-        }
-      }
-    }
-    ctx.putImageData(imgData, 0, 0);
-  }
-
   const hudFps = document.getElementById("hud-fps");
   const hudFrame = document.getElementById("hud-frame");
   const hudTid = document.getElementById("hud-tid");
@@ -489,34 +455,129 @@ function stopRafLoop(): void {
 
 // ── ISO → HLE filesystem bridge ───────────────────────────────────────────────
 
-/** Walk the ISO tree and register all files as disc0:/ paths for HLE access. */
-function registerIsoFileSystem(
+/** Walk the ISO tree and register lazy file readers for disc0:/ paths.
+ *  Files are read on-demand from the ISO File using slice(), avoiding loading the entire ISO into memory. */
+async function registerIsoFileSystem(
   fileData: Map<string, Uint8Array>,
   root: IsoFile,
-  isoBuffer: ArrayBuffer,
-): void {
+  isoFile: File,
+): Promise<void> {
   fileData.clear();
+  const entries: Array<{ path: string; entry: IsoFile }> = [];
   function walk(entry: IsoFile, prefix: string): void {
     if (entry.isDirectory) {
       for (const child of entry.children ?? []) {
         walk(child, `${prefix}/${entry.name}`);
       }
     } else {
-      // Lazily read on first access? No — just register the path.
-      // readFile is cheap (subarray), actual copy only when needed.
-      const pspPath = `disc0:${prefix}/${entry.name}`;
-      const data = readFile(isoBuffer, entry);
-      fileData.set(pspPath, new Uint8Array(data));
+      entries.push({ path: `disc0:${prefix}/${entry.name}`, entry });
     }
   }
   for (const child of root.children ?? []) {
     walk(child, "");
   }
+  // Read all files from ISO on demand. For the boot phase, read them eagerly
+  // but using slice() so we never hold the entire ISO buffer in memory at once.
+  for (const { path, entry } of entries) {
+    try {
+      const data = await readFileFromIso(isoFile, entry);
+      fileData.set(path, data);
+    } catch {
+      // Skip files that can't be read (may be beyond file bounds)
+    }
+  }
   log.info(`Registered ${fileData.size} ISO files for HLE`);
 }
 
+interface GameMetadata {
+  title: string;
+  discId: string;
+  region: string;
+  version: string;
+  parentalLevel: number;
+  category: string;
+  saveTitle: string;
+  saveDetail: string;
+  iconUrl: string | null;
+  bgUrl: string | null;
+  logoUrl: string | null;
+}
+
+/** Extract game metadata (title, icons, etc.) from an ISO File using lazy reads. */
+async function extractMetadataFromIso(isoFile: File, volume: IsoVolume, pspGame: IsoFile): Promise<GameMetadata> {
+  const { parseSfo, extractGameInfo } = await import("../iso/sfo.js");
+  const meta: GameMetadata = {
+    title: volume.volumeId, discId: "", region: "", version: "",
+    parentalLevel: 0, category: "", saveTitle: "", saveDetail: "",
+    iconUrl: null, bgUrl: null, logoUrl: null,
+  };
+
+  const sfoEntry = pspGame.children?.find(f => !f.isDirectory && f.name.toUpperCase() === "PARAM.SFO");
+  if (sfoEntry) {
+    try {
+      const sfoData = await readFileFromIso(isoFile, sfoEntry);
+      const parsed = parseSfo(sfoData.slice().buffer);
+      const info = extractGameInfo(parsed);
+      meta.title = info.title || meta.title;
+      meta.discId = info.discId;
+      meta.region = info.region;
+      meta.version = info.version;
+      meta.parentalLevel = info.parentalLevel;
+      meta.category = info.category;
+      meta.saveTitle = info.saveTitle;
+      meta.saveDetail = info.saveDetail;
+    } catch { /* non-fatal */ }
+  }
+
+  meta.iconUrl = await readImageFromIso(isoFile, pspGame, "ICON0.PNG");
+  meta.bgUrl = await readImageFromIso(isoFile, pspGame, "PIC1.PNG");
+  meta.logoUrl = await readImageFromIso(isoFile, pspGame, "PIC0.PNG");
+
+  return meta;
+}
+
+async function readImageFromIso(isoFile: File, dir: IsoFile, name: string): Promise<string | null> {
+  const entry = dir.children?.find(f => !f.isDirectory && f.name.toUpperCase() === name);
+  if (!entry) return null;
+  try {
+    const data = await readFileFromIso(isoFile, entry);
+    return URL.createObjectURL(new Blob([data.slice().buffer], { type: "image/png" }));
+  } catch {
+    return null;
+  }
+}
+
+/** Read all files from a directory for HLE filesystem registration.
+ *  Registers under the given device prefix (e.g. "ms0:/PSP/GAME/Duke3D"). */
+async function loadCompanionFiles(
+  dir: FileSystemDirectoryHandle,
+  devicePrefix: string,
+): Promise<Map<string, Uint8Array>> {
+  const files = new Map<string, Uint8Array>();
+
+  async function walk(handle: FileSystemDirectoryHandle, prefix: string): Promise<void> {
+    for await (const entry of handle.values()) {
+      if (entry.kind === "file") {
+        try {
+          const fh = entry as FileSystemFileHandle;
+          const file = await fh.getFile();
+          const buf = await file.arrayBuffer();
+          files.set(`${prefix}/${entry.name}`, new Uint8Array(buf));
+        } catch { /* skip unreadable files */ }
+      } else if (entry.kind === "directory") {
+        try {
+          await walk(entry as FileSystemDirectoryHandle, `${prefix}/${entry.name}`);
+        } catch { /* skip unreadable dirs */ }
+      }
+    }
+  }
+
+  await walk(dir, devicePrefix);
+  return files;
+}
+
 // ── ISO loading ───────────────────────────────────────────────────────────────
-async function handleIso(file: File): Promise<void> {
+async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle): Promise<void> {
   clearError();
   clearGameVideo();
   clearGameAudio();
@@ -524,25 +585,36 @@ async function handleIso(file: File): Promise<void> {
   pendingDirFiles = null;
   setStatus(`Reading ${file.name}…`);
 
-  let buffer: ArrayBuffer;
-  try {
-    buffer = await file.arrayBuffer();
-  } catch (err) {
-    showError(`Could not read file: ${String(err)}`, err);
-    setStatus("");
+  // Free previous ISO data
+  lastIsoVolume = null;
+  lastIsoFile = null;
+
+  // PBP/EBOOT files are not ISOs — treat as direct EBOOT with companion files.
+  // PPSSPP mounts the game directory as the device root (umd0:/), so /file.grp
+  // resolves to the game's directory. We register files under disc0:/ to match,
+  // since that's the default device and the starting directory.
+  const ext = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+  if (ext === ".pbp" || ext === ".bin" || ext === ".elf") {
+    if (parentDir) {
+      pendingDirFiles = await loadCompanionFiles(parentDir, "disc0:");
+      pendingStartDir = "disc0:/";
+    }
+    await handleEboot(file);
     return;
   }
 
+  // Parse ISO structure using lazy reads (only directory metadata, not file content).
+  // This avoids loading the entire ISO into memory (critical for 1+ GB games).
   let volume: IsoVolume;
   try {
-    volume = parseIso(buffer);
+    volume = await parseIsoFromFile(file);
   } catch (err) {
     showError(`Not a valid PSP ISO: ${String(err)}`, err);
     setStatus("");
     return;
   }
-  lastIsoBuffer = buffer;
   lastIsoVolume = volume;
+  lastIsoFile = file;
 
   const pspGame = volume.root.children?.find(
     (f) => f.isDirectory && f.name.toUpperCase() === "PSP_GAME"
@@ -554,7 +626,7 @@ async function handleIso(file: File): Promise<void> {
     return;
   }
 
-  // Locate SYSDIR/EBOOT.BIN for the emulator
+  // Read only EBOOT.BIN (typically ~10-50MB, not the whole ISO)
   ebootBytes = null;
   const sysdirEntry = pspGame.children?.find(
     (f) => f.isDirectory && f.name.toUpperCase() === "SYSDIR"
@@ -565,7 +637,7 @@ async function handleIso(file: File): Promise<void> {
     );
     if (ebootEntry) {
       try {
-        ebootBytes = readFile(buffer, ebootEntry).slice();
+        ebootBytes = await readFileFromIso(file, ebootEntry);
         log.info(`EBOOT.BIN extracted: ${ebootBytes.byteLength} bytes`);
       } catch (err) {
         log.warn(`Could not read EBOOT.BIN: ${err}`);
@@ -573,7 +645,8 @@ async function handleIso(file: File): Promise<void> {
     }
   }
 
-  const meta = extractFromBuffer(buffer, volume);
+  // Read PARAM.SFO + icons for metadata (small files)
+  const meta = await extractMetadataFromIso(file, volume, pspGame);
 
   const pmfEntry   = pspGame.children?.find((f) => !f.isDirectory && f.name.toUpperCase() === "ICON1.PMF");
   const at3Entry   = pspGame.children?.find((f) => !f.isDirectory && f.name.toUpperCase() === "SND0.AT3");
@@ -596,11 +669,9 @@ async function handleIso(file: File): Promise<void> {
   setStatus(`Loaded: ${gameInfo.title}${gameInfo.discId ? ` · ${gameInfo.discId}` : ""}`);
   navTo(`game/${currentGameSlug}`);
 
-  // Pre-read media data as independent copies before any transcoding starts.
-  // readFile() returns a view into the ISO ArrayBuffer; FFmpeg's writeFile()
-  // may transfer (detach) that buffer, making later views invalid.
-  const pmfData = pmfEntry ? readFile(buffer, pmfEntry).slice() : undefined;
-  const at3Data = at3Entry ? readFile(buffer, at3Entry).slice() : undefined;
+  // Read media files on demand from ISO (small files, read lazily)
+  const pmfData = pmfEntry ? await readFileFromIso(file, pmfEntry) : undefined;
+  const at3Data = at3Entry ? await readFileFromIso(file, at3Entry) : undefined;
 
   // Transcode PMF then AT3 sequentially (FFmpeg can only run one exec at a time)
   // Use AbortController so boot/change can cancel stale results
@@ -660,7 +731,7 @@ async function handleDirectory(files: FileList): Promise<void> {
   clearGameVideo();
   clearGameAudio();
   unlockAudio();
-  lastIsoBuffer = null;
+  lastIsoFile = null;
   lastIsoVolume = null;
   setStatus("Reading directory... (large directories may take a moment)");
 
@@ -740,9 +811,9 @@ async function handleEboot(file: File): Promise<void> {
   clearGameVideo();
   clearGameAudio();
   unlockAudio();
-  lastIsoBuffer = null;
+  lastIsoFile = null;
   lastIsoVolume = null;
-  pendingDirFiles = null;
+  // Don't clear pendingDirFiles — handleIso may have set companion files before calling us
   setStatus(`Reading ${file.name}…`);
 
   let buf: ArrayBuffer;

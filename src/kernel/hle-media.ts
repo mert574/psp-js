@@ -4,7 +4,8 @@
 
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel } from "./hle-kernel.js";
-import { SAS, PSMF, RTC, VTIMER, DEFLT, G729, CCC, JPEG, P3DA } from "./nids.js";
+import { SAS, PSMF, RTC, VTIMER, DEFLT, G729, CCC, JPEG, P3DA, REG } from "./nids.js";
+import { lookupCategory, REG_TYPE_DIR, REG_TYPE_INT, REG_TYPE_STR, REG_TYPE_BIN, SCE_REG_ERROR_CATEGORY_NOT_FOUND } from "./psp-registry.js";
 
 const log = Logger.get("HLE-MEDIA");
 
@@ -711,6 +712,172 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   kernel.stub(CCC.sceCccUTF16toUTF8);
   kernel.stub(CCC.sceCccUTF8toSJIS);
   kernel.stub(CCC.sceCccUTF8toUTF16);
+  // ── sceReg — PPSSPP sceReg.cpp ────────────────────────────────────
+  // PSP system registry — games query language, button assign, network settings, etc.
+  // Full registry tree lookup using psp-registry.ts data.
+
+  let regCatHandleGen = 1;
+  const regOpenCategories = new Map<number, string>();
+
+  // sceRegOpenRegistry(paramAddr, mode, handleAddr) → 0
+  // Only one registry exists; handle is always 0.
+  kernel.register(REG.sceRegOpenRegistry, (regs, bus) => {
+    const handleAddr = regs.getGpr(6);
+    if (handleAddr !== 0) bus.writeU32(handleAddr, 0);
+    regs.setGpr(2, 0);
+  });
+
+  // sceRegCloseRegistry(handle) → 0
+  kernel.register(REG.sceRegCloseRegistry, (regs) => {
+    regOpenCategories.clear();
+    regs.setGpr(2, 0);
+  });
+
+  // sceRegOpenCategory(regHandle, nameAddr, mode, catHandleAddr) → 0 or error
+  kernel.register(REG.sceRegOpenCategory, (regs, bus) => {
+    const name = kernel.readCString(bus, regs.getGpr(5));
+    const catHandleAddr = regs.getGpr(7);
+    const result = lookupCategory(name);
+    if (!result) {
+      if (catHandleAddr !== 0) bus.writeU32(catHandleAddr, (-1 >>> 0));
+      log.warn(`sceRegOpenCategory("${name}") → NOT FOUND`);
+      regs.setGpr(2, SCE_REG_ERROR_CATEGORY_NOT_FOUND);
+      return;
+    }
+    const catHandle = regCatHandleGen++;
+    regOpenCategories.set(catHandle, name);
+    if (catHandleAddr !== 0) bus.writeU32(catHandleAddr, catHandle);
+    log.debug(`sceRegOpenCategory("${name}") → handle ${catHandle}`);
+    regs.setGpr(2, 0);
+  });
+
+  // sceRegCloseCategory(catHandle) → 0
+  kernel.register(REG.sceRegCloseCategory, (regs) => {
+    regOpenCategories.delete(regs.getGpr(4));
+    regs.setGpr(2, 0);
+  });
+
+  // sceRegGetKeysNum(catHandle, numAddr) → 0
+  kernel.register(REG.sceRegGetKeysNum, (regs, bus) => {
+    const catHandle = regs.getGpr(4);
+    const numAddr = regs.getGpr(5);
+    const path = regOpenCategories.get(catHandle);
+    if (path !== undefined) {
+      const result = lookupCategory(path);
+      if (result && numAddr !== 0) {
+        bus.writeU32(numAddr, result.count);
+        regs.setGpr(2, 0);
+        return;
+      }
+    }
+    if (numAddr !== 0) bus.writeU32(numAddr, 0);
+    regs.setGpr(2, 0);
+  });
+
+  // sceRegGetKeys(catHandle, bufAddr, num) → 0
+  // Writes key names as 27-byte null-terminated strings sequentially.
+  kernel.register(REG.sceRegGetKeys, (regs, bus) => {
+    const catHandle = regs.getGpr(4);
+    const bufAddr = regs.getGpr(5);
+    const num = regs.getGpr(6);
+    const path = regOpenCategories.get(catHandle);
+    if (path !== undefined && bufAddr !== 0) {
+      const result = lookupCategory(path);
+      if (result) {
+        const count = Math.min(num, result.keys.length);
+        for (let i = 0; i < count; i++) {
+          const nameBytes = result.keys[i]!.name;
+          const offset = bufAddr + i * 27;
+          // Write name bytes (up to 26 chars + null terminator)
+          for (let j = 0; j < 27; j++) {
+            bus.writeU8(offset + j, j < nameBytes.length ? nameBytes.charCodeAt(j) : 0);
+          }
+        }
+      }
+    }
+    regs.setGpr(2, 0);
+  });
+
+  // sceRegGetKeyInfo(catHandle, nameAddr, keyHandleAddr, typeAddr, sizeAddr) → 0 or -1
+  kernel.register(REG.sceRegGetKeyInfo, (regs, bus) => {
+    const catHandle = regs.getGpr(4);
+    const name = kernel.readCString(bus, regs.getGpr(5));
+    const keyHandleAddr = regs.getGpr(6);
+    const typeAddr = regs.getGpr(7);
+    // sizeAddr is 5th arg → on stack at sp+16
+    const sp = regs.getGpr(29);
+    const sizeAddr = bus.readU32(sp + 16);
+
+    const path = regOpenCategories.get(catHandle);
+    if (path !== undefined) {
+      const result = lookupCategory(path);
+      if (result) {
+        const nameLower = name.toLowerCase();
+        const idx = result.keys.findIndex(k => k.name.toLowerCase() === nameLower);
+        if (idx >= 0) {
+          const key = result.keys[idx]!;
+          // keyHandle = index into keys array
+          if (keyHandleAddr !== 0) bus.writeU32(keyHandleAddr, idx);
+          // Map type: dir=1, int=2, str=3, bin=4
+          let typeCode = REG_TYPE_INT;
+          let size = 4;
+          if (key.type === "dir") { typeCode = REG_TYPE_DIR; size = 0; }
+          else if (key.type === "int") { typeCode = REG_TYPE_INT; size = 4; }
+          else if (key.type === "str") { typeCode = REG_TYPE_STR; size = (key.strValue?.length ?? 0) + 1; }
+          else if (key.type === "bin") { typeCode = REG_TYPE_BIN; size = key.strValue?.length ?? 0; }
+          if (typeAddr !== 0) bus.writeU32(typeAddr, typeCode);
+          if (sizeAddr !== 0) bus.writeU32(sizeAddr, size);
+          log.debug(`sceRegGetKeyInfo("${name}") → type=${typeCode} size=${size}`);
+          regs.setGpr(2, 0);
+          return;
+        }
+      }
+    }
+    log.warn(`sceRegGetKeyInfo("${name}") → NOT FOUND`);
+    regs.setGpr(2, -1);
+  });
+
+  // sceRegGetKeyValue(catHandle, keyHandle, bufAddr, size) → 0
+  // keyHandle is the index returned by sceRegGetKeyInfo.
+  kernel.register(REG.sceRegGetKeyValue, (regs, bus) => {
+    const catHandle = regs.getGpr(4);
+    const keyHandle = regs.getGpr(5);
+    const bufAddr = regs.getGpr(6);
+    const size = regs.getGpr(7);
+
+    const path = regOpenCategories.get(catHandle);
+    if (path !== undefined && bufAddr !== 0) {
+      const result = lookupCategory(path);
+      if (result && keyHandle >= 0 && keyHandle < result.keys.length) {
+        const key = result.keys[keyHandle]!;
+        if (key.type === "int") {
+          bus.writeU32(bufAddr, key.intValue ?? 0);
+        } else if (key.type === "str" || key.type === "bin") {
+          const str = key.strValue ?? "";
+          const len = Math.min(str.length, size - 1);
+          for (let i = 0; i < len; i++) {
+            bus.writeU8(bufAddr + i, str.charCodeAt(i));
+          }
+          bus.writeU8(bufAddr + len, 0); // null terminator
+        }
+        regs.setGpr(2, 0);
+        return;
+      }
+    }
+    // Fallback: zero fill
+    if (bufAddr !== 0 && size >= 4) bus.writeU32(bufAddr, 0);
+    regs.setGpr(2, 0);
+  });
+
+  // ── Stubs: REG ──────────────────────────────────────────────────────────
+  kernel.stub(REG.sceRegRemoveRegistry);
+  kernel.stub(REG.sceRegFlushRegistry);
+  kernel.stub(REG.sceRegFlushCategory);
+  kernel.stub(REG.sceRegCreateKey);
+  kernel.stub(REG.sceRegSetKeyValue);
+  kernel.stub(REG.sceRegGetKeyInfoByName);
+  kernel.stub(REG.sceRegGetKeyValueByName);
+  kernel.stub(REG.sceRegRemoveCategory);
   // ── P3DA ──────────────────────────────────────────────────────────
   kernel.stub(P3DA.sceP3daBridgeCore);
   kernel.stub(P3DA.sceP3daBridgeExit);
