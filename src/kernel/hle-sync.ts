@@ -6,14 +6,122 @@
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel } from "./hle-kernel.js";
 import { ThreadState, WaitType } from "./hle-kernel.js";
-import { SEMA, MUTEX, EVENT_FLAG, FPL, VPL, MSG_PIPE, SYSMEM } from "./nids.js";
+import { SEMA, MUTEX, EVENT_FLAG, FPL, VPL, MSG_PIPE, SYSMEM, KERNEL } from "./nids.js";
 
 const log = Logger.get("HLE-SYNC");
 
 export function registerSyncHLE(kernel: HLEKernel): void {
 
   // ── VPL (variable-size partition list) ────────────────────────────────
-  const vpls = new Map<number, { baseAddr: number; size: number; nextFree: number }>();
+  // PPSSPP-compatible block allocator — allocates from end (top) of pool.
+  // Each block is measured in 8-byte units. A "block header" is 1 unit (8 bytes):
+  //   - u32 next pointer (points to next FREE block, or sentinel if allocated)
+  //   - u32 sizeInBlocks (including the header block itself)
+  // Free blocks form a circular linked list. The last block (sentinel, size=0)
+  // links to the first free block. Allocations split from the END of free blocks.
+
+  interface VplBlock {
+    offset: number;       // offset from memBlockPtr in bytes
+    sizeInBlocks: number; // size in 8-byte blocks (includes 1-block header)
+    free: boolean;        // true if this block is free
+  }
+
+  interface VplState {
+    memBlockPtr: number;  // base of entire VPL memory (including 0x20 header)
+    vplSize: number;      // total size passed to Init (aligned)
+    poolAddr: number;     // memBlockPtr + 0x20 (start of usable pool)
+    poolSize: number;     // vplSize - 0x20
+    // Block list in address order (offset from memBlockPtr).
+    // firstBlockOffset = 0x18, lastBlockOffset = vplSize - 8
+    blocks: VplBlock[];
+    firstBlockOffset: number; // 0x18
+    lastBlockOffset: number;  // vplSize - 8
+  }
+
+  const vpls = new Map<number, VplState>();
+  const SCE_KERNEL_ERROR_NO_MEMORY     = 0x80020190 >>> 0;
+  const SCE_KERNEL_ERROR_UNKNOWN_VPLID = 0x8002019b >>> 0;
+  const SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_VPL = 0x800201b6 >>> 0;
+  const SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE_VPL = 0x800201b7 >>> 0;
+
+  /**
+   * Try to allocate `size` bytes from VPL. Returns the user pointer (past header)
+   * or -1 if no block is large enough. Matches PPSSPP SceKernelVplHeader::Allocate.
+   */
+  function vplAlloc(vpl: VplState, size: number): number {
+    const allocBlocks = Math.floor((size + 7) / 8) + 1; // +1 for header
+    // Search free blocks for one large enough (first fit, matching PPSSPP circular scan)
+    for (let i = 0; i < vpl.blocks.length; i++) {
+      const b = vpl.blocks[i]!;
+      if (!b.free) continue;
+      if (b.sizeInBlocks < allocBlocks) continue;
+
+      if (b.sizeInBlocks > allocBlocks) {
+        // Split: shrink free block from front, allocate from end (PPSSPP SplitBlock)
+        const newFreeSize = b.sizeInBlocks - allocBlocks;
+        b.sizeInBlocks = newFreeSize;
+        // Insert new allocated block after the shrunk free block
+        const newBlock: VplBlock = {
+          offset: b.offset + newFreeSize * 8,
+          sizeInBlocks: allocBlocks,
+          free: false,
+        };
+        vpl.blocks.splice(i + 1, 0, newBlock);
+        return vpl.memBlockPtr + newBlock.offset + 8; // +8 skips header
+      } else {
+        // Exact fit
+        b.free = false;
+        return vpl.memBlockPtr + b.offset + 8;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Free a user pointer back to the VPL. Merges adjacent free blocks.
+   * Returns true on success.
+   */
+  function vplFree(vpl: VplState, ptr: number): boolean {
+    const blockOffset = (ptr - 8) - vpl.memBlockPtr; // header is 8 bytes before user ptr
+    // Find the block
+    for (let i = 0; i < vpl.blocks.length; i++) {
+      const b = vpl.blocks[i]!;
+      if (b.offset === blockOffset && !b.free) {
+        b.free = true;
+        // Merge with next free block
+        if (i + 1 < vpl.blocks.length && vpl.blocks[i + 1]!.free) {
+          b.sizeInBlocks += vpl.blocks[i + 1]!.sizeInBlocks;
+          vpl.blocks.splice(i + 1, 1);
+        }
+        // Merge with previous free block
+        if (i > 0 && vpl.blocks[i - 1]!.free) {
+          vpl.blocks[i - 1]!.sizeInBlocks += b.sizeInBlocks;
+          vpl.blocks.splice(i, 1);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Try to wake threads waiting on a VPL after a free operation. */
+  function vplWakeWaiters(vpl: VplState, vplId: number, regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void {
+    let woke = false;
+    for (const t of kernel.threads.values()) {
+      if (t.state === ThreadState.WAITING && t.waitType === WaitType.VPL && t.waitVplId === vplId) {
+        const addr = vplAlloc(vpl, t.waitVplSize);
+        if (addr !== -1 && t.waitVplAddrPtr !== 0) {
+          kernel.bus.writeU32(t.waitVplAddrPtr, addr);
+          t.state = ThreadState.READY;
+          t.waitType = WaitType.NONE;
+          t.context.gpr[2] = 0;
+          woke = true;
+          break; // One at a time, like FPL
+        }
+      }
+    }
+    if (woke) kernel.reschedule(regs);
+  }
 
   // ── Semaphores ────────────────────────────────────────────────────────
 
@@ -36,36 +144,95 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   });
 
   // sceKernelDeleteSema(semId)
+  // PPSSPP sceKernelSemaphore.cpp:236-249
   kernel.register(SEMA.sceKernelDeleteSema, (regs) => {
-    kernel.semaphores.delete(regs.getGpr(4));
+    const semId = regs.getGpr(4);
+    const sema = kernel.semaphores.get(semId);
+    if (!sema) {
+      regs.setGpr(2, 0x80020199 >>> 0); // SCE_KERNEL_ERROR_UNKNOWN_SEMID
+      return;
+    }
+    // Wake all threads waiting on this sema with WAIT_DELETE error
+    let wokeThreads = false;
+    for (const t of kernel.threads.values()) {
+      if (t.state === ThreadState.WAITING && t.waitType === WaitType.SEMA && t.waitSemaId === semId) {
+        t.state = ThreadState.READY;
+        t.waitType = WaitType.NONE;
+        t.context.gpr[2] = 0x800201b5 >>> 0; // SCE_KERNEL_ERROR_WAIT_DELETE
+        wokeThreads = true;
+      }
+    }
+    kernel.semaphores.delete(semId);
     regs.setGpr(2, 0);
+    if (wokeThreads) kernel.reschedule(regs);
+  });
+
+  // sceKernelCancelSema(semId, setCount, numWaitThreadsPtr)
+  // PPSSPP sceKernelSemaphore.cpp:251-270
+  kernel.register(KERNEL.sceKernelCancelSema, (regs, bus) => {
+    const semId = regs.getGpr(4);
+    const setCount = regs.getGpr(5) | 0; // signed
+    const numWaitPtr = regs.getGpr(6);
+    const sema = kernel.semaphores.get(semId);
+    if (!sema) {
+      regs.setGpr(2, 0x80020199 >>> 0); // SCE_KERNEL_ERROR_UNKNOWN_SEMID
+      return;
+    }
+
+    // Count and wake all waiting threads with WAIT_CANCEL error
+    let waitCount = 0;
+    for (const t of kernel.threads.values()) {
+      if (t.state === ThreadState.WAITING && t.waitType === WaitType.SEMA && t.waitSemaId === semId) {
+        t.state = ThreadState.READY;
+        t.waitType = WaitType.NONE;
+        t.context.gpr[2] = 0x800201a9 >>> 0; // SCE_KERNEL_ERROR_WAIT_CANCEL
+        waitCount++;
+      }
+    }
+
+    // Write number of waiting threads to output pointer
+    if (numWaitPtr !== 0) {
+      bus.writeU32(numWaitPtr, waitCount);
+    }
+
+    // Reset sema count: if setCount < 0, reset to initCount; otherwise set to setCount
+    sema.count = setCount < 0 ? sema.initCount : setCount;
+
+    regs.setGpr(2, 0);
+    // Don't reschedule here — the woken threads will be picked up naturally
+    // by the normal scheduler. Calling reschedule inside an interrupt/alarm
+    // handler context would corrupt thread state.
   });
 
   // sceKernelSignalSema(semId, signal)
+  // PPSSPP sceKernelSemaphore.cpp:273
   kernel.register(SEMA.sceKernelSignalSema, (regs) => {
     const semId  = regs.getGpr(4);
     const signal = regs.getGpr(5);
     const sema = kernel.semaphores.get(semId);
-    if (sema) {
-      sema.count = Math.min(sema.count + signal, sema.maxCount);
-      for (const t of kernel.threads.values()) {
-        if (t.state === ThreadState.WAITING && t.waitType === WaitType.SEMA && t.waitSemaId === semId) {
-          if (sema.count >= t.waitSemaCount) {
-            sema.count -= t.waitSemaCount;
-            t.state = ThreadState.READY;
-            t.waitType = WaitType.NONE;
-            t.context.gpr[2] = 0;
-          }
+    if (!sema) { regs.setGpr(2, 0x80020199 >>> 0); return; }
+    sema.count = Math.min(sema.count + signal, sema.maxCount);
+    let wokeThreads = false;
+    for (const t of kernel.threads.values()) {
+      if (t.state === ThreadState.WAITING && t.waitType === WaitType.SEMA && t.waitSemaId === semId) {
+        if (sema.count >= t.waitSemaCount) {
+          sema.count -= t.waitSemaCount;
+          t.state = ThreadState.READY;
+          t.waitType = WaitType.NONE;
+          t.context.gpr[2] = 0;
+          wokeThreads = true;
         }
       }
     }
     regs.setGpr(2, 0);
+    if (wokeThreads) kernel.reschedule(regs);
   });
 
   // sceKernelWaitSema / sceKernelWaitSemaCB
-  const waitSema = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
+  const waitSema = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0], bus: Parameters<Parameters<typeof kernel.register>[1]>[1]): void => {
     const semId  = regs.getGpr(4);
     const signal = regs.getGpr(5);
+    const timeoutPtr = regs.getGpr(6);
     const sema = kernel.semaphores.get(semId);
     if (!sema) { regs.setGpr(2, 0); return; }
 
@@ -83,6 +250,16 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       t.waitSemaCount = signal;
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
+
+      // Schedule timeout if a timeout pointer is provided
+      if (timeoutPtr !== 0 && kernel.coreTiming && kernel.wakeThreadEventId >= 0) {
+        const usec = bus.readU32(timeoutPtr);
+        if (usec > 0) {
+          const cycles = kernel.coreTiming.usToCycles(usec);
+          kernel.coreTiming.scheduleEvent(cycles, kernel.wakeThreadEventId, kernel.currentThreadId);
+        }
+      }
+
       if (!kernel.reschedule(regs)) kernel.idleBreak = true;
     } else {
       sema.count = 0;
@@ -127,7 +304,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       }
       bus.writeU32(ptr + 52, waitCount);        // numWaitThreads
     }
-    regs.setGpr(2, sema ? 0 : 0x800201bc); // SCE_KERNEL_ERROR_UNKNOWN_SEMID
+    regs.setGpr(2, sema ? 0 : 0x80020199 >>> 0); // SCE_KERNEL_ERROR_UNKNOWN_SEMID
   });
 
   // ── Mutexes ───────────────────────────────────────────────────────────
@@ -170,12 +347,15 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const m = mutexes.get(id);
     if (!m) { regs.setGpr(2, SCE_MUTEX_ERROR_NO_SUCH_MUTEX); return; }
     if (count <= 0) { regs.setGpr(2, 0x80020001 >>> 0); return; }
+    if (count > 1 && !(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) {
+      regs.setGpr(2, 0x800201bd >>> 0); return; // SCE_KERNEL_ERROR_ILLEGAL_COUNT
+    }
     if (m.lockLevel === 0) {
       m.lockLevel = count;
       m.lockThread = kernel.currentThreadId;
       regs.setGpr(2, 0);
     } else if (m.lockThread === kernel.currentThreadId) {
-      if (!(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) { regs.setGpr(2, SCE_MUTEX_ERROR_ALREADY_LOCKED); return; }
+      if (!(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) { regs.setGpr(2, SCE_MUTEX_ERROR_LOCK_OVERFLOW); return; }
       if (m.lockLevel + count < 0) { regs.setGpr(2, SCE_MUTEX_ERROR_LOCK_OVERFLOW); return; }
       m.lockLevel += count;
       regs.setGpr(2, 0);
@@ -194,6 +374,43 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     }
   });
 
+  // sceKernelLockMutexCB — same as LockMutex but processes callbacks
+  kernel.register(KERNEL.sceKernelLockMutexCB, (regs) => {
+    const id = regs.getGpr(4);
+    const count = regs.getGpr(5) | 0;
+    const m = mutexes.get(id);
+    if (!m) { regs.setGpr(2, SCE_MUTEX_ERROR_NO_SUCH_MUTEX); return; }
+    if (count <= 0) { regs.setGpr(2, 0x80020001 >>> 0); return; }
+    if (count > 1 && !(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) {
+      regs.setGpr(2, 0x800201bd >>> 0); return;
+    }
+    if (m.lockLevel === 0) {
+      m.lockLevel = count;
+      m.lockThread = kernel.currentThreadId;
+      regs.setGpr(2, 0);
+    } else if (m.lockThread === kernel.currentThreadId) {
+      if (!(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) { regs.setGpr(2, SCE_MUTEX_ERROR_LOCK_OVERFLOW); return; }
+      if (m.lockLevel + count < 0) { regs.setGpr(2, SCE_MUTEX_ERROR_LOCK_OVERFLOW); return; }
+      m.lockLevel += count;
+      regs.setGpr(2, 0);
+    } else {
+      const t = kernel.threads.get(kernel.currentThreadId);
+      if (t) {
+        t.state = ThreadState.WAITING;
+        t.waitType = WaitType.MUTEX;
+        t.waitMutexId = id;
+        t.waitMutexCount = count;
+        t.isProcessingCallbacks = true;
+        kernel.saveContext(t, regs);
+        t.context.gpr[2] = 0;
+        if (!kernel.reschedule(regs)) kernel.idleBreak = true;
+        return; // already dispatched via reschedule
+      }
+    }
+    // CB variant: process callbacks after successful (non-blocking) lock
+    kernel.processThreadCallbacks(regs, true);
+  });
+
   // sceKernelTryLockMutex(id, count)
   kernel.register(MUTEX.sceKernelTryLockMutex, (regs) => {
     const id = regs.getGpr(4);
@@ -201,12 +418,15 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const m = mutexes.get(id);
     if (!m) { regs.setGpr(2, SCE_MUTEX_ERROR_NO_SUCH_MUTEX); return; }
     if (count <= 0) { regs.setGpr(2, 0x80020001 >>> 0); return; }
+    if (count > 1 && !(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) {
+      regs.setGpr(2, 0x800201bd >>> 0); return; // SCE_KERNEL_ERROR_ILLEGAL_COUNT
+    }
     if (m.lockLevel === 0) {
       m.lockLevel = count;
       m.lockThread = kernel.currentThreadId;
       regs.setGpr(2, 0);
     } else if (m.lockThread === kernel.currentThreadId) {
-      if (!(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) { regs.setGpr(2, SCE_MUTEX_ERROR_ALREADY_LOCKED); return; }
+      if (!(m.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) { regs.setGpr(2, SCE_MUTEX_ERROR_LOCK_OVERFLOW); return; }
       m.lockLevel += count;
       regs.setGpr(2, 0);
     } else {
@@ -250,7 +470,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     pattern: number;     // current bit pattern (u32)
     attr: number;        // creation attributes
   }
-  const eventFlags = new Map<number, EventFlag>();
+  const eventFlags = kernel.eventFlags;
 
   /** Check if event flag condition is met (AND/OR mode) */
   const evfCondMet = (pattern: number, bits: number, waitMode: number): boolean => {
@@ -340,6 +560,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const bits       = regs.getGpr(5);
     const waitMode   = regs.getGpr(6);
     const outBitsPtr = regs.getGpr(7);
+    const timeoutPtr = regs.getGpr(8); // PARAM(4) = $t0 — pointer to timeout in microseconds
     const evf = eventFlags.get(id);
     if (!evf) { regs.setGpr(2, 0x8002019a >>> 0); return; }
     // Check if condition already met
@@ -361,6 +582,20 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       if (cb) t.isProcessingCallbacks = true;
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
+      // Schedule timeout via CoreTiming if a timeout pointer is provided
+      if (timeoutPtr !== 0 && kernel.coreTiming && kernel.wakeThreadEventId >= 0) {
+        const usec = bus.readU32(timeoutPtr);
+        if (usec > 0) {
+          const cycles = kernel.coreTiming.usToCycles(usec);
+          kernel.coreTiming.scheduleEvent(cycles, kernel.wakeThreadEventId, kernel.currentThreadId);
+        } else {
+          // Timeout = 0: immediate timeout (poll mode)
+          t.state = ThreadState.READY;
+          t.waitType = WaitType.NONE;
+          if (outBitsPtr !== 0) bus.writeU32(outBitsPtr, evf.pattern);
+          t.context.gpr[2] = 0x800201a8 >>> 0; // SCE_KERNEL_ERROR_WAIT_TIMEOUT
+        }
+      }
       if (!kernel.reschedule(regs)) kernel.idleBreak = true;
     } else {
       regs.setGpr(2, 0);
@@ -390,7 +625,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   interface FplState { base: number; blockSize: number; numBlocks: number; freeBlocks: boolean[] }
   const fpls = new Map<number, FplState>();
   const SCE_KERNEL_ERROR_UNKNOWN_FPLID = 0x80020199 >>> 0;
-  const SCE_KERNEL_ERROR_NO_MEMORY     = 0x80020190 >>> 0;
+  // SCE_KERNEL_ERROR_NO_MEMORY already declared above for VPL
 
   function fplAlloc(fpl: FplState): number {
     for (let i = 0; i < fpl.numBlocks; i++) {
@@ -403,16 +638,14 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   }
 
   // sceKernelCreateFpl(name, part, attr, blockSize, numBlocks, option)
-  kernel.register(FPL.sceKernelCreateFpl, (regs, bus) => {
+  kernel.register(FPL.sceKernelCreateFpl, (regs) => {
     const blockSize = regs.getGpr(7);
-    const sp = regs.getGpr(29);
-    const rawNumBlocks = bus.readU32(sp + 16) | 0;
-    const numBlocks = Math.max(1, Math.min(rawNumBlocks, 4096)); // clamp to sane range
+    // PPSSPP reads 5th arg from $t0 (r8), not stack: PARAM(4) = r[MIPS_REG_A0 + 4] = r[8]
+    const numBlocks = Math.max(1, Math.min(regs.getGpr(8) | 0, 4096));
     const fplId = kernel.nextBlockId++;
     const aligned = (blockSize + 3) & ~3; // 4-byte align (PPSSPP uses BlockAllocator)
     const totalSize = aligned * numBlocks;
-    const addr = kernel.nextAllocAddr;
-    kernel.nextAllocAddr = (addr + totalSize) >>> 0;
+    const addr = kernel.allocLow(totalSize);
     fpls.set(fplId, { base: addr, blockSize: aligned, numBlocks, freeBlocks: new Array(numBlocks).fill(true) });
     kernel.memBlocks.set(fplId, { addr, size: totalSize, name: "FPL" });
     regs.setGpr(2, fplId);
@@ -422,12 +655,21 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   kernel.register(FPL.sceKernelDeleteFpl, (regs) => {
     const fplId = regs.getGpr(4);
     if (!fpls.has(fplId)) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
+    // Wake waiting threads with WAIT_DELETE error
+    for (const t of kernel.threads.values()) {
+      if (t.state === ThreadState.WAITING && t.waitType === WaitType.FPL && t.waitFplId === fplId) {
+        t.state = ThreadState.READY;
+        t.waitType = WaitType.NONE;
+        t.context.gpr[2] = 0x800201b5 >>> 0; // SCE_KERNEL_ERROR_WAIT_DELETE
+      }
+    }
     fpls.delete(fplId);
     kernel.memBlocks.delete(fplId);
     regs.setGpr(2, 0);
   });
 
   // sceKernelAllocateFpl(fplId, dataPtr, timeout)
+  // Blocks if no blocks available (PPSSPP sceKernelMemory.cpp:639)
   kernel.register(FPL.sceKernelAllocateFpl, (regs) => {
     const fplId   = regs.getGpr(4);
     const dataPtr = regs.getGpr(5);
@@ -438,8 +680,19 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       kernel.bus.writeU32(dataPtr, fpl.base + fpl.blockSize * blockNum);
       regs.setGpr(2, 0);
     } else {
-      // TODO: block thread until a block is freed
-      regs.setGpr(2, SCE_KERNEL_ERROR_NO_MEMORY);
+      // Block the thread until a block is freed
+      const t = kernel.threads.get(kernel.currentThreadId);
+      if (t) {
+        t.state = ThreadState.WAITING;
+        t.waitType = WaitType.FPL;
+        t.waitFplId = fplId;
+        t.waitFplDataPtr = dataPtr;
+        kernel.saveContext(t, regs);
+        t.context.gpr[2] = 0;
+        if (!kernel.reschedule(regs)) kernel.idleBreak = true;
+      } else {
+        regs.setGpr(2, SCE_KERNEL_ERROR_NO_MEMORY);
+      }
     }
   });
 
@@ -469,65 +722,142 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     if (blockNum >= 0 && blockNum < fpl.numBlocks) {
       fpl.freeBlocks[blockNum] = true;
       regs.setGpr(2, 0);
+      // Wake any threads waiting for a block in this FPL
+      for (const t of kernel.threads.values()) {
+        if (t.state === ThreadState.WAITING && t.waitType === WaitType.FPL && t.waitFplId === fplId) {
+          const newBlock = fplAlloc(fpl);
+          if (newBlock >= 0 && t.waitFplDataPtr !== 0) {
+            kernel.bus.writeU32(t.waitFplDataPtr, fpl.base + fpl.blockSize * newBlock);
+            t.state = ThreadState.READY;
+            t.waitType = WaitType.NONE;
+            t.context.gpr[2] = 0;
+            kernel.reschedule(regs);
+            break; // Only wake one thread per free
+          }
+        }
+      }
     } else {
-      regs.setGpr(2, 0x800200d8 >>> 0); // SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK
+      regs.setGpr(2, 0x800201b6 >>> 0); // SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK
     }
   });
 
-  // ── VPL (variable pool list) ─────────────────────────────────────────
+  // ── VPL (variable pool list) — PPSSPP sceKernelMemory.cpp ────────────
 
   // sceKernelCreateVpl(name, partition, attr, vplSize, option)
+  // PPSSPP: vplSize aligned to 8, min 0x1000 if <=0x30. Pool = vplSize-0x20.
   kernel.register(VPL.sceKernelCreateVpl, (regs) => {
-    const vplSize = regs.getGpr(7);
-    const aligned = (vplSize + 0xFF) & ~0xFF;
-    const baseAddr = kernel.nextAllocAddr;
-    kernel.nextAllocAddr = (kernel.nextAllocAddr + aligned) >>> 0;
+    let vplSize = regs.getGpr(7);
+    if (vplSize === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE_VPL); return; }
+    if (vplSize <= 0x30) vplSize = 0x1000;
+    vplSize = (vplSize + 7) & ~7;
+
+    const memBlockPtr = kernel.allocLow(vplSize);
+    if (memBlockPtr < 0) { regs.setGpr(2, SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
     const vplId = kernel.nextBlockId++;
-    vpls.set(vplId, { baseAddr, size: aligned, nextFree: baseAddr });
-    log.debug(`sceKernelCreateVpl(size=${vplSize}) → id=${vplId} base=0x${baseAddr.toString(16)}`);
+    const firstBlockOffset = 0x18;
+    const lastBlockOffset = vplSize - 8;
+    // Initial state: one big free block from firstBlockOffset to lastBlockOffset
+    const totalBlocks = (lastBlockOffset - firstBlockOffset) / 8;
+    const state: VplState = {
+      memBlockPtr,
+      vplSize,
+      poolAddr: memBlockPtr + 0x20,
+      poolSize: vplSize - 0x20,
+      blocks: [{ offset: firstBlockOffset, sizeInBlocks: totalBlocks, free: true }],
+      firstBlockOffset,
+      lastBlockOffset,
+    };
+    vpls.set(vplId, state);
+    kernel.memBlocks.set(vplId, { addr: memBlockPtr, size: vplSize, name: "VPL" });
+    log.debug(`sceKernelCreateVpl(size=${regs.getGpr(7)}) → id=${vplId} mem=0x${memBlockPtr.toString(16)} pool=${state.poolSize}`);
     regs.setGpr(2, vplId);
   });
 
   // sceKernelDeleteVpl
   kernel.register(VPL.sceKernelDeleteVpl, (regs) => {
-    vpls.delete(regs.getGpr(4));
+    const uid = regs.getGpr(4);
+    const vpl = vpls.get(uid);
+    if (!vpl) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
+    // Wake waiting threads with WAIT_DELETE error
+    for (const t of kernel.threads.values()) {
+      if (t.state === ThreadState.WAITING && t.waitType === WaitType.VPL && t.waitVplId === uid) {
+        t.state = ThreadState.READY;
+        t.waitType = WaitType.NONE;
+        t.context.gpr[2] = 0x800201b5 >>> 0; // SCE_KERNEL_ERROR_WAIT_DELETE
+      }
+    }
+    vpls.delete(uid);
+    kernel.memBlocks.delete(uid);
     regs.setGpr(2, 0);
   });
 
-  // sceKernelAllocateVpl(vplId, size, addrPtr, timeout)
-  kernel.register(VPL.sceKernelAllocateVpl, (regs, bus) => {
+  // sceKernelAllocateVpl(vplId, size, addrPtr, timeout) — blocking
+  const allocateVplImpl = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0], bus: Parameters<Parameters<typeof kernel.register>[1]>[1]): void => {
     const vplId   = regs.getGpr(4);
     const size    = regs.getGpr(5);
     const addrPtr = regs.getGpr(6);
     const vpl = vpls.get(vplId);
-    if (vpl && addrPtr !== 0) {
-      const aligned = (size + 15) & ~15;
-      const addr = vpl.nextFree;
-      vpl.nextFree = (vpl.nextFree + aligned) >>> 0;
+    if (!vpl) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
+    if (size === 0 || size > vpl.poolSize) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE_VPL); return; }
+
+    const addr = vplAlloc(vpl, size);
+    if (addr !== -1 && addrPtr !== 0) {
       bus.writeU32(addrPtr, addr);
       log.debug(`sceKernelAllocateVpl(id=${vplId}, size=${size}) → 0x${addr.toString(16)}`);
       regs.setGpr(2, 0);
-    } else {
-      log.warn(`sceKernelAllocateVpl: unknown vplId=${vplId}`);
-      regs.setGpr(2, -1 >>> 0);
+      return;
     }
-  });
 
-  // sceKernelTryAllocateVpl
+    // Block the thread until memory is freed
+    const t = kernel.threads.get(kernel.currentThreadId);
+    if (t) {
+      t.state = ThreadState.WAITING;
+      t.waitType = WaitType.VPL;
+      t.waitVplId = vplId;
+      t.waitVplSize = size;
+      t.waitVplAddrPtr = addrPtr;
+      kernel.saveContext(t, regs);
+      t.context.gpr[2] = 0;
+      if (!kernel.reschedule(regs)) kernel.idleBreak = true;
+    } else {
+      regs.setGpr(2, SCE_KERNEL_ERROR_NO_MEMORY);
+    }
+  };
+  kernel.register(VPL.sceKernelAllocateVpl, allocateVplImpl);
+  kernel.register(KERNEL.sceKernelAllocateVplCB, allocateVplImpl);
+
+  // sceKernelTryAllocateVpl(vplId, size, addrPtr) — non-blocking
   kernel.register(VPL.sceKernelTryAllocateVpl, (regs, bus) => {
     const vplId   = regs.getGpr(4);
     const size    = regs.getGpr(5);
     const addrPtr = regs.getGpr(6);
     const vpl = vpls.get(vplId);
-    if (vpl && addrPtr !== 0) {
-      const aligned = (size + 15) & ~15;
-      const addr = vpl.nextFree;
-      vpl.nextFree = (vpl.nextFree + aligned) >>> 0;
+    if (!vpl) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
+    if (size === 0 || size > vpl.poolSize) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE_VPL); return; }
+
+    const addr = vplAlloc(vpl, size);
+    if (addr !== -1 && addrPtr !== 0) {
       bus.writeU32(addrPtr, addr);
       regs.setGpr(2, 0);
     } else {
-      regs.setGpr(2, -1 >>> 0);
+      regs.setGpr(2, SCE_KERNEL_ERROR_NO_MEMORY);
     }
+  });
+
+  // sceKernelFreeVpl(vplId, addr)
+  kernel.register(VPL.sceKernelFreeVpl, (regs) => {
+    const vplId = regs.getGpr(4);
+    const addr  = regs.getGpr(5);
+    const vpl = vpls.get(vplId);
+    if (!vpl) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
+    if (!vplFree(vpl, addr)) {
+      regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_VPL);
+      return;
+    }
+    regs.setGpr(2, 0);
+    // Wake any threads waiting for VPL memory
+    vplWakeWaiters(vpl, vplId, regs);
   });
 
   // ── Message Pipes ─────────────────────────────────────────────────────
@@ -543,19 +873,34 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const size      = regs.getGpr(7);
     const addrHint  = regs.getGpr(8);
 
+    // PPSSPP: NULL name returns SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT
+    if (namePtr === 0) {
+      regs.setGpr(2, 0x80020001 >>> 0); // SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT
+      return;
+    }
+    // PPSSPP sceKernelMemory.cpp:871 — valid types are 0-4
+    if (allocType < 0 || allocType > 4) {
+      regs.setGpr(2, 0x800200d8 >>> 0); // SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCKTYPE
+      return;
+    }
+    // Size 0 or overflow
+    if (size === 0 || size > 0x7FFFFFFF) {
+      regs.setGpr(2, 0x800200d9 >>> 0); // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
+      return;
+    }
+
     let name = "";
-    if (namePtr !== 0) {
-      for (let i = 0; i < 32; i++) {
-        const b = bus.readU8(namePtr + i);
-        if (b === 0) break;
-        name += String.fromCharCode(b);
-      }
+    for (let i = 0; i < 32; i++) {
+      const b = bus.readU8(namePtr + i);
+      if (b === 0) break;
+      name += String.fromCharCode(b);
     }
 
     let addr: number;
     if (allocType === 2) {
       addr = addrHint & ~0xFF;
     } else if (allocType === 1 || allocType === 4) {
+      // High allocation (grows downward)
       const sizeAligned = (size + 0xFF) & ~0xFF;
       addr = (kernel.nextHighAddr - sizeAligned) & ~0xFF;
       if (addr < kernel.nextAllocAddr + 0x4000) {
@@ -565,18 +910,17 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       }
       kernel.nextHighAddr = addr;
     } else {
-      addr = (kernel.nextAllocAddr + 0xFF) & ~0xFF;
-      const end = addr + size;
-      if (end > kernel.nextHighAddr - 0x4000) {
-        log.error(`sceKernelAllocPartitionMemory: low heap exhausted`);
-        regs.setGpr(2, -1);
+      // Low allocation — use free list first
+      addr = kernel.allocLow(size);
+      if (addr < 0) {
+        regs.setGpr(2, 0x800200d9 >>> 0); // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
         return;
       }
-      kernel.nextAllocAddr = end >>> 0;
     }
 
+    const isHigh = allocType === 1 || allocType === 4;
     const blockId = kernel.nextBlockId++;
-    kernel.memBlocks.set(blockId, { addr, size, name });
+    kernel.memBlocks.set(blockId, { addr, size, name, high: isHigh });
     log.debug(`sceKernelAllocPartitionMemory(part=${partition}, "${name}", type=${allocType}, size=0x${size.toString(16)}) → uid=${blockId} addr=0x${addr.toString(16)}`);
     regs.setGpr(2, blockId);
   });
@@ -592,42 +936,100 @@ export function registerSyncHLE(kernel: HLEKernel): void {
 
   // sceKernelFreePartitionMemory
   kernel.register(SYSMEM.sceKernelFreePartitionMemory, (regs) => {
-    kernel.memBlocks.delete(regs.getGpr(4));
+    const blockId = regs.getGpr(4);
+    const block = kernel.memBlocks.get(blockId);
+    if (block) {
+      if (block.high) kernel.freeHigh(block.addr, block.size);
+      else kernel.freeLow(block.addr, block.size);
+      kernel.memBlocks.delete(blockId);
+    }
     regs.setGpr(2, 0);
   });
 
-  // sceKernelMaxFreeMemSize — largest contiguous free block
+  // sceKernelMaxFreeMemSize — largest contiguous allocatable block
+  // Must account for alignment overhead so the returned value can actually be allocated
   kernel.register(SYSMEM.sceKernelMaxFreeMemSize, (regs) => {
-    // Simple: gap between low alloc and high alloc
-    const free = Math.max(0, kernel.nextHighAddr - kernel.nextAllocAddr);
-    regs.setGpr(2, free >>> 0);
+    // Bump allocator gap — subtract alignment overhead so the returned value
+    // can actually be allocated (allocLow rounds size up to 0x100 boundary)
+    const rawGap = Math.max(0, kernel.nextHighAddr - kernel.nextAllocAddr - 0x4000);
+    const bumpGap = rawGap & ~0xFF; // round DOWN to alignment
+    let maxFree = bumpGap;
+    // Check free list regions
+    for (const r of kernel.freeRegions) {
+      if (r.size > maxFree) maxFree = r.size;
+    }
+    regs.setGpr(2, maxFree >>> 0);
   });
 
   // sceKernelTotalFreeMemSize — total free memory
   kernel.register(SYSMEM.sceKernelTotalFreeMemSize, (regs) => {
-    const free = Math.max(0, kernel.nextHighAddr - kernel.nextAllocAddr);
-    regs.setGpr(2, free >>> 0);
+    let total = Math.max(0, kernel.nextHighAddr - kernel.nextAllocAddr);
+    for (const r of kernel.freeRegions) {
+      total += r.size;
+    }
+    regs.setGpr(2, total >>> 0);
   });
 
-  // sceKernelMemset(addr, fillByte, n)
+  // sceKernelMemset(addr, fillByte, n) — also serves as sce_paf_private_memset
   kernel.register(SYSMEM.sceKernelMemset, (regs, bus) => {
     const addr = regs.getGpr(4);
     const fill = regs.getGpr(5) & 0xFF;
     const n    = regs.getGpr(6);
     for (let i = 0; i < n; i++) bus.writeU8(addr + i, fill);
-    regs.setGpr(2, addr);
+    regs.setGpr(2, addr); // returns dest pointer
+  });
+
+  // sceKernelMemcpy(dest, src, n) — also serves as sce_paf_private_memcpy
+  // NID 0x1839852A from Kernel_Library. Forward copy (NOT memmove).
+  kernel.register(SYSMEM.sceKernelMemcpy, (regs, bus) => {
+    const dest = regs.getGpr(4);
+    const src  = regs.getGpr(5);
+    const n    = regs.getGpr(6);
+    for (let i = 0; i < n; i++) bus.writeU8(dest + i, bus.readU8(src + i));
+    regs.setGpr(2, dest);
   });
 
   // ── SysMem user-level block allocation ──────────────────────────────
 
-  // AllocMemoryBlock(name, type, size, param)
+  // AllocMemoryBlock(name, type, size, param) — PPSSPP sceKernelMemory.cpp:1630
   kernel.register(SYSMEM.AllocMemoryBlock, (regs) => {
-    const size = regs.getGpr(6);
+    const namePtr   = regs.getGpr(4);
+    const type      = regs.getGpr(5);
+    const size      = regs.getGpr(6);
+    const paramsPtr = regs.getGpr(7);
+
+    // Validate params struct: if provided, first u32 must be 4
+    if (paramsPtr !== 0 && kernel.bus.readU32(paramsPtr) !== 4) {
+      regs.setGpr(2, 0x800200d2 >>> 0); return; // SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT
+    }
+    // Only type 0 (low) and 1 (high) are valid
+    if (type !== 0 && type !== 1) {
+      regs.setGpr(2, 0x800200d8 >>> 0); return; // SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCKTYPE
+    }
+    // Size 0 or overflow
+    if (size === 0 || size > 0x7FFFFFFF) {
+      regs.setGpr(2, 0x800200d9 >>> 0); return; // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
+    }
+    // NULL name
+    if (namePtr === 0) {
+      regs.setGpr(2, 0x80020001 >>> 0); return; // SCE_KERNEL_ERROR_ERROR
+    }
+
+    let addr: number;
+    if (type === 1) {
+      // High allocation
+      const aligned = (size + 0xFF) & ~0xFF;
+      addr = (kernel.nextHighAddr - aligned) & ~0xFF;
+      kernel.nextHighAddr = addr;
+    } else {
+      addr = kernel.allocLow(size);
+      if (addr < 0) {
+        regs.setGpr(2, 0x800200d9 >>> 0); return; // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
+      }
+    }
     const aligned = (size + 0xFF) & ~0xFF;
-    const addr = kernel.nextAllocAddr;
-    kernel.nextAllocAddr = (kernel.nextAllocAddr + aligned) >>> 0;
     const uid = kernel.nextBlockId++;
-    kernel.memBlocks.set(uid, { addr, size: aligned, name: "UserBlock" });
+    kernel.memBlocks.set(uid, { addr, size: aligned, name: "UserBlock", high: type === 1 });
     log.debug(`AllocMemoryBlock(size=${size}) → uid=${uid} addr=0x${addr.toString(16)}`);
     regs.setGpr(2, uid);
   });
@@ -639,23 +1041,31 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const block   = kernel.memBlocks.get(uid);
     if (block && addrOut !== 0) {
       kernel.bus.writeU32(addrOut, block.addr);
-      regs.setGpr(2, 0);
-    } else {
-      regs.setGpr(2, 0x800200d6); // SCE_KERNEL_ERROR_UNKNOWN_UID
     }
+    // PPSSPP: always returns 0 even for invalid UIDs
+    regs.setGpr(2, 0);
   });
 
   // FreeMemoryBlock(uid)
   kernel.register(SYSMEM.FreeMemoryBlock, (regs) => {
-    kernel.memBlocks.delete(regs.getGpr(4));
-    regs.setGpr(2, 0);
+    const uid = regs.getGpr(4);
+    const block = kernel.memBlocks.get(uid);
+    if (block) {
+      if (block.high) kernel.freeHigh(block.addr, block.size);
+      else kernel.freeLow(block.addr, block.size);
+      kernel.memBlocks.delete(uid);
+      regs.setGpr(2, 0);
+    } else {
+      regs.setGpr(2, 0x800200cb >>> 0); // SCE_KERNEL_ERROR_UNKNOWN_UID
+    }
   });
 
   // ── SDK / compiler version stubs ─────────────────────────────────────
 
   // sceKernelSetCompiledSdkVersion603_605
   kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion603_605, (regs) => {
-    log.debug(`sceKernelSetCompiledSdkVersion(0x${regs.getGpr(4).toString(16)})`);
+    kernel.compiledSdkVersion = regs.getGpr(4);
+    log.debug(`sceKernelSetCompiledSdkVersion(0x${kernel.compiledSdkVersion.toString(16)})`);
     regs.setGpr(2, 0);
   });
 
@@ -672,30 +1082,31 @@ export function registerSyncHLE(kernel: HLEKernel): void {
 
   // sceKernelSetCompiledSdkVersion (generic)
   kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion, (regs) => {
-    log.debug(`sceKernelSetCompiledSdkVersion(0x${regs.getGpr(4).toString(16)})`);
+    kernel.compiledSdkVersion = regs.getGpr(4);
+    log.debug(`sceKernelSetCompiledSdkVersion(0x${kernel.compiledSdkVersion.toString(16)})`);
     regs.setGpr(2, 0);
   });
 
   // sceKernelSetCompiledSdkVersion350_360
   kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion350_360, (regs) => {
-    log.debug(`sceKernelSetCompiledSdkVersion350_360(0x${regs.getGpr(4).toString(16)})`);
+    kernel.compiledSdkVersion = regs.getGpr(4);
+    log.debug(`sceKernelSetCompiledSdkVersion350_360(0x${kernel.compiledSdkVersion.toString(16)})`);
     regs.setGpr(2, 0);
   });
 
   // sceKernelSetCompiledSdkVersion370
   kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion370, (regs) => {
-    log.debug(`sceKernelSetCompiledSdkVersion370(0x${regs.getGpr(4).toString(16)})`);
+    kernel.compiledSdkVersion = regs.getGpr(4);
+    log.debug(`sceKernelSetCompiledSdkVersion370(0x${kernel.compiledSdkVersion.toString(16)})`);
     regs.setGpr(2, 0);
   });
 
-  // sceKernelSetCompiledSdkVersion380_390
-  kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion380_390, (regs) => {
-    regs.setGpr(2, 0);
-  });
+  // sceKernelSetCompiledSdkVersion380_390 — NID missing from nids.ts, keep as-is
+  // kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion380_390, ...);
 
   // sceKernelGetCompiledSdkVersion
   kernel.register(SYSMEM.sceKernelGetCompiledSdkVersion, (regs) => {
-    regs.setGpr(2, 0x06060010);
+    regs.setGpr(2, kernel.compiledSdkVersion);
   });
 
   // sceKernelDcacheWritebackRange — PPSSPP sceKernel.cpp: validate size >= 0
@@ -712,8 +1123,6 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   kernel.stub(MUTEX.sceKernelReferLwMutexStatusByID);
   kernel.stub(MUTEX.sceKernelDeleteLwMutex);
 
-
-  kernel.stub(VPL.sceKernelFreeVpl);
 
   kernel.stub(MSG_PIPE.sceKernelDeleteMsgPipe);
   kernel.stub(MSG_PIPE.sceKernelSendMsgPipe);

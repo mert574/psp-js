@@ -44,6 +44,12 @@ export async function runAutotest(
 
   await emu.loadElfBinary(prxData);
 
+  // pspautotests run as homebrew on ms0:, set initial CWD accordingly
+  emu.hle.pspFs.setStartingDirectory("ms0:/PSP/GAME/__autotest");
+  // Register standard memory stick directories so sceIoDopen succeeds
+  emu.hle.pspFs.registerDirectory("ms0:/PSP/SAVEDATA");
+  emu.hle.pspFs.registerDirectory("ms0:/PSP/COMMON");
+
   let frames = 0;
   for (frames = 0; frames < maxFrames; frames++) {
     emu.runFrame();

@@ -8,6 +8,7 @@ import { parseIso, readFile, type IsoFile } from "../src/iso/iso9660.js";
 import { isPbp, parsePbp } from "../src/loader/pbp.js";
 import { pspDecryptPRX } from "../src/loader/prx-decrypter.js";
 import { PSPEmulator } from "../src/emulator.js";
+import { NID_NAMES } from "../src/kernel/nids.js";
 import { Logger } from "../src/utils/logger.js";
 
 const isoPath = process.argv[2];
@@ -89,6 +90,17 @@ async function main() {
 
   await emu.loadElfBinary(data);
   console.log(`Entry: 0x${emu.cpu.regs.pc.toString(16)}`);
+
+  // Dump syscall-to-NID mapping for debugging
+  if (process.argv.includes("--dump-nids")) {
+    for (let sc = 0; sc <= 0x80; sc++) {
+      const nid = emu.hle.getNidBySyscallForTest(sc);
+      if (nid != null) {
+        const name = NID_NAMES.get(nid) ?? "???";
+        console.log(`  syscall 0x${sc.toString(16).padStart(2,"0")} → NID 0x${nid.toString(16).padStart(8,"0")} ${name}`);
+      }
+    }
+  }
 
   let frames = 0;
   const startTime = Date.now();

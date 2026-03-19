@@ -16,13 +16,13 @@
     </div>
 
     <main>
-      <!-- Shown when no ISO is loaded -->
-      <section id="drop-zone" class="drop-zone">
-        <div class="drop-zone__icon">💿</div>
-        <p class="drop-zone__label">Drop a PSP ISO here</p>
-        <p class="drop-zone__sub">or <label for="file-input" class="drop-zone__browse">click to browse</label></p>
-        <input id="file-input" type="file" accept=".iso,.ISO" hidden />
-      </section>
+      <!-- Game library (replaces old file picker) -->
+      <game-library id="game-library"></game-library>
+
+      <!-- Hidden fallback file inputs (used by legacy code paths) -->
+      <input id="file-input-iso"   type="file" accept=".iso,.ISO"           hidden />
+      <input id="file-input-dir"   type="file" webkitdirectory              hidden />
+      <input id="file-input-eboot" type="file" accept=".bin,.BIN,.pbp,.PBP" hidden />
 
       <!-- Shown after ISO is loaded -->
       <section id="game-view" class="game-view" hidden>
@@ -36,18 +36,24 @@
 
           <!-- Right: metadata + actions -->
           <div class="game-card__body">
-            <h2 id="game-title" class="game-card__title"></h2>
-            <dl class="game-card__meta">
-              <dt>Disc ID</dt>   <dd id="game-disc-id">—</dd>
-              <dt>Region</dt>    <dd id="game-region">—</dd>
-              <dt>Version</dt>   <dd id="game-version">—</dd>
-              <dt>Rating</dt>    <dd id="game-rating">—</dd>
-              <dt id="game-save-title-label" hidden>Save</dt> <dd id="game-save-title" hidden>—</dd>
-            </dl>
+            <img id="game-logo" class="game-card__logo" src="" alt="" hidden />
+            <div class="game-card__body-content">
+              <h2 id="game-title" class="game-card__title"></h2>
+              <dl class="game-card__meta">
+                <dt>Disc ID</dt>   <dd id="game-disc-id">—</dd>
+                <dt>Region</dt>    <dd id="game-region">—</dd>
+                <dt>Version</dt>   <dd id="game-version">—</dd>
+                <dt>Rating</dt>    <dd id="game-rating">—</dd>
+                <dt id="game-save-title-label" hidden>Save</dt> <dd id="game-save-title" hidden>—</dd>
+              </dl>
+            </div>
             <div class="game-card__actions">
+              <button id="back-to-library-btn" class="btn btn--ghost">← Back</button>
               <button id="boot-btn"   class="btn btn--primary">▶&nbsp;Boot</button>
-              <button id="change-btn" class="btn btn--ghost">Change ISO</button>
               <button id="audio-btn"  class="btn btn--ghost audio-btn--loading" hidden>🔊…</button>
+              <label class="debug-toggle" title="Skip all audio decoding and AudioEngine init (for performance testing)">
+                <input type="checkbox" id="disable-audio-chk" checked> Disable audio
+              </label>
             </div>
           </div>
         </div>
@@ -63,41 +69,105 @@
 
       <!-- Shown when game is running -->
       <section id="gameplay-view" class="gameplay-view" hidden>
+        <div class="gameplay-cols">
 
-        <div class="gameplay-screen">
-          <canvas id="psp-canvas" width="480" height="272"></canvas>
-          <table id="fps-counter" style="position:absolute;top:4px;left:4px;color:#0f0;font:12px monospace;background:rgba(0,0,0,0.5);padding:2px 6px;pointer-events:none;z-index:10;border-collapse:collapse;">
-            <tr><td>FPS</td><td id="hud-fps" style="text-align:right;padding-left:8px">0</td></tr>
-            <tr><td>Frame</td><td id="hud-frame" style="text-align:right;padding-left:8px">0</td></tr>
-            <tr><td>Thread</td><td id="hud-tid" style="text-align:right;padding-left:8px">-</td></tr>
-            <tr><td>PC</td><td id="hud-pc" style="text-align:right;padding-left:8px">-</td></tr>
-          </table>
+          <!-- Left: game canvas + controls -->
+          <div class="gameplay-primary">
+            <div id="perf-bar" class="perf-bar">
+              <span>FPS <b id="hud-fps">0</b></span>
+              <span>Frame <b id="hud-frame">0</b></span>
+              <span>TID <b id="hud-tid">-</b></span>
+              <span>PC <b id="hud-pc">-</b></span>
+              <span class="perf-bar__spacer"></span>
+              <span class="perf-bar__group">
+                <button class="perf-bar__btn" data-scale="1">1x</button>
+                <button class="perf-bar__btn perf-bar__btn--active" data-scale="2">2x</button>
+                <button class="perf-bar__btn" data-scale="3">3x</button>
+              </span>
+              <button id="pause-btn" class="perf-bar__btn">⏸</button>
+              <button id="step-btn" class="perf-bar__btn" disabled>⏭</button>
+            </div>
 
-          <div id="gameplay-hud" class="gameplay-hud" hidden>
-            <div class="gameplay-hud__inner">
-              <h3 class="gameplay-hud__title">Controls</h3>
-              <table class="gameplay-hud__table">
-                <tbody>
-                  <tr><td>Arrow Keys</td><td>D-Pad</td></tr>
-                  <tr><td>Z</td>        <td>Cross ✕</td></tr>
-                  <tr><td>X</td>        <td>Circle ○</td></tr>
-                  <tr><td>J</td>        <td>Square □</td></tr>
-                  <tr><td>K</td>        <td>Triangle △</td></tr>
-                  <tr><td>Q</td>        <td>L Trigger</td></tr>
-                  <tr><td>E</td>        <td>R Trigger</td></tr>
-                  <tr><td>Enter</td>    <td>Start</td></tr>
-                  <tr><td>Shift</td>    <td>Select</td></tr>
-                  <tr><td>WASD</td>     <td>Analog Stick</td></tr>
-                </tbody>
-              </table>
-              <p class="gameplay-hud__hint">Press Tab or H to hide</p>
+            <div class="gameplay-screen">
+              <div id="at3-loading" class="at3-loading" hidden>
+                <div class="at3-loading__inner">
+                  <div class="at3-loading__label">Decoding audio…</div>
+                  <div class="at3-loading__progress-track">
+                    <div id="at3-loading-bar" class="at3-loading__progress-bar"></div>
+                  </div>
+                  <div id="at3-loading-text" class="at3-loading__text">0 / 0</div>
+                </div>
+              </div>
+              <canvas id="psp-canvas" width="480" height="272"></canvas>
+              <savedata-overlay id="savedata-overlay"></savedata-overlay>
+              <savedata-list id="savedata-list"></savedata-list>
+
+              <div id="gameplay-hud" class="gameplay-hud" hidden>
+                <div class="gameplay-hud__inner">
+                  <h3 class="gameplay-hud__title">Controls</h3>
+                  <table class="gameplay-hud__table">
+                    <tbody>
+                      <tr><td>Arrow Keys</td><td>D-Pad</td></tr>
+                      <tr><td>Z</td>        <td>Cross ✕</td></tr>
+                      <tr><td>X</td>        <td>Circle ○</td></tr>
+                      <tr><td>J</td>        <td>Square □</td></tr>
+                      <tr><td>K</td>        <td>Triangle △</td></tr>
+                      <tr><td>Q</td>        <td>L Trigger</td></tr>
+                      <tr><td>E</td>        <td>R Trigger</td></tr>
+                      <tr><td>Enter</td>    <td>Start</td></tr>
+                      <tr><td>Shift</td>    <td>Select</td></tr>
+                      <tr><td>WASD</td>     <td>Analog Stick</td></tr>
+                    </tbody>
+                  </table>
+                  <p class="gameplay-hud__hint">Press Tab or H to hide</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="gameplay-toolbar">
+              <button id="exit-btn" class="btn btn--ghost">← Back</button>
+              <span class="gameplay-toolbar__hint">Tab / H — toggle controls</span>
             </div>
           </div>
-        </div>
 
-        <div class="gameplay-toolbar">
-          <button id="exit-btn" class="btn btn--ghost">← Back</button>
-          <span class="gameplay-toolbar__hint">Tab / H — toggle controls</span>
+          <!-- Right: debug sidebar -->
+          <aside id="debug-panel" class="debug-sidebar">
+            <h3 class="debug-sidebar__title">Debug</h3>
+
+            <section class="debug-section">
+              <h4 class="debug-section__title">Performance</h4>
+              <div id="debug-perf-body" class="debug-perf"></div>
+            </section>
+
+            <section class="debug-section">
+              <h4 class="debug-section__title">Threads</h4>
+              <table class="debug-threads">
+                <thead><tr><th>TID</th><th>State / Wait</th><th>Prio</th><th>PC</th></tr></thead>
+                <tbody id="debug-threads-body"></tbody>
+              </table>
+            </section>
+
+            <section class="debug-section">
+              <h4 class="debug-section__title">GE</h4>
+              <div id="debug-ge-body" class="debug-ge"></div>
+            </section>
+
+            <section class="debug-section">
+              <h4 class="debug-section__title">Save Data</h4>
+              <div id="debug-savedata-body" class="debug-stubs"></div>
+            </section>
+
+            <section class="debug-section">
+              <h4 class="debug-section__title">Stubs Called</h4>
+              <div id="debug-stubs-body" class="debug-stubs"></div>
+            </section>
+
+            <section class="debug-section">
+              <h4 class="debug-section__title">Log <span style="color:var(--muted);font-weight:normal">(warn / error)</span></h4>
+              <div id="debug-log-body" class="debug-log"></div>
+            </section>
+          </aside>
+
         </div>
 
       </section>

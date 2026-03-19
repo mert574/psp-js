@@ -35,6 +35,9 @@ const CALL_STACK_DEPTH = 8;
 export class GEProcessor {
   private bus: MemoryBus;
 
+  /** When true, skip per-pixel sprite/triangle rasterization (keep clears + block transfers). */
+  skipSoftwareRaster = false;
+
   // GE state registers
   private baseAddr = 0;
   private offsetAddr = 0;
@@ -492,9 +495,9 @@ export class GEProcessor {
           this.texEnable = (param & 1) !== 0;
           break;
 
-        // Texture address (level 0)
+        // Texture address (level 0) — PPSSPP GPUState.h:293
         case 0xA0:
-          this.texAddr0 = (this.texAddr0 & 0xFF000000) | param;
+          this.texAddr0 = (this.texAddr0 & 0x0F000000) | (param & 0xFFFFF0);
           break;
 
         // Texture addresses / buffer widths for mip levels 1-7 (NOP — only level 0 used)
@@ -506,9 +509,9 @@ export class GEProcessor {
         case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD: case 0xBE: case 0xBF:
           break;
 
-        // Texture buffer width (level 0)
+        // Texture buffer width (level 0) — PPSSPP GPUState.h:293
         case 0xA8:
-          this.texAddr0 = (this.texAddr0 & 0x00FFFFFF) | ((param & 0xFF0000) << 8);
+          this.texAddr0 = (this.texAddr0 & 0x00FFFFFf) | ((param << 8) & 0x0F000000);
           this.texBufWidth0 = param & 0x07FF;
           break;
 
@@ -768,18 +771,21 @@ export class GEProcessor {
           this.texShadeLS0 = param & 3;
           this.texShadeLS1 = (param >> 8) & 3;
           break;
-        case 0xB0: // CLUT addr lower
-          this.clutAddr = (this.clutAddr & 0xFF000000) | param;
+        case 0xB0: // CLUT addr lower — PPSSPP GPUState.h:306
+          // clutaddr stores raw param; getClutAddress masks to 0x00FFFFF0
+          this.clutAddr = (this.clutAddr & 0x0F000000) | (param & 0x00FFFFF0);
           break;
-        case 0xB1: // CLUT addr upper
-          this.clutAddr = (this.clutAddr & 0x00FFFFFF) | ((param & 0xFF0000) << 8);
+        case 0xB1: // CLUT addr upper — PPSSPP GPUState.h:306
+          this.clutAddr = (this.clutAddr & 0x00FFFFF0) | ((param << 8) & 0x0F000000);
           break;
         case 0xC4: break; // load CLUT (triggers the load, data already set)
         case 0xC5: // CLUT format: format | shift | mask | start
+          // PPSSPP GPUState.h:315-318
           this.clutFormat = param & 3;
           this.clutShift = (param >> 2) & 0x1F;
           this.clutMask = (param >> 8) & 0xFF;
-          this.clutStart = ((param >> 16) & 0x1F) * (this.clutFormat < 3 ? 16 : 8);
+          // getClutIndexStartPos: always << 4 (×16), regardless of format
+          this.clutStart = ((param >> 16) & 0x1F) << 4;
           break;
         case 0xC8: break; // tex level (LOD)
 
@@ -932,8 +938,8 @@ export class GEProcessor {
           this._dbgTotalPrim    += this._dbgPrimCount;
           this._dbgTotalClear   += this._dbgClearCount;
           this._dbgTotalSkip    += this._dbgSkipCount;
-          if (this._dbgListCount <= 10 || this._dbgListCount % 50 === 0 || this._dbgSkipCount > 0 || this._dbgBadFbOff > 0) {
-            log.info(`List #${this._dbgListCount} END: drawn=${this._dbgPrimCount - this._dbgSkipCount} clear=${this._dbgClearCount} skipped=${this._dbgSkipCount} badFb=${this._dbgBadFbOff} fbPtr=0x${this.fbPtr.toString(16)} fmt=${this.fbFormat} blend=${this.alphaBlendEnable}(s=${this.blendSrc},d=${this.blendDst},op=${this.blendOp}) atest=${this.alphaTestEnable}:${this.alphaTestFunc}:${this.alphaTestRef}`);
+          if (this._dbgListCount <= 3) {
+            log.info(`List #${this._dbgListCount} END: drawn=${this._dbgPrimCount - this._dbgSkipCount} clear=${this._dbgClearCount} fbPtr=0x${this.fbPtr.toString(16)}`);
           }
           this._dbgBadFbOff = 0;
           return { stoppedPc: -1, commandsProcessed: count }; // completed
@@ -1318,6 +1324,13 @@ export class GEProcessor {
     }
     if (this.clearMode) return; // non-sprite clears: skip
 
+    this._dbgPrimCount += Math.floor(vertices.length / (primType === 6 ? 2 : 3));
+
+    // Skip expensive software rasterization for non-clear primitives.
+    // Clears and block transfers still render. Sprites/triangles are counted but not drawn.
+    // TODO: Replace with WebGL-based rendering for full-speed textured rendering.
+    if (this.skipSoftwareRaster) return;
+
     // Record which buffer is receiving actual pixel draws
     this.lastDrawFbPtr = this.fbPtr;
     this.lastDrawFbWidth = this.fbWidth;
@@ -1447,81 +1460,53 @@ export class GEProcessor {
 
     // One-shot center-pixel alpha probe: for large sprites, sample center and log
     // once per unique draw state when alpha=0 (invisible with SRC_ALPHA blend).
-    if ((sx1 - sx0) * (sy1 - sy0) > 100) {
-      const cx = (sx0 + sx1) >> 1, cy = (sy0 + sy1) >> 1;
-      const cu = u0 + (cx - sx0 + 0.5) * du, cv2 = vt0 + (cy - sy0 + 0.5) * dv;
-      const vc = v1.color;
-      const pa = (vc >>> 24) & 0xFF;
-      let probeA = pa;
-      if (useTexture) {
-        const texel = sampleTexture(ts, this.bus, cu, cv2);
-        const ta = (texel >>> 24) & 0xFF;
-        const [,,,fa] = applyTexFunc(fs, (texel>>>16)&0xFF,(texel>>>8)&0xFF,texel&0xFF,ta,(vc>>>16)&0xFF,(vc>>>8)&0xFF,vc&0xFF,pa);
-        probeA = fa;
-      }
-      if (probeA === 0) {
-        const blendKey = this.alphaBlendEnable ? ((this.blendSrc << 4) | this.blendDst) : 0;
-        const key = (this.texFormat << 16) | (this.texFunc << 8) | ((this.texFuncAlpha ? 1 : 0) << 7) | blendKey;
-        if (!this._dbgAlpha0Seen.has(key)) {
-          this._dbgAlpha0Seen.add(key);
-          log.debug(`ALPHA0 sprite: vertColor=0x${vc.toString(16)} useTexture=${useTexture} texAddr=0x${this.texAddr0.toString(16)} texFmt=${this.texFormat} texFunc=${this.texFunc} texFuncAlpha=${this.texFuncAlpha} blend=${this.alphaBlendEnable}(s=${this.blendSrc},d=${this.blendDst}) matAmb=0x${this.materialAmbient.toString(16)} matAlpha=${this.materialAlpha}`);
+    // Fast path: untextured opaque ABGR8888 with no blending/alpha test
+    const vc = v1.color;
+    const noBlend = !this.alphaBlendEnable;
+    const noAtest = !this.alphaTestEnable;
+    if (!useTexture && bpp === 4 && noBlend && noAtest && this.maskRgb === 0 && this.maskAlpha === 0) {
+      // Pack pixel as RGBA for direct u32 write (little-endian: R,G,B,A)
+      const r = (vc >>> 16) & 0xFF;
+      const g = (vc >>>  8) & 0xFF;
+      const b = (vc >>>  0) & 0xFF;
+      const a = (vc >>> 24) & 0xFF;
+      const pixel = r | (g << 8) | (b << 16) | (a << 24);
+      const vram32 = new Uint32Array(vram.buffer, vram.byteOffset);
+      for (let y = yStart; y < yEnd; y++) {
+        const rowOff = (fbOff + y * stride * 4) >>> 2;
+        for (let x = xStart; x < xEnd; x++) {
+          vram32[rowOff + x] = pixel;
         }
       }
-    }
+    } else {
+      // General path with texture sampling and fragment processing
+      for (let y = yStart; y < yEnd; y++) {
+        for (let x = xStart; x < xEnd; x++) {
+          let r: number, g: number, b: number, a: number;
+          const pr = (vc >>> 16) & 0xFF;
+          const pg = (vc >>>  8) & 0xFF;
+          const pb = (vc >>>  0) & 0xFF;
+          const pa = (vc >>> 24) & 0xFF;
 
-    let _dbgPixelsWritten = 0;
-    for (let y = yStart; y < yEnd; y++) {
-      for (let x = xStart; x < xEnd; x++) {
-        let r: number, g: number, b: number, a: number;
+          if (useTexture) {
+            const tu = u0 + (x - sx0 + 0.5) * du;
+            const tv = vt0 + (y - sy0 + 0.5) * dv;
+            const texel = sampleTexture(ts, this.bus, tu, tv);
+            const tr = (texel >>> 16) & 0xFF;
+            const tg = (texel >>>  8) & 0xFF;
+            const tb = (texel >>>  0) & 0xFF;
+            const ta = (texel >>> 24) & 0xFF;
+            [r, g, b, a] = applyTexFunc(fs, tr, tg, tb, ta, pr, pg, pb, pa);
+          } else {
+            r = pr; g = pg; b = pb; a = pa;
+          }
 
-        // Vertex prim color (v1 for sprites), R/B swapped for shader convention
-        const vc = v1.color;
-        const pr = (vc >>> 16) & 0xFF;  // B channel
-        const pg = (vc >>>  8) & 0xFF;
-        const pb = (vc >>>  0) & 0xFF;  // R channel
-        const pa = (vc >>> 24) & 0xFF;
+          if (!passAlphaTest(fs, a)) continue;
 
-        if (useTexture) {
-          // Sample at pixel center (+0.5), matching PPSSPP's DrawRectangle sub-pixel offset
-          const tu = u0 + (x - sx0 + 0.5) * du;
-          const tv = vt0 + (y - sy0 + 0.5) * dv;
-          const texel = sampleTexture(ts, this.bus, tu, tv);
-          // Texel ABGR8888: R=bits[7:0], G=bits[15:8], B=bits[23:16], A=bits[31:24]
-          // Swap R/B to match shader swizzle convention (same as vertex color above)
-          const tr = (texel >>> 16) & 0xFF;  // B of texel
-          const tg = (texel >>>  8) & 0xFF;
-          const tb = (texel >>>  0) & 0xFF;  // R of texel
-          const ta = (texel >>> 24) & 0xFF;
-          [r, g, b, a] = applyTexFunc(fs, tr, tg, tb, ta, pr, pg, pb, pa);
-        } else {
-          r = pr; g = pg; b = pb; a = pa;
-        }
-
-        if (!passAlphaTest(fs, a)) continue;
-
-        const idx = fbOff + (y * stride + x) * bpp;
-        if (emitFragment(fs, vram, idx, x, y, r, g, b, a)) {
-          _dbgPixelsWritten++;
+          const idx = fbOff + (y * stride + x) * bpp;
+          emitFragment(fs, vram, idx, x, y, r, g, b, a);
         }
       }
-    }
-    // Diagnostic: log invisible sprites that had valid screen area but wrote no pixels
-    if (_dbgPixelsWritten === 0 && (xEnd - xStart) * (yEnd - yStart) > 200) {
-      // Sample center texel for diagnosis
-      const cx = (sx0 + sx1) >> 1, cy = (sy0 + sy1) >> 1;
-      const cu = u0 + (cx - sx0 + 0.5) * du, cv = vt0 + (cy - sy0 + 0.5) * dv;
-      const centerTexel = useTexture ? sampleTexture(ts, this.bus, cu, cv) : 0;
-      const vc = v1.color;
-      log.debug(
-        `SPRITE invisible: area=${sx0}..${sx1},${sy0}..${sy1} ` +
-        `vertColor=0x${vc.toString(16)} tex=${useTexture} texAddr=0x${this.texAddr0.toString(16)} ` +
-        `texFmt=${this.texFormat} texW=${this.texWidth0} texH=${this.texHeight0} ` +
-        `centerTexel=0x${centerTexel.toString(16)} ` +
-        `atest=${this.alphaTestEnable}:${this.alphaTestFunc}:${this.alphaTestRef} ` +
-        `blend=${this.alphaBlendEnable} s=${this.blendSrc} d=${this.blendDst} ` +
-        `texFunc=${this.texFunc} texFuncAlpha=${this.texFuncAlpha} ` +
-        `through=${(this.vtypeRaw >>> 23) & 1}`
-      );
     }
   }
 

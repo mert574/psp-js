@@ -157,8 +157,32 @@ export class AllegrexCPU {
           this.regs.pc = delayTarget;
         }
         if (this.hle) {
+          const callerThreadId = this.hle.currentThreadId;
           this.hle.dispatch(e.code, this.regs);
           if (this.stepFaulted) return false;
+          // Clobber caller-saved registers to 0xDEADBEEF after syscall,
+          // matching PPSSPP's hleFinishSyscall behavior.
+          // Skip $v0/$v1 (return values), $s0-$s7 (callee-saved), $k0-$k1/$gp/$sp/$fp/$ra.
+          // Don't clobber when a MipsCall is active — the syscall handler set up
+          // $a0-$a2 for the callback, and clobbering would destroy them.
+          const DEADBEEF = 0xDEADBEEF;
+          const callerRegs = [1, 4,5,6,7, 8,9,10,11,12,13,14,15, 24,25];
+          if (this.hle.hasMipsCall) {
+            // MipsCall dispatched — callback args are live, don't clobber
+          } else if (this.hle.currentThreadId === callerThreadId) {
+            // No thread switch — clobber live registers directly
+            for (const r of callerRegs) this.regs.setGpr(r, DEADBEEF);
+            this.regs.hi = DEADBEEF;
+            this.regs.lo = DEADBEEF;
+          } else {
+            // Thread switch occurred — clobber the saved context of the calling thread
+            const callerThread = this.hle.threads.get(callerThreadId);
+            if (callerThread) {
+              for (const r of callerRegs) callerThread.context.gpr[r] = DEADBEEF;
+              callerThread.context.hi = DEADBEEF;
+              callerThread.context.lo = DEADBEEF;
+            }
+          }
         } else {
           log.warn(`SYSCALL 0x${e.code.toString(16)} with no HLE kernel attached`);
           this.regs.setGpr(2, 0x80020001);

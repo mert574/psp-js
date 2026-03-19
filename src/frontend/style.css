@@ -73,8 +73,8 @@ main {
   padding: 40px 24px;
 }
 
-/* ── Drop zone ───────────────────────────────────────────────────────────── */
-.drop-zone {
+/* ── File picker ─────────────────────────────────────────────────────────── */
+.file-picker {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -84,21 +84,19 @@ main {
   padding: 64px 32px;
   border: 2px dashed var(--border);
   border-radius: var(--radius);
-  cursor: pointer;
-  transition: border-color 0.15s, background 0.15s;
   text-align: center;
 }
 
-.drop-zone:hover,
-.drop-zone--drag-over {
-  border-color: var(--highlight);
-  background: rgba(88, 166, 255, 0.04);
-}
+.file-picker__icon  { font-size: 40px; }
+.file-picker__label { font-size: 16px; color: var(--text); }
 
-.drop-zone__icon  { font-size: 40px; }
-.drop-zone__label { font-size: 16px; color: var(--text); }
-.drop-zone__sub   { font-size: 13px; color: var(--muted); }
-.drop-zone__browse { color: var(--highlight); text-decoration: underline; cursor: pointer; }
+.file-picker__btns {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: 8px;
+}
 
 /* ── Game view ───────────────────────────────────────────────────────────── */
 .game-view {
@@ -174,21 +172,45 @@ main {
 /* Audio enable button (shown when autoplay is blocked) */
 .audio-btn--loading { opacity: 0.6; cursor: default; }
 
+.game-card__logo {
+  position: absolute;
+  top: 24px;
+  right: 24px;
+  max-width: 310px;
+  max-height: 180px;
+  object-fit: contain;
+  pointer-events: none;
+}
+
 /* Body */
 .game-card__body {
   flex: 1;
   display: flex;
   flex-direction: column;
+  height: 100%;
   gap: 12px;
   min-width: 0;
+  z-index: 1; /* Stay above background */
+}
+
+.game-card__body-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
 
 .game-card__title {
-  font-size: 20px;
-  font-weight: 600;
+  position: absolute;
+  top: 24px;
+  left: 24px;
+  font-size: 24px;
+  font-weight: 700;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  color: #fff;
+  text-shadow: 0 2px 4px rgba(0,0,0,0.5);
 }
 
 .game-card__meta {
@@ -222,6 +244,8 @@ main {
 .btn--primary { background: var(--highlight); color: #0d1117; }
 .btn--ghost   { background: transparent; color: var(--muted); border-color: var(--border); }
 .btn:hover    { opacity: 0.8; }
+
+.debug-toggle { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--muted); cursor: pointer; user-select: none; }
 
 /* ── ISO tree (collapsible) ──────────────────────────────────────────────── */
 .iso-tree {
@@ -273,22 +297,81 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
 
 /* ── Gameplay view ───────────────────────────────────────────────────────── */
 .gameplay-view {
+  width: 100%;
+}
+
+/* ── 2-column layout: game | debug ───────────────────────────────────────── */
+.gameplay-cols {
+  display: grid;
+  grid-template-columns: 1fr 400px;
+  gap: 0 16px;
+  align-items: start;
+  width: 100%;
+}
+@media (max-width: 1200px) {
+  .gameplay-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+.gameplay-primary {
   display: flex;
   flex-direction: column;
   align-items: center;
+  min-width: 0;
+}
+
+/* ── Perf bar (Steam Deck–style) ─────────────────────────────────────────── */
+.perf-bar {
+  display: flex;
   gap: 16px;
-  width: 100%;
+  align-items: center;
+  padding: 10px;
+  font: 11px/1 monospace;
+  color: #8f8;
+  background: #111;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  user-select: none;
+}
+.perf-bar span { white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+.perf-bar b { color: #5f5; font-weight: 700; }
+.perf-bar__spacer { flex: 1; }
+.perf-bar__btn {
+  background: none;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 4px;
+  color: #8f8;
+  font: 11px monospace;
+  padding: 2px 6px;
+  cursor: pointer;
+  line-height: 1;
+}
+.perf-bar__btn:hover { background: rgba(255,255,255,0.08); }
+.perf-bar__btn:disabled { opacity: 0.3; cursor: default; }
+.perf-bar__btn--active { color: #5f5; border-color: #5f5; }
+.perf-bar__group { display: flex; gap: 2px; }
+
+.gameplay-primary {
+  --psp-scale: 2;
+}
+
+.perf-bar,
+.gameplay-screen {
+  width: calc(480px * var(--psp-scale));
 }
 
 .gameplay-screen {
   position: relative;
-  width: min(960px, 100%);
-  aspect-ratio: 480 / 272;
+  height: calc(272px * var(--psp-scale));
   background: #000;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 0 0 var(--radius) var(--radius);
   overflow: hidden;
 }
+
+.gameplay-toolbar { margin-top: 12px; }
 
 #psp-canvas {
   display: block;
@@ -348,6 +431,54 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
   text-align: center;
 }
 
+/* ── AT3 loading overlay ──────────────────────────────────────────────────── */
+.at3-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.85);
+}
+
+.at3-loading__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  width: 60%;
+}
+
+.at3-loading__label {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e6edf3;
+  letter-spacing: 0.04em;
+}
+
+.at3-loading__progress-track {
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.at3-loading__progress-bar {
+  height: 100%;
+  width: 0%;
+  background: #58a6ff;
+  border-radius: 3px;
+  transition: width 0.2s ease;
+}
+
+.at3-loading__text {
+  font-size: 11px;
+  color: #8b949e;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Gameplay toolbar ─────────────────────────────────────────────────────── */
 .gameplay-toolbar {
   display: flex;
@@ -362,3 +493,177 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
   color: var(--muted);
   margin-left: auto;
 }
+
+/* ── Debug panel ─────────────────────────────────────────────────────────── */
+/* ── Debug sidebar ────────────────────────────────────────────────────────── */
+.debug-sidebar {
+  background: #0d1117;
+  border: 1px solid #1c2128;
+  border-radius: 12px;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  position: sticky;
+  top: 60px;
+  scrollbar-width: thin;
+  scrollbar-color: #30363d transparent;
+}
+.debug-sidebar::-webkit-scrollbar { width: 4px; }
+.debug-sidebar::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+
+.debug-sidebar__title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin: 0 0 8px;
+}
+
+@media (max-width: 1200px) {
+  .debug-sidebar { position: static; max-height: 420px; }
+}
+
+/* ── Debug sections ──────────────────────────────────────────────────────── */
+.debug-section {
+  padding: 10px 12px;
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  margin-bottom: 6px;
+}
+
+.debug-section__title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #484f58;
+  margin: 0 0 8px;
+}
+
+/* ── Performance ─────────────────────────────────────────────────────────── */
+.debug-perf {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dbg-perf-row {
+  display: grid;
+  grid-template-columns: 32px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #c9d1d9;
+}
+.dbg-perf-row > span:first-child {
+  color: #484f58;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.dbg-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: #21262d;
+  position: relative;
+  overflow: hidden;
+}
+.dbg-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  right: calc(100% - var(--pct));
+  background: var(--clr);
+  border-radius: inherit;
+  transition: right .3s;
+}
+.dbg-perf-detail {
+  grid-column: 2 / -1;
+  color: #6e7681;
+  font-size: 10px;
+}
+
+/* ── Threads table ───────────────────────────────────────────────────────── */
+.debug-threads {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  color: #c9d1d9;
+}
+.debug-threads th {
+  text-align: left;
+  padding: 3px 6px;
+  color: #484f58;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  border-bottom: 1px solid #21262d;
+}
+.debug-threads th:nth-child(1) { width: 48px; }
+.debug-threads th:nth-child(2) { width: auto; }
+.debug-threads th:nth-child(3) { width: 40px; }
+.debug-threads th:nth-child(4) { width: 90px; }
+.debug-threads td {
+  padding: 3px 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+}
+.dbg-row--active td { color: #58a6ff; }
+
+/* ── GE stats ────────────────────────────────────────────────────────────── */
+.debug-ge {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: #8b949e;
+  font-size: 11px;
+}
+.debug-ge b { color: #c9d1d9; font-weight: 600; }
+
+/* ── Stubs / Save Data ───────────────────────────────────────────────────── */
+.debug-stubs {
+  max-height: 100px;
+  overflow-y: auto;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: #30363d transparent;
+}
+.debug-stubs::-webkit-scrollbar { width: 3px; }
+.debug-stubs::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+.dbg-stub-name  { color: #6e7681; }
+.dbg-stub-count { color: #d29922; font-weight: 600; }
+
+/* ── Log ─────────────────────────────────────────────────────────────────── */
+.debug-log {
+  max-height: 160px;
+  overflow-y: auto;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: #30363d transparent;
+}
+.debug-log::-webkit-scrollbar { width: 3px; }
+.debug-log::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+.dbg-log--warn  { color: #d29922; }
+.dbg-log--error { color: #f85149; }

@@ -134,7 +134,13 @@ function createDummyThread(hle: HLEKernel, id: number = 1, priority: number = 0x
     waitThreadEndId: 0,
     waitMutexId: 0,
     waitMutexCount: 0,
+    waitFplId: 0,
+    waitFplDataPtr: 0,
+    waitVplId: 0,
+    waitVplSize: 0,
+    waitVplAddrPtr: 0,
     pendingWakeCallback: undefined,
+    cbPromotedFromWaitType: 0,
   };
   hle.addThreadForTest(thread);
   return thread;

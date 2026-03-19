@@ -96,8 +96,8 @@ export class InputHandler {
       mapBtn(15, PspButton.Right);
 
       const axes = pad.axes;
-      if (Math.abs(axes[0]) > 0.1) ax = axes[0];
-      if (Math.abs(axes[1]) > 0.1) ay = axes[1];
+      if (Math.abs(axes[0]!) > 0.1) ax = axes[0]!;
+      if (Math.abs(axes[1]!) > 0.1) ay = axes[1]!;
     }
 
     return { buttons, analog: { x: ax, y: ay } };

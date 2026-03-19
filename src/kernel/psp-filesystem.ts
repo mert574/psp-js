@@ -14,8 +14,53 @@ export class PspFileSystem {
   /** Per-thread CWD: threadId → absolute path like "disc0:/PSP_GAME/USRDIR" */
   private currentDir = new Map<number, string>();
   private startingDirectory = "disc0:/";
+  /** Directories created via sceIoMkdir or registered as existing */
+  private readonly knownDirs = new Set<string>();
 
   constructor(private readonly fileData: Map<string, Uint8Array>) {}
+
+  /**
+   * Set the starting (default) working directory.
+   * Also registers the directory and all its parents as known directories.
+   */
+  setStartingDirectory(dir: string): void {
+    this.startingDirectory = dir;
+    // Register this directory and all parent directories as known
+    this._registerDirAndParents(dir);
+  }
+
+  /** Register an additional directory as known/existing. */
+  registerDirectory(dir: string): void {
+    this._registerDirAndParents(dir);
+  }
+
+  /**
+   * Create a directory. Tracks it so getFileInfo/getDirListing recognise it.
+   * Returns 0 on success.
+   */
+  mkDir(path: string, threadId: number): number {
+    const resolved = this.resolvePath(path, threadId);
+    this._registerDirAndParents(resolved);
+    return 0;
+  }
+
+  /** Register a directory path and all its ancestor directories as known (case-insensitive). */
+  private _registerDirAndParents(dir: string): void {
+    const colonIdx = dir.indexOf(":");
+    if (colonIdx < 0) return;
+    const lower = dir.toLowerCase();
+    const device = lower.substring(0, colonIdx + 1);
+    const rest = lower.substring(colonIdx + 1).replace(/^\/+/, "").replace(/\/+$/, "");
+
+    // Register device root
+    this.knownDirs.add(device);
+
+    // Register each ancestor
+    const parts = rest.split("/").filter(p => p.length > 0);
+    for (let i = 1; i <= parts.length; i++) {
+      this.knownDirs.add(device + "/" + parts.slice(0, i).join("/"));
+    }
+  }
 
   /**
    * Resolve a PSP path to an absolute normalized path.
@@ -41,12 +86,18 @@ export class PspFileSystem {
       device = path.substring(0, colonIdx + 1).toLowerCase();
       rest = path.substring(colonIdx + 1);
     } else {
-      // Relative path: prepend CWD
+      // No device prefix — use current device from CWD
       const cwd = this.currentDir.get(threadId) ?? this.startingDirectory;
       const cwdColon = cwd.indexOf(":");
       device = cwdColon >= 0 ? cwd.substring(0, cwdColon + 1).toLowerCase() : "disc0:";
-      const cwdRest = cwdColon >= 0 ? cwd.substring(cwdColon + 1) : cwd;
-      rest = cwdRest + "/" + path;
+      if (path.startsWith("/")) {
+        // Absolute from device root (e.g. "/PSP/GAME")
+        rest = path;
+      } else {
+        // Relative path: prepend CWD
+        const cwdRest = cwdColon >= 0 ? cwd.substring(cwdColon + 1) : cwd;
+        rest = cwdRest + "/" + path;
+      }
     }
 
     // Normalize path components: split on /, handle . and .., remove empty
@@ -60,6 +111,8 @@ export class PspFileSystem {
       }
     }
 
+    // PSP represents device root as "ms0:" not "ms0:/"
+    if (resolved.length === 0) return device;
     return device + "/" + resolved.join("/");
   }
 
@@ -96,6 +149,12 @@ export class PspFileSystem {
         const parts = resolved.split("/");
         return { exists: true, isDirectory: true, name: parts[parts.length - 1]! || "", size: 0 };
       }
+    }
+
+    // Check known directories (created via sceIoMkdir or registered)
+    if (this.knownDirs.has(resolvedLower)) {
+      const parts = resolved.split("/");
+      return { exists: true, isDirectory: true, name: parts[parts.length - 1]! || "", size: 0 };
     }
 
     return { exists: false, isDirectory: false, name: "", size: 0 };

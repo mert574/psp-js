@@ -66,6 +66,11 @@ export class CoreTiming {
     this.queue = this.queue.filter(ev => ev.typeId !== typeId);
   }
 
+  /** Remove pending events matching both typeId and userdata (like PPSSPP UnscheduleEvent). */
+  unscheduleEvent(typeId: EventTypeId, userdata: number): void {
+    this.queue = this.queue.filter(ev => !(ev.typeId === typeId && ev.userdata === userdata));
+  }
+
   /**
    * Advance the global timer by `cycles`, then fire all due events.
    * Callbacks receive `cyclesLate = globalTimer - event.time`.

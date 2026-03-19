@@ -163,7 +163,42 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   function allocAtracID(codecType: number): number {
     for (let i = 0; i < MAX_ATRAC_IDS; i++) {
       if ((atracContextTypes[i] === codecType || atracContextTypes[i] === 0) && !atracContexts.has(i)) {
-        atracContextTypes[i] = codecType; // lock this slot to the codec type
+        atracContextTypes[i] = codecType;
+        return i;
+      }
+    }
+    // All slots occupied — try reclaiming a finished context of matching type.
+    // Some games never call sceAtracReleaseAtracID after playback ends.
+    for (let i = 0; i < MAX_ATRAC_IDS; i++) {
+      const ctx = atracContexts.get(i);
+      if (ctx && atracContextTypes[i] === codecType && !ctx.decoding &&
+          ctx.decodedPcm !== null && ctx.decodePos >= ctx.info.totalSamples) {
+        log.warn(`allocAtracID: reclaiming finished slot ${i} for codec 0x${codecType.toString(16)}`);
+        atracContexts.delete(i);
+        atracDecodeCallCount.delete(i);
+        return i;
+      }
+    }
+    // Also try reclaiming any finished slot regardless of type
+    for (let i = 0; i < MAX_ATRAC_IDS; i++) {
+      const ctx = atracContexts.get(i);
+      if (ctx && !ctx.decoding &&
+          ctx.decodedPcm !== null && ctx.decodePos >= ctx.info.totalSamples) {
+        log.warn(`allocAtracID: reclaiming finished slot ${i} (type mismatch, was 0x${atracContextTypes[i]!.toString(16)})`);
+        atracContexts.delete(i);
+        atracDecodeCallCount.delete(i);
+        atracContextTypes[i] = codecType;
+        return i;
+      }
+    }
+    // Last resort: reclaim any non-decoding slot (failed decode, stale context)
+    for (let i = 0; i < MAX_ATRAC_IDS; i++) {
+      const ctx = atracContexts.get(i);
+      if (ctx && !ctx.decoding && !atracWaiters.has(i)) {
+        log.warn(`allocAtracID: force-reclaiming stale slot ${i} (pcm=${ctx.decodedPcm !== null}, pos=${ctx.decodePos}/${ctx.info.totalSamples})`);
+        atracContexts.delete(i);
+        atracDecodeCallCount.delete(i);
+        atracContextTypes[i] = codecType;
         return i;
       }
     }
@@ -178,7 +213,7 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   // ── sceAudioChReserve(channel, sampleCount, format) → channelIndex ──────
   kernel.register(AUDIO.sceAudioChReserve, (regs) => {
     const engine = kernel.audioEngine;
-    if (!engine?.isReady) { regs.setGpr(2, regs.getGpr(4) >= 0 ? regs.getGpr(4) : 0); return; }
+    if (!engine?.isReady) { regs.setGpr(2, 0x80260008); return; } // SCE_ERROR_AUDIO_NOT_INITIALIZED
     const ch = engine.reserveChannel(
       regs.getGpr(4) >>> 0,
       regs.getGpr(5) >>> 0,
@@ -460,7 +495,7 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   });
 
   // ── sceAtracDecodeData(id, out, numSamplesPtr, finishFlagPtr, remainPtr) ──
-  // NIDs: 0x9f265f14 (primary) and 0x6a8c3cd5 (alternate)
+  // NID: 0x6a8c3cd5 (PPSSPP canonical)
   const decodeHandler: HLEHandler = (regs, bus) => {
     // Skip decode entirely when audio is disabled (engine never initialised).
     if (!kernel.audioEngine?.isReady) { regs.setGpr(2, 0); return; }
@@ -685,9 +720,43 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  // ── sceAtracReinit (NID 0x132f1eca) ──────────────────────────────────────
+  // ── sceAtracReinit(at3Count, at3plusCount) — PPSSPP sceAtrac.cpp:794-832 ──
   kernel.register(ATRAC.sceAtracReinit, (regs) => {
-    log.debug(`sceAtracReinit at3=${regs.getGpr(4)} at3plus=${regs.getGpr(5)}`);
+    const at3Count = regs.getGpr(4) | 0;
+    const at3plusCount = regs.getGpr(5) | 0;
+
+    // PPSSPP: fail if any IDs still in use
+    for (let i = 0; i < MAX_ATRAC_IDS; i++) {
+      if (atracContexts.has(i)) {
+        log.warn(`sceAtracReinit: ID ${i} still in use — returning BUSY`);
+        regs.setGpr(2, 0x80020001); // SCE_KERNEL_ERROR_BUSY
+        return;
+      }
+    }
+
+    // Reset slot types
+    atracContextTypes.fill(0);
+    let next = 0;
+    const space = MAX_ATRAC_IDS;
+
+    // (0,0) = deinit
+    if (at3Count === 0 && at3plusCount === 0) {
+      log.info("sceAtracReinit: deinit");
+      regs.setGpr(2, 0);
+      return;
+    }
+
+    // AT3+ slots cost double in PPSSPP
+    for (let i = 0; i < at3plusCount && next < space - 1; i++) {
+      atracContextTypes[next++] = PSP_CODEC_AT3PLUS;
+      atracContextTypes[next++] = PSP_CODEC_AT3PLUS;
+    }
+    // AT3 slots
+    for (let i = 0; i < at3Count && next < space; i++) {
+      atracContextTypes[next++] = PSP_CODEC_AT3;
+    }
+
+    log.info(`sceAtracReinit: at3=${at3Count} at3plus=${at3plusCount} → types=[${atracContextTypes.join(",")}]`);
     regs.setGpr(2, 0);
   });
 

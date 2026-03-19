@@ -1,7 +1,7 @@
 import type { IsoFile } from "../iso/iso9660.js";
 import type { GameInfo } from "../iso/sfo.js";
 
-const dropZoneEl    = document.getElementById("drop-zone")     as HTMLElement;
+const gameLibraryEl  = document.getElementById("game-library")   as HTMLElement | null;
 const gameViewEl    = document.getElementById("game-view")      as HTMLElement;
 const errorBanner   = document.getElementById("error-banner")   as HTMLElement;
 const errorMsg      = document.getElementById("error-message")!;
@@ -12,9 +12,14 @@ export function setStatus(message: string): void {
   document.getElementById("status-bar")!.textContent = message;
 }
 
-export function showError(message: string): void {
+export function showError(message: string, cause?: unknown): void {
   errorMsg.textContent = message;
   errorBanner.classList.add("visible");
+  if (cause !== undefined) {
+    console.error(message, cause);
+  } else {
+    console.error(message);
+  }
 }
 
 export function clearError(): void {
@@ -22,9 +27,9 @@ export function clearError(): void {
   errorMsg.textContent = "";
 }
 
-export function showDropZone(): void {
+export function showFilePicker(): void {
   gameViewEl.hidden = true;
-  dropZoneEl.hidden = false;
+  if (gameLibraryEl) gameLibraryEl.hidden = false;
 }
 
 // Unlock the audio element within the current user gesture so autoplay works
@@ -90,7 +95,7 @@ const PARENTAL_LABELS: Record<number, string> = {
   9: "Adults Only 18+",
 };
 
-export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string): void {
+export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string, logoUrl?: string): void {
   document.getElementById("game-title")!.textContent    = info.title;
   document.getElementById("game-disc-id")!.textContent  = info.discId   || "—";
   document.getElementById("game-version")!.textContent  = info.version  || "—";
@@ -117,9 +122,11 @@ export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string): 
     : "";
 
   const icon        = document.getElementById("game-icon")        as HTMLImageElement;
+  const logo        = document.getElementById("game-logo")        as HTMLImageElement;
   const placeholder = document.getElementById("game-media-placeholder") as HTMLElement;
 
   icon.hidden        = true;
+  logo.hidden        = true;
   placeholder.hidden = false;
 
   if (iconUrl) {
@@ -129,7 +136,12 @@ export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string): 
     placeholder.hidden = true;
   }
 
-  dropZoneEl.hidden = true;
+  if (logoUrl) {
+    logo.src    = logoUrl;
+    logo.hidden = false;
+  }
+
+  if (gameLibraryEl) gameLibraryEl.hidden = true;
   gameViewEl.hidden = false;
 }
 
@@ -190,6 +202,19 @@ export function exitGameplayView(): void {
   gameplayViewEl.hidden = true;
   gameViewEl.hidden     = false;
   setStatus("Returned to game info.");
+}
+
+export function showAt3Loading(done: number, total: number): void {
+  const el  = document.getElementById("at3-loading")!;
+  const bar = document.getElementById("at3-loading-bar")!;
+  const txt = document.getElementById("at3-loading-text")!;
+  el.hidden = false;
+  bar.style.width = total > 0 ? `${Math.round((done / total) * 100)}%` : "0%";
+  txt.textContent = `${done} / ${total}`;
+}
+
+export function hideAt3Loading(): void {
+  document.getElementById("at3-loading")!.hidden = true;
 }
 
 export function toggleGameplayHud(): void {

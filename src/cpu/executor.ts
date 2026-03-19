@@ -24,6 +24,52 @@ function roundToNearestEven(x: number): number {
   return (f & 1) ? ((f + 1) | 0) : (f | 0);
 }
 
+/** Flush denormal float to zero if FS bit is set (FCR31 bit 24). */
+function fpuFlush(v: number, fs: number): number {
+  if (fs && v !== 0 && Math.abs(v) < 1.1754944e-38) return 0;
+  return v;
+}
+
+/**
+ * Apply PSP FPU rounding mode to a double-precision result, converting to float.
+ * JS always uses round-to-nearest-even. For other modes, adjust the result.
+ * fcr31 bits [1:0]: 0=nearest, 1=toward zero, 2=toward +inf, 3=toward -inf
+ */
+const _froundBuf = new Float32Array(1);
+const _froundU32 = new Uint32Array(_froundBuf.buffer);
+function fpuRound(d: number, rm: number): number {
+  if (rm === 0 || !isFinite(d)) return Math.fround(d); // default: nearest-even
+  const f = Math.fround(d); // nearest-even result
+  if (f === d) return f;     // exact — no rounding needed
+  if (rm === 1) {
+    // Toward zero: if fround rounded AWAY from zero, step back 1 ULP
+    if ((d > 0 && f > d) || (d < 0 && f < d)) {
+      _froundBuf[0] = f;
+      _froundU32[0] = (_froundU32[0]! - 1) >>> 0;
+      return _froundBuf[0]!;
+    }
+    return f;
+  }
+  if (rm === 2) {
+    // Toward +inf: if fround rounded down, step up 1 ULP
+    if (f < d) {
+      _froundBuf[0] = f;
+      if (d > 0) _froundU32[0] = (_froundU32[0]! + 1) >>> 0;
+      else _froundU32[0] = (_froundU32[0]! - 1) >>> 0;
+      return _froundBuf[0]!;
+    }
+    return f;
+  }
+  // rm === 3: toward -inf: if fround rounded up, step down 1 ULP
+  if (f > d) {
+    _froundBuf[0] = f;
+    if (d > 0) _froundU32[0] = (_froundU32[0]! - 1) >>> 0;
+    else _froundU32[0] = (_froundU32[0]! + 1) >>> 0;
+    return _froundBuf[0]!;
+  }
+  return f;
+}
+
 /**
  * executeInstruction
  *
@@ -685,11 +731,11 @@ function execCOP1_S(cpu: AllegrexCPU, i: Instruction, fs: number, ft: number, fd
   const t = r.getFpr(ft);
 
   switch (i.funct) {
-    case 0x00: r.setFpr(fd, s + t); break;    // ADD.S
-    case 0x01: r.setFpr(fd, s - t); break;    // SUB.S
-    case 0x02: r.setFpr(fd, s * t); break;    // MUL.S
-    case 0x03: r.setFpr(fd, s / t); break;    // DIV.S
-    case 0x04: r.setFpr(fd, Math.sqrt(s)); break; // SQRT.S
+    case 0x00: { const rm = r.fcr31 & 3; const fs = r.fcr31 & (1 << 24); r.setFpr(fd, fpuFlush(fpuRound(s + t, rm), fs)); break; }  // ADD.S
+    case 0x01: { const rm = r.fcr31 & 3; const fs = r.fcr31 & (1 << 24); r.setFpr(fd, fpuFlush(fpuRound(s - t, rm), fs)); break; }  // SUB.S
+    case 0x02: { const rm = r.fcr31 & 3; const fs = r.fcr31 & (1 << 24); r.setFpr(fd, fpuFlush(fpuRound(s * t, rm), fs)); break; }  // MUL.S
+    case 0x03: { const rm = r.fcr31 & 3; const fs = r.fcr31 & (1 << 24); r.setFpr(fd, fpuFlush(fpuRound(s / t, rm), fs)); break; }  // DIV.S
+    case 0x04: { const rm = r.fcr31 & 3; const fs = r.fcr31 & (1 << 24); r.setFpr(fd, fpuFlush(fpuRound(Math.sqrt(s), rm), fs)); break; } // SQRT.S
     case 0x05: r.setFpr(fd, Math.abs(s)); break;  // ABS.S
     case 0x06: r.setFpr(fd, s); break;        // MOV.S
     case 0x07: r.setFpr(fd, -s); break;       // NEG.S
