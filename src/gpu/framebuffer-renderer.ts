@@ -48,7 +48,7 @@ export class FramebufferRenderer {
   private rgbaBuf: Uint8Array; // pre-allocated RGBA conversion buffer
 
   constructor(canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext("webgl", { alpha: false, antialias: false })!;
+    const gl = canvas.getContext("webgl", { alpha: false, antialias: false });
     if (!gl) throw new Error("WebGL not supported");
     this.gl = gl;
 
@@ -64,7 +64,7 @@ export class FramebufferRenderer {
     });
 
     // Create texture — 512×272, nearest filtering for crisp pixels
-    this.texture = twgl.createTexture(gl, {
+    const tex = twgl.createTexture(gl, {
       width: 512,
       height: PSP_HEIGHT,
       min: gl.NEAREST,
@@ -73,6 +73,8 @@ export class FramebufferRenderer {
       format: gl.RGBA,
       type: gl.UNSIGNED_BYTE,
     });
+    if (!tex) throw new Error("Could not create WebGL texture");
+    this.texture = tex;
 
     this.rgbaBuf = new Uint8Array(512 * PSP_HEIGHT * 4);
 
@@ -112,11 +114,14 @@ export class FramebufferRenderer {
 
     // Update UV if stride changed
     const uMax = PSP_WIDTH / stride;
-    twgl.setAttribInfoBufferFromArray(
-      gl,
-      this.bufferInfo.attribs!["texcoord"],
-      { numComponents: 2, data: [0, 1, uMax, 1, 0, 0, uMax, 0] },
-    );
+    const texcoordAttrib = this.bufferInfo.attribs?.["texcoord"];
+    if (texcoordAttrib) {
+      twgl.setAttribInfoBufferFromArray(
+        gl,
+        texcoordAttrib,
+        { numComponents: 2, data: [0, 1, uMax, 1, 0, 0, uMax, 0] },
+      );
+    }
 
     gl.useProgram(this.programInfo.program);
     twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);

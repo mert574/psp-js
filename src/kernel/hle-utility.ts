@@ -29,6 +29,7 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   let savedataParamAddr = 0;
   let savedataResult = 0;
   let savedataIoComplete = false;
+  let savedataMode = 0;
 
   /** Read a fixed-length null-terminated string from PSP memory */
   function readFixedStr(bus: MemoryBus, addr: number, maxLen: number): string {
@@ -47,8 +48,12 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     savedataParamAddr = paramAddr;
     savedataIoComplete = false;
     savedataResult = 0;
+    savedataUpdateCount = 0;
+    // Clear common.result in PSP memory so the game doesn't read a stale value
+    bus.writeU32(paramAddr + 28, 0);
 
     const mode = bus.readU32(paramAddr + 48);
+    savedataMode = mode;
     const gameName = readFixedStr(bus, paramAddr + 60, 13);
     const saveName = readFixedStr(bus, paramAddr + 76, 20);
     const fileName = readFixedStr(bus, paramAddr + 100, 13);
@@ -75,10 +80,8 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     kernel.onSavedataEvent?.(action, gameName, saveName, false, false);
 
     if (!store) {
-      // No store available — report no data for loads, success for saves
-      if (mode === 0 || mode === 2 || mode === 4 || mode === 15 || mode === 16) {
-        savedataResult = 0x80110305; // LOAD_NO_DATA
-      }
+      // No store: return LOAD_NO_DATA for load modes, success for everything else
+      if (isLoad) savedataResult = 0x80110305;
       savedataIoComplete = true;
       regs.setGpr(2, 0);
       return;
@@ -99,23 +102,28 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
 
     // Helper: perform a load from a given save key
     function doLoad(key: string): void {
-      store!.load(key).then(entry => {
+      function applyLoad(entry: import("../storage/savedata-store.js").SaveEntry | null): void {
         if (entry && entry.data.byteLength > 0) {
           const copySize = Math.min(entry.data.byteLength, dataBufSize);
           for (let i = 0; i < copySize; i++) {
             bus.writeU8(dataBuf + i, entry.data[i]!);
           }
           bus.writeU32(paramAddr + 124, entry.dataSize);
-          bus.writeU32(paramAddr + 52, 1021); // bind (PPSSPP SavedataParam.cpp:190)
+          bus.writeU32(paramAddr + 52, 1021); // bind
           savedataResult = 0;
         } else {
           savedataResult = (mode === 15 || mode === 16) ? 0x80110327 : 0x80110305;
         }
         savedataIoComplete = true;
-      }).catch(() => {
-        savedataResult = 0x80110305;
-        savedataIoComplete = true;
-      });
+      }
+      if (store!.loadSync) {
+        applyLoad(store!.loadSync(key));
+      } else {
+        store!.load(key).then(applyLoad).catch(() => {
+          savedataResult = 0x80110305;
+          savedataIoComplete = true;
+        });
+      }
     }
 
     // Helper: perform a save to a given save key
@@ -127,16 +135,21 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
       }
       const title = readFixedStr(bus, paramAddr + 128, 128);
       const detail = readFixedStr(bus, paramAddr + 384, 1024);
+      const entry = { key, data: saveData, dataSize: saveSize, title, detail, timestamp: Date.now() };
 
-      store!.save(key, {
-        key, data: saveData, dataSize: saveSize, title, detail, timestamp: Date.now(),
-      }).then(() => {
+      if (store!.saveSync) {
+        store!.saveSync(key, entry);
         savedataResult = 0;
         savedataIoComplete = true;
-      }).catch(() => {
-        savedataResult = 0;
-        savedataIoComplete = true;
-      });
+      } else {
+        store!.save(key, entry).then(() => {
+          savedataResult = 0;
+          savedataIoComplete = true;
+        }).catch(() => {
+          savedataResult = 0;
+          savedataIoComplete = true;
+        });
+      }
     }
 
     // Helper: show slot selection UI or auto-select first valid slot
@@ -349,16 +362,17 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  // sceUtilitySavedataGetStatus
-  kernel.register(UTILITY.sceUtilitySavedataGetStatus, (regs) => {
+  // sceUtilitySavedataGetStatus — PPSSPP PSPDialog.cpp:38-47
+  // Returns the CURRENT status, then advances the state machine.
+  kernel.register(UTILITY.sceUtilitySavedataGetStatus, (regs, bus) => {
     const prev = savedataStatus;
-    if (savedataStatus === 2 && savedataIoComplete) {
-      savedataStatus = 3; // QUIT
-    } else if (savedataStatus === 3) {
-      savedataStatus = 4; // FINISHED
+    if (savedataStatus === 3) {
+      savedataStatus = 4; // QUIT → FINISHED
+      if (savedataParamAddr !== 0) bus.writeU32(savedataParamAddr + 28, savedataResult);
     } else if (savedataStatus === 4) {
-      savedataStatus = 0; // NONE
+      savedataStatus = 0; // FINISHED → NONE
     }
+    // Note: VISIBLE(2) → QUIT(3)/FINISHED(4) transition happens in Update, not here
     regs.setGpr(2, prev);
   });
 
@@ -375,7 +389,27 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   });
 
   // sceUtilitySavedataUpdate(drawSpeed)
-  kernel.register(UTILITY.sceUtilitySavedataUpdate, (regs) => {
+  // PPSSPP PSPSaveDialog.cpp:672-1101
+  // For non-visible actions (AUTOLOAD, AUTOSAVE, etc.), Update performs IO
+  // and transitions directly to FINISHED, skipping the dialog UI.
+  // For visible actions (LOAD, SAVE with UI), it waits for user input.
+  let savedataUpdateCount = 0;
+  const NON_VISIBLE_MODES = new Set([0,1,6,7,8,11,12,13,14,15,16,17,18,19,20,21]);
+  kernel.register(UTILITY.sceUtilitySavedataUpdate, (regs, bus) => {
+    if (savedataStatus === 2) {
+      savedataUpdateCount++;
+      if (savedataIoComplete) {
+        if (NON_VISIBLE_MODES.has(savedataMode)) {
+          // PPSSPP DS_NONE path: IO done → go directly to FINISHED (skip QUIT)
+          savedataStatus = 4; // FINISHED
+          if (savedataParamAddr !== 0) bus.writeU32(savedataParamAddr + 28, savedataResult);
+        } else if (savedataUpdateCount >= 3) {
+          // Visible dialog: auto-dismiss after a few frames (simulates user pressing X)
+          savedataStatus = 3; // QUIT
+          if (savedataParamAddr !== 0) bus.writeU32(savedataParamAddr + 28, savedataResult);
+        }
+      }
+    }
     regs.setGpr(2, 0);
   });
 

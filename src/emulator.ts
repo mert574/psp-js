@@ -1,6 +1,6 @@
 import { MemoryBus } from "./memory/memory-bus.js";
 import { AllegrexCPU } from "./cpu/cpu.js";
-import { HLEKernel } from "./kernel/hle-kernel.js";
+import { HLEKernel, ThreadState } from "./kernel/hle-kernel.js";
 import { CoreTiming } from "./timing/core-timing.js";
 import { loadElf } from "./loader/elf.js";
 import { isPbp, parsePbp } from "./loader/pbp.js";
@@ -107,9 +107,20 @@ export class PSPEmulator {
       // Mark the main thread as DEAD and reschedule to the next READY thread
       if (this.hle.currentThreadId > 0) {
         if (!this.hle.exitCurrentThread(regs)) {
-          hleLog.info("module_start exited, no READY threads — halting.");
-          this.halted = true;
-          this.cpu.stepFaulted = true;
+          // No READY threads right now, but there may be WAITING threads
+          // that will be woken by CoreTiming events (delays, VBlank, etc.).
+          // Only truly halt if there are no threads left at all.
+          const hasWaiting = [...this.hle.threads.values()].some(
+            t => t.state === ThreadState.WAITING || t.state === ThreadState.READY
+          );
+          if (hasWaiting) {
+            hleLog.info("Thread exited, no READY threads — idle until timed event");
+            this.hle.idleBreak = true;
+          } else {
+            hleLog.info("Thread exited, no remaining threads — halting.");
+            this.halted = true;
+            this.cpu.stepFaulted = true;
+          }
         }
       } else {
         // module_start returned without any thread running — use the scheduler
@@ -179,9 +190,11 @@ export class PSPEmulator {
   }
 
   async initWorker(): Promise<void> {
-    if (typeof Worker === "undefined") return;
-    const { ramSab, vramSab, scratchpadSab } = this.bus.switchToShared();
-    this.hle.initGeWorker(ramSab, vramSab, scratchpadSab);
+    // Inline GE processing: runs synchronously on the main thread.
+    // The Worker-based path has a race condition with stall-based rendering:
+    // postMessage delivery is async, so UpdateStallAddr arrives before the
+    // Worker even starts processing, causing blank frames.
+    // TODO: Redesign Worker to use SharedArrayBuffer command ring instead of postMessage.
   }
 
   /**
@@ -218,6 +231,11 @@ export class PSPEmulator {
         const skip = Math.min(delta, PSPEmulator.MAX_SLICE);
         this.coreTiming.advance(skip > 0 ? skip : 1);
         budgetSpent += skip > 0 ? skip : 1;
+        // CoreTiming events (VBlank, WakeThread) may have set threads to READY.
+        // Try to pick one up — mirrors PPSSPP's post-Idle() reschedule check.
+        if (!this.hle.hasRunningThread()) {
+          this.hle.reschedule(this.cpu.regs);
+        }
         continue;
       }
 

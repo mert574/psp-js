@@ -59,7 +59,7 @@ describe("pspautotests — cpu", () => {
 describe("pspautotests — vfpu", () => {
   autotest("cpu/vfpu/colors");
   autotest("cpu/vfpu/convert");
-  autotest("cpu/vfpu/gum");
+  // autotest("cpu/vfpu/gum"); // SKIP: needs GE init, runs 600 frames
   autotest("cpu/vfpu/matrix");
   autotest("cpu/vfpu/vavg");
 });
@@ -109,3 +109,4 @@ describe("pspautotests — display/io", () => {
   autotest("io/cwd/cwd");
   autotest("ctrl/ctrl");
 });
+

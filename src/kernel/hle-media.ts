@@ -23,9 +23,8 @@ export function registerMediaHLE(kernel: HLEKernel): void {
     const maxVoices = regs.getGpr(6);
     const outputMode = regs.getGpr(7);
     const sampleRate = regs.getGpr(8);
-    // PPSSPP sceSas.cpp:214: validate core address
-    const phys = core & 0x1FFFFFFF;
-    if (phys < 0x08000000 || phys >= 0x0C000000 || (core & 0x3F) !== 0) {
+    // PPSSPP sceSas.cpp:214: Memory::IsValidAddress(core) + alignment
+    if (core < 0x08000000 || core >= 0x0C000000 || (core & 0x3F) !== 0) {
       log.warn(`__sceSasInit: bad core addr 0x${core.toString(16)}`);
       regs.setGpr(2, 0x80260001); // SCE_SAS_ERROR_BAD_ADDRESS
       return;
@@ -47,13 +46,21 @@ export function registerMediaHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  // __sceSasCore(core, outAddr) — blocks for one grain duration
-  kernel.register(SAS.__sceSasCore, (regs) => {
+  // __sceSasCore(core, outAddr) — synthesize one grain of audio
+  // We don't emulate SAS voices, so write silence to outAddr.
+  // Games read from outAddr after this call and feed it to sceAudioOutput.
+  kernel.register(SAS.__sceSasCore, (regs, bus) => {
+    const outAddr = regs.getGpr(5);
+    if (outAddr !== 0) {
+      // Stereo s16 silence: 4 bytes per frame × grainSize frames
+      for (let i = 0; i < sasGrainSize * 4; i++) bus.writeU8(outAddr + i, 0);
+    }
     regs.setGpr(2, 0);
     kernel.blockForAudio(regs, sasGrainSize, 44_100);
   });
 
-  // __sceSasCoreWithMix — mix into existing buffer
+  // __sceSasCoreWithMix — mix into existing buffer (additive)
+  // Since we have no voices, mixing nothing doesn't change the buffer.
   kernel.register(SAS.__sceSasCoreWithMix, (regs) => {
     regs.setGpr(2, 0);
     kernel.blockForAudio(regs, sasGrainSize, 44_100);
@@ -415,14 +422,14 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   });
 
   // sceKernelSetVTimerHandlerWide(uid, u64 schedule, handlerFuncAddr, commonAddr)
-  // MIPS O32: u64 arg aligned to even register → a2:a3 (regs 6:7), handler at stack+16, common at stack+20
+  // MIPS O32: u64 arg aligned to even register → a2:a3 (regs 6:7), handler=$t0(r8), common=$t1(r9)
+  // PPSSPP reads all syscall args from sequential registers: PARAM(n) = r[A0+n]
   kernel.register(VTIMER.sceKernelSetVTimerHandlerWide, (regs) => {
     const uid = regs.getGpr(4);
     const scheduleLo = regs.getGpr(6) >>> 0;
     const scheduleHi = regs.getGpr(7) >>> 0;
-    const sp = regs.getGpr(29);
-    const handlerAddr = kernel.bus.readU32(sp + 16);
-    const commonAddr  = kernel.bus.readU32(sp + 20);
+    const handlerAddr = regs.getGpr(8); // PARAM(4) = $t0
+    const commonAddr  = regs.getGpr(9); // PARAM(5) = $t1
     const vt = vtimers.get(uid);
     if (!vt) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     const schedule = scheduleHi * 0x100000000 + scheduleLo;

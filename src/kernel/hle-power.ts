@@ -135,21 +135,67 @@ export function registerPowerHLE(kernel: HLEKernel): void {
     regs.setGpr(2, regs.getGpr(4) === 0 ? 0 : 0x80000107);
   });
 
-  // scePowerRegisterCallback — PPSSPP scePower.cpp: slot-based (16 slots)
-  const powerCbSlots = new Array<number>(16).fill(0);
+  // scePowerRegisterCallback — PPSSPP scePower.cpp:207-244
+  // 16 user slots (0-15), 32 total (16-31 = kernel-only)
+  const PSP_POWER_ERROR_INVALID_CB   = 0x80000100;
+  const PSP_POWER_ERROR_INVALID_SLOT = 0x80000102;
+  const PSP_POWER_ERROR_TAKEN_SLOT   = 0x80000020;
+  const PSP_POWER_ERROR_SLOTS_FULL   = 0x80000022;
+  const PSP_POWER_ERROR_EMPTY_SLOT   = 0x80000025;
+  const SCE_KERNEL_ERROR_PRIV_REQUIRED = 0x80000023;
+  const numberOfCBPowerSlots = 16;
+  const numberOfCBPowerSlotsPrivate = 32;
+  const PSP_POWER_CB_AC_POWER       = 0x00001000;
+  const PSP_POWER_CB_BATTERY_EXIST  = 0x00000080;
+  const PSP_POWER_CB_BATTERY_FULL   = 0x00000064;
+
+  const powerCbSlots = new Array<number>(numberOfCBPowerSlots).fill(0);
   kernel.register(POWER.scePowerRegisterCallback, (regs) => {
     const slot = regs.getGpr(4) | 0;
     const cbId = regs.getGpr(5);
-    if (cbId === 0) { regs.setGpr(2, 0x80000107); return; } // PSP_POWER_ERROR_INVALID_CB
-    if (slot === -1) {
-      for (let i = 0; i < 16; i++) {
-        if (powerCbSlots[i] === 0) { powerCbSlots[i] = cbId; regs.setGpr(2, i); return; }
-      }
-      regs.setGpr(2, 0x80000025); return; // no free slot
+
+    // Validation — PPSSPP scePower.cpp:208-216
+    if (slot < -1 || slot >= numberOfCBPowerSlotsPrivate) {
+      regs.setGpr(2, PSP_POWER_ERROR_INVALID_SLOT); return;
     }
-    if (slot < 0 || slot >= 16) { regs.setGpr(2, 0x80000107); return; }
-    powerCbSlots[slot] = cbId;
-    regs.setGpr(2, slot);
+    if (slot >= numberOfCBPowerSlots) {
+      regs.setGpr(2, SCE_KERNEL_ERROR_PRIV_REQUIRED); return;
+    }
+    if (cbId === 0) {
+      regs.setGpr(2, PSP_POWER_ERROR_INVALID_CB); return;
+    }
+
+    let retval = -1;
+    if (slot === -1) {
+      // Auto-select first empty slot
+      for (let i = 0; i < numberOfCBPowerSlots; i++) {
+        if (powerCbSlots[i] === 0 && retval === -1) {
+          powerCbSlots[i] = cbId;
+          retval = i;
+        }
+      }
+      if (retval === -1) {
+        regs.setGpr(2, PSP_POWER_ERROR_SLOTS_FULL); return;
+      }
+    } else {
+      if (powerCbSlots[slot] === 0) {
+        powerCbSlots[slot] = cbId;
+        retval = 0;
+      } else {
+        regs.setGpr(2, PSP_POWER_ERROR_TAKEN_SLOT); return;
+      }
+    }
+
+    // Notify the callback with initial power state — PPSSPP scePower.cpp:240-241
+    if (retval >= 0) {
+      const arg = PSP_POWER_CB_AC_POWER | PSP_POWER_CB_BATTERY_EXIST | PSP_POWER_CB_BATTERY_FULL;
+      const cb = kernel.pspCallbacks.get(cbId);
+      if (cb) {
+        cb.notifyCount++;
+        cb.notifyArg = arg;
+      }
+    }
+    regs.setGpr(2, retval);
   });
 
   // sceUmdCheckMedium — disc always present in HLE
@@ -168,22 +214,28 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   // scePowerUnregisterCallback(slotId) — PPSSPP scePower.cpp:246-262
   kernel.register(POWER.scePowerUnregisterCallback, (regs) => {
     const slotId = regs.getGpr(4) | 0;
-    // PPSSPP: numberOfCBPowerSlotsPrivate=32, numberOfCBPowerSlots=16
-    if (slotId < 0 || slotId >= 32) {
-      regs.setGpr(2, 0x80000107); // PSP_POWER_ERROR_INVALID_SLOT
-      return;
+    if (slotId < 0 || slotId >= numberOfCBPowerSlotsPrivate) {
+      regs.setGpr(2, PSP_POWER_ERROR_INVALID_SLOT); return;
     }
-    if (slotId >= 16) {
-      regs.setGpr(2, 0x80000004); // SCE_KERNEL_ERROR_PRIV_REQUIRED
-      return;
+    if (slotId >= numberOfCBPowerSlots) {
+      regs.setGpr(2, SCE_KERNEL_ERROR_PRIV_REQUIRED); return;
     }
     if (powerCbSlots[slotId] !== 0) {
       powerCbSlots[slotId] = 0;
       regs.setGpr(2, 0);
     } else {
-      regs.setGpr(2, 0x80000025); // PSP_POWER_ERROR_EMPTY_SLOT
+      regs.setGpr(2, PSP_POWER_ERROR_EMPTY_SLOT);
     }
   });
+
+  // scePowerIsBatteryExist — battery always present in HLE
+  kernel.register(POWER.scePowerIsBatteryExist, (regs) => { regs.setGpr(2, 1); });
+  // scePowerIsPowerOnline — always on AC power
+  kernel.register(POWER.scePowerIsPowerOnline, (regs) => { regs.setGpr(2, 1); });
+  // scePowerIsLowBattery — never low
+  kernel.register(POWER.scePowerIsLowBattery, (regs) => { regs.setGpr(2, 0); });
+  // scePowerIsBatteryCharging — not charging (on AC)
+  kernel.register(POWER.scePowerIsBatteryCharging, (regs) => { regs.setGpr(2, 0); });
 
   // ── Stubs: POWER ──────────────────────────────────────────────────────────
   kernel.stub(POWER.scePowerBatteryUpdateInfo);
@@ -210,10 +262,6 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   kernel.stub(POWER.scePowerGetResumeCount);
   kernel.stub(POWER.scePowerIdleTimerDisable);
   kernel.stub(POWER.scePowerIdleTimerEnable);
-  kernel.stub(POWER.scePowerIsBatteryCharging);
-  kernel.stub(POWER.scePowerIsBatteryExist);
-  kernel.stub(POWER.scePowerIsLowBattery);
-  kernel.stub(POWER.scePowerIsPowerOnline, 1);
   kernel.stub(POWER.scePowerIsRequest);
   kernel.stub(POWER.scePowerIsSuspendRequired);
   kernel.stub(POWER.scePowerLock);

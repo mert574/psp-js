@@ -25,10 +25,18 @@ const COLORS = [
   "#000075", "#a9a9a9",
 ];
 
-const isBrowser = typeof window !== "undefined";
+const isBrowser = typeof (globalThis as unknown as Window).window !== "undefined";
 
 const instances = new Map<string, Logger>();
 let colorIdx = 0;
+
+/** Optional hook called for every `error`-level message. Useful in tests. */
+type ErrorHook = (namespace: string, message: string) => void;
+let errorHook: ErrorHook | null = null;
+
+/** Optional hook called for every `warn`- or `error`-level message. Used by the debug panel. */
+type WarnHook = (level: LogLevel, namespace: string, message: string) => void;
+let warnHook: WarnHook | null = null;
 
 export class Logger {
   static minLevel: LogLevel = "info";
@@ -55,6 +63,16 @@ export class Logger {
     colorIdx = 0;
   }
 
+  /** Install a hook that is called on every error-level log message. */
+  static setErrorHook(hook: ErrorHook | null): void {
+    errorHook = hook;
+  }
+
+  /** Install a hook called for every warn- or error-level message (for live debug panels). */
+  static setWarnHook(hook: WarnHook | null): void {
+    warnHook = hook;
+  }
+
   debug(...args: unknown[]): void {
     this.log("debug", args);
   }
@@ -74,17 +92,34 @@ export class Logger {
   private log(level: LogLevel, args: unknown[]): void {
     if (LEVEL_ORDER[level] < LEVEL_ORDER[Logger.minLevel]) return;
 
-    const method = level === "debug" ? "debug"
-      : level === "info" ? "info"
-      : level === "warn" ? "warn" : "error";
-
     const tag = `[${this.namespace}]`;
 
     if (isBrowser) {
-      const css = `color:${this.color};font-weight:bold`;
-      console[method](`%c${tag}%c`, css, "color:inherit", ...args);
+      // Always use console.log in the browser to suppress the automatic
+      // call-stack annotation that console.error/warn append (which would
+      // show logger.ts and the requestAnimationFrame chain on every message).
+      const levelBg =
+        level === "error" ? "background:#c0392b;color:#fff" :
+        level === "warn"  ? "background:#e67e22;color:#fff" :
+        level === "debug" ? "background:#555;color:#fff"    : "";
+      const nsStyle = `color:${this.color};font-weight:bold`;
+      if (levelBg) {
+        console.log(`%c${level.toUpperCase()}%c %c${tag}%c`, levelBg, "", nsStyle, "color:inherit", ...args);
+      } else {
+        console.log(`%c${tag}%c`, nsStyle, "color:inherit", ...args);
+      }
     } else {
+      const method = level === "debug" ? "debug"
+        : level === "info" ? "info"
+        : level === "warn" ? "warn" : "error";
       console[method](tag, ...args);
+    }
+
+    if (level === "error" && errorHook) {
+      errorHook(this.namespace, args.map(String).join(" "));
+    }
+    if ((level === "warn" || level === "error") && warnHook) {
+      warnHook(level, this.namespace, args.map(String).join(" "));
     }
   }
 }

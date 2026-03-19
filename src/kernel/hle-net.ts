@@ -4,7 +4,7 @@
 
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel } from "./hle-kernel.js";
-import { NET, NET_ADHOC, NP, WLAN, HTTP, NP2, NET_ADHOC_MATCHING, NET_INET, NET_LIB, NET_RESOLVER, NP_DRM, OPENPSID, PARSE_HTTP, PARSE_URI, PAUTH, SSL } from "./nids.js";
+import { NET, NET_ADHOC, NP, WLAN, HTTP, NP2, NET_ADHOC_MATCHING, NET_INET, NET_LIB, NET_RESOLVER, OPENPSID, PARSE_HTTP, PARSE_URI, PAUTH, SSL } from "./nids.js";
 
 const log = Logger.get("HLE-NET");
 
@@ -310,13 +310,6 @@ export function registerNetHLE(kernel: HLEKernel): void {
   kernel.stub(NP2.sceNpMatching2SetRoomDataInternal);
   kernel.stub(NP2.sceNpMatching2SignalingGetConnectionStatus, 1);
   kernel.stub(NP2.sceNpMatching2Term);
-  // ── NP_DRM ──────────────────────────────────────────────────────────
-  kernel.stub(NP_DRM.sceNpDrmClearLicenseeKey);
-  kernel.stub(NP_DRM.sceNpDrmEdataGetDataSize);
-  kernel.stub(NP_DRM.sceNpDrmEdataSetupKey);
-  kernel.stub(NP_DRM.sceNpDrmOpen, 1);
-  kernel.stub(NP_DRM.sceNpDrmRenameCheck);
-  kernel.stub(NP_DRM.sceNpDrmSetLicenseeKey);
   // ── WLAN ──────────────────────────────────────────────────────────
   kernel.stub(WLAN.sceWlanGetEtherAddr);
   kernel.stub(WLAN.sceWlanGetSwitchState);

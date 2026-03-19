@@ -25,9 +25,9 @@ const enum PsmfPlayerStatus {
   INIT      = 0x1,
   STANDBY   = 0x2,
   PLAYING   = 0x4,
-  PAUSED    = 0x6,
-  FINISHED  = 0x20,
+  PAUSED    = 0x6, // not in PPSSPP — pause is a playMode, not status
   ERROR     = 0x100,
+  FINISHED  = 0x200, // PPSSPP: PSMF_PLAYER_STATUS_PLAYING_FINISHED
 }
 
 // ── Player instance ─────────────────────────────────────────────────────────
