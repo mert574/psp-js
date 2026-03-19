@@ -5,8 +5,59 @@
 
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel } from "./hle-kernel.js";
-import { ThreadState, WaitType, type ThreadContext, type PSPCallback } from "./hle-kernel.js";
+import { ThreadState, WaitType, type ThreadContext, type PSPCallback, type LoadedModule } from "./hle-kernel.js";
 import { THREAD, KERNEL, SYSMEM, ADLER, CHNNLSV, MD5, MT19937, SFMT19937, SHA256 } from "./nids.js";
+import { loadElf, computeElfMemorySize } from "../loader/elf.js";
+
+// Module names that we HLE — matching PPSSPP's ShouldHLEModule() list.
+// When a PRX with one of these modnames is loaded, we fake it instead of executing native code.
+const HLE_MODULE_NAMES = new Set([
+  "sceATRAC3plus_Library", "sceAtrac3plus", "sceAudiocodec_Driver",
+  "sceMpeg_library", "scePsmf_library", "scePsmfP_library", "scePsmfPlayer",
+  "sceSAScore", "sceSasCore", "libsas",
+  "sceAudio_Driver", "sceAudio",
+  "sceNet_Library", "sceNetInet_Library", "sceNetApctl_Library",
+  "sceNetAdhoc_Library", "sceNetAdhocctl_Library", "sceNetAdhocMatching_Library",
+  "sceNetResolver_Library", "sceNet_Service",
+  "sceFont_Library", "sceLibFont",
+  "sceSsl_Module", "sceParseHTTPheader_Library", "sceParseUri_Library",
+  "sceHttp_Library", "sceHttps_Module",
+  "sceDeflt", "sceNpDrm_user_Module", "sceNp",
+  "sceOpenPSID_Library", "scePauth_Module",
+  "sceMp3_Library", "sceAac_Library",
+  "sceP3da_Library", "sceGameUpdate_Library",
+]);
+
+/** Peek at the module name from an ELF's module_info without fully loading it. */
+function peekElfModuleName(data: Uint8Array): string | null {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const le = data[5] === 1;
+  const eType = view.getUint16(0x10, le);
+  if (eType !== 0xFFA0) return null; // not a PRX
+
+  const phoff = view.getUint32(0x1c, le);
+  const phentsize = view.getUint16(0x2a, le);
+  const phnum = view.getUint16(0x2c, le);
+  if (phnum === 0) return null;
+
+  const pVaddr  = view.getUint32(phoff + 0x08, le);
+  const pPaddr  = view.getUint32(phoff + 0x0c, le);
+  const pOffset = view.getUint32(phoff + 0x04, le);
+  // Module info offset within the file
+  const modinfoFileOff = pOffset + (pPaddr & 0x7FFFFFFF) - pOffset + pOffset;
+  // Simpler: moduleinfo is at file_offset = pOffset + (pPaddr - pVaddr) for PRX
+  const miOff = pOffset + (pPaddr & 0x7FFFFFFF);
+  if (miOff + 0x20 > data.byteLength) return null;
+
+  // Module name at offset 0x04 within SceModuleInfo, 28 bytes
+  let name = "";
+  for (let i = 0; i < 28; i++) {
+    const b = data[miOff + 0x04 + i]!;
+    if (b === 0) break;
+    name += String.fromCharCode(b);
+  }
+  return name || null;
+}
 
 const log = Logger.get("HLE-THREAD");
 const pspLog = Logger.get("PSP");
@@ -348,21 +399,235 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
   // ── Module management ────────────────────────────────────────────────
 
-  // sceKernelLoadModule
-  kernel.register(KERNEL.sceKernelLoadModule, (regs) => {
-    log.debug("sceKernelLoadModule (stub)");
-    regs.setGpr(2, 0x80);
+  // System PRXes we already HLE — return fake module without loading code
+  // (matches PPSSPP lieAboutSuccessModules)
+  const FAKE_MODULE_NAMES: Record<string, string> = {
+    "flash0:/kd/audiocodec.prx": "sceAudiocodec_Driver",
+    "flash0:/kd/audiocodec_260.prx": "sceAudiocodec_Driver",
+    "flash0:/kd/libatrac3plus.prx": "sceATRAC3plus_Library",
+    "flash0:/kd/ifhandle.prx": "sceNet_Service",
+    "flash0:/kd/pspnet.prx": "sceNet_Library",
+    "flash0:/kd/pspnet_inet.prx": "sceNetInet_Library",
+    "flash0:/kd/pspnet_apctl.prx": "sceNetApctl_Library",
+    "flash0:/kd/pspnet_resolver.prx": "sceNetResolver_Library",
+    "flash0:/kd/pspnet_adhoc.prx": "sceNetAdhoc_Library",
+    "flash0:/kd/pspnet_adhocctl.prx": "sceNetAdhocctl_Library",
+    "flash0:/kd/pspnet_adhoc_matching.prx": "sceNetAdhocMatching_Library",
+  };
+
+  // sceKernelLoadModule(name, flags, optionAddr) → moduleId
+  kernel.register(KERNEL.sceKernelLoadModule, (regs, bus) => {
+    const name = kernel.readCString(bus, regs.getGpr(4));
+    const modId = kernel.nextBlockId++;
+
+    // Check for system PRXes we already HLE
+    if (FAKE_MODULE_NAMES[name]) {
+      const mod: LoadedModule = {
+        id: modId, name: FAKE_MODULE_NAMES[name]!, path: name,
+        entryAddr: 0, gp: 0, baseAddr: 0, size: 0, isFake: true, status: 0,
+      };
+      kernel.loadedModules.set(modId, mod);
+      log.info(`sceKernelLoadModule("${name}") → fake 0x${modId.toString(16)}`);
+      regs.setGpr(2, modId);
+      return;
+    }
+
+    // Read file from virtual filesystem
+    const fileData = kernel.pspFs.getFileData(name, kernel.currentThreadId);
+    if (!fileData) {
+      log.warn(`sceKernelLoadModule("${name}"): file not found`);
+      regs.setGpr(2, 0x80020002); // SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND
+      return;
+    }
+
+    // Check ELF magic (file should be pre-decrypted/decompressed at boot)
+    if (fileData.byteLength < 4) {
+      log.warn(`sceKernelLoadModule("${name}"): file too small`);
+      regs.setGpr(2, 0x80020001); // SCE_KERNEL_ERROR_FILEERR
+      return;
+    }
+    const elfMagic = new DataView(fileData.buffer, fileData.byteOffset, 4).getUint32(0, false);
+
+    // PPSSPP: ShouldHLEModule(head->modname) — check module name from ~PSP header
+    // or ELF module_info. If it matches a known HLE module, fake it.
+    let hleModName: string | null = null;
+    if (elfMagic === 0x7e505350 && fileData.byteLength > 0x2A) {
+      // Read modname from ~PSP header at offset 0x0A (28 bytes)
+      let mn = "";
+      for (let i = 0; i < 28; i++) {
+        const b = fileData[0x0A + i]!;
+        if (b === 0) break;
+        mn += String.fromCharCode(b);
+      }
+      if (mn && HLE_MODULE_NAMES.has(mn)) hleModName = mn;
+    } else if (elfMagic === 0x7f454c46) {
+      const mn = peekElfModuleName(fileData);
+      if (mn && HLE_MODULE_NAMES.has(mn)) hleModName = mn;
+    }
+    if (hleModName) {
+      log.info(`sceKernelLoadModule("${name}"): HLE module "${hleModName}", creating fake`);
+      const mod: LoadedModule = {
+        id: modId, name: hleModName, path: name,
+        entryAddr: 0, gp: 0, baseAddr: 0, size: 0, isFake: true, status: 0,
+      };
+      kernel.loadedModules.set(modId, mod);
+      regs.setGpr(2, modId);
+      return;
+    }
+
+    if (elfMagic !== 0x7f454c46) {
+      // Not a valid ELF — might be encrypted but decryption failed. Return fake module.
+      log.warn(`sceKernelLoadModule("${name}"): not an ELF (magic=0x${elfMagic.toString(16)}), creating fake module`);
+      const mod: LoadedModule = {
+        id: modId, name, path: name,
+        entryAddr: 0, gp: 0, baseAddr: 0, size: 0, isFake: true, status: 0,
+      };
+      kernel.loadedModules.set(modId, mod);
+      regs.setGpr(2, modId);
+      return;
+    }
+
+    // Compute memory needed and allocate
+    const memSize = computeElfMemorySize(fileData);
+    const loadAddr = kernel.allocLow(memSize || 0x10000);
+    if (loadAddr < 0) {
+      log.error(`sceKernelLoadModule("${name}"): memory allocation failed`);
+      regs.setGpr(2, 0x800200d9); // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
+      return;
+    }
+
+    // Load ELF at the allocated address with the next available syscall codes
+    const result = loadElf(fileData, bus, loadAddr, kernel.nextSyscallCode);
+    kernel.nextSyscallCode = result.nextSyscallCode;
+
+    // Wire up HLE handlers for the module's imports
+    const unimplCount = kernel.remapSyscallsAdditive(result.nidBySyscall);
+
+    // If the module has unimplemented imports, don't run its native code —
+    // it would call unimplemented syscalls and crash/hang. Fake it instead.
+    // This matches PPSSPP's behavior: ShouldHLEModule() prevents native execution.
+    const shouldFake = unimplCount > 0;
+    if (shouldFake) {
+      log.info(`sceKernelLoadModule("${name}"): ${unimplCount} unimplemented imports, faking module`);
+    }
+
+    const mod: LoadedModule = {
+      id: modId,
+      name: result.moduleName || name,
+      path: name,
+      entryAddr: result.moduleStartFunc ?? result.entryPoint,
+      gp: result.gp,
+      baseAddr: loadAddr,
+      size: memSize,
+      isFake: shouldFake,
+      status: 0,
+    };
+    kernel.loadedModules.set(modId, mod);
+
+    log.info(`sceKernelLoadModule("${name}") → 0x${modId.toString(16)} loaded at 0x${loadAddr.toString(16)} entry=0x${mod.entryAddr.toString(16)}`);
+    regs.setGpr(2, modId);
   });
 
-  // sceKernelLoadModuleByID
+  // sceKernelLoadModuleByID — load by file descriptor (less common)
   kernel.register(KERNEL.sceKernelLoadModuleByID, (regs) => {
-    log.debug("sceKernelLoadModuleByID (stub)");
-    regs.setGpr(2, 0x80);
+    const modId = kernel.nextBlockId++;
+    log.info(`sceKernelLoadModuleByID(fd=${regs.getGpr(4)}) → fake 0x${modId.toString(16)}`);
+    const mod: LoadedModule = {
+      id: modId, name: "unknown", path: "byID",
+      entryAddr: 0, gp: 0, baseAddr: 0, size: 0, isFake: true, status: 0,
+    };
+    kernel.loadedModules.set(modId, mod);
+    regs.setGpr(2, modId);
   });
 
-  // sceKernelStartModule
-  kernel.register(KERNEL.sceKernelStartModule, (regs) => {
-    log.debug("sceKernelStartModule (stub)");
+  // sceKernelStartModule(moduleId, argsize, argp, returnValueAddr, optionAddr) → moduleId
+  kernel.register(KERNEL.sceKernelStartModule, (regs, bus) => {
+    const moduleId = regs.getGpr(4);
+    const argsize = regs.getGpr(5);
+    const argp = regs.getGpr(6);
+
+    const mod = kernel.loadedModules.get(moduleId);
+    if (!mod) {
+      log.warn(`sceKernelStartModule: unknown module 0x${moduleId.toString(16)}`);
+      regs.setGpr(2, 0x80020032); // SCE_KERNEL_ERROR_UNKNOWN_MODULE
+      return;
+    }
+
+    if (mod.isFake || mod.entryAddr === 0) {
+      mod.status = 1;
+      log.info(`sceKernelStartModule(0x${moduleId.toString(16)} "${mod.name}") → fake/no-entry, returning success`);
+      regs.setGpr(2, 0);
+      return;
+    }
+
+    // Create a thread to run module_start, same pattern as sceKernelCreateThread
+    const tid = kernel.nextBlockId++;
+    const stackSize = 0x4000;
+    const aligned = (stackSize + 0xFF) & ~0xFF;
+    const totalStackAlloc = aligned + 0x100;
+    kernel.nextStackTopAddr -= totalStackAlloc;
+    const stackBase = kernel.nextStackTopAddr;
+    const sp = (stackBase + aligned) >>> 0;
+    const k0 = sp;
+
+    // Fill stack
+    for (let i = 0; i < totalStackAlloc; i += 4) bus.writeU32(stackBase + i, 0xFFFFFFFF);
+    bus.writeU32(k0 + 0xC0, tid);
+    bus.writeU32(k0 + 0xC8, stackBase);
+
+    const ctx: ThreadContext = {
+      gpr: new Uint32Array(32), hi: 0, lo: 0, pc: mod.entryAddr,
+      fpr: new Uint32Array(32), fcr31: 0,
+      vfpr: new Float32Array(128), vfpuCtrl: new Uint32Array(16), vfpuCc: 0,
+      vpfxs: 0, vpfxt: 0, vpfxd: 0,
+      vpfxsEnabled: false, vpfxtEnabled: false, vpfxdEnabled: false,
+    };
+    resetThreadContext(ctx);
+    ctx.pc = mod.entryAddr;
+    ctx.gpr[26] = k0;         // $k0
+    ctx.gpr[28] = mod.gp;     // $gp
+    ctx.gpr[29] = sp - 64;    // $sp
+    ctx.gpr[30] = sp - 64;    // $fp
+    ctx.gpr[31] = kernel.threadReturnAddr; // $ra → trampoline
+
+    // Pass args: a0 = argsize, a1 = argp
+    if (argsize > 0 && argp !== 0) {
+      const argDst = sp - 64 - ((argsize + 0xf) & ~0xf);
+      for (let i = 0; i < argsize; i++) bus.writeU8(argDst + i, bus.readU8(argp + i));
+      ctx.gpr[4] = argsize;
+      ctx.gpr[5] = argDst;
+      ctx.gpr[29] = argDst - 64;
+      ctx.gpr[30] = argDst - 64;
+    } else {
+      ctx.gpr[4] = 0;
+      ctx.gpr[5] = 0;
+    }
+
+    kernel.threads.set(tid, {
+      id: tid, entry: mod.entryAddr,
+      stackSize: aligned, stackBase, stackTop: sp, k0,
+      priority: 0x20,
+      state: ThreadState.READY, waitType: WaitType.NONE,
+      context: ctx,
+      wakeupCount: 0,
+      callbacks: [],
+      isProcessingCallbacks: false,
+      waitSemaId: 0, waitSemaCount: 0,
+      waitEvfId: 0, waitEvfBits: 0, waitEvfMode: 0, waitEvfOutPtr: 0,
+      waitGeListId: 0, waitDeadlineVbl: 0, waitWakeTimeMs: 0,
+      waitThreadEndId: 0, waitMutexId: 0, waitMutexCount: 0,
+      waitFplId: 0, waitFplDataPtr: 0,
+      waitVplId: 0, waitVplSize: 0, waitVplAddrPtr: 0,
+      pendingWakeCallback: undefined,
+      cbPromotedFromWaitType: WaitType.NONE,
+    });
+
+    mod.status = 1;
+    log.info(`sceKernelStartModule(0x${moduleId.toString(16)} "${mod.name}") → thread ${tid} at 0x${mod.entryAddr.toString(16)}`);
+
+    // Let the module_start thread run. It will return via the thread-return trampoline
+    // and be cleaned up. The calling thread continues after scheduler gives it time.
+    if (!kernel.reschedule(regs)) kernel.idleBreak = true;
     regs.setGpr(2, 0);
   });
 

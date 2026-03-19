@@ -14,6 +14,82 @@ const hleLog = Logger.get("HLE");
 const MAGIC_ELF     = 0x7f454c46; // "\x7fELF" big-endian
 const MAGIC_PSP_ENC = 0x7e505350; // "~PSP"   big-endian — Kirk-encrypted
 
+/** Module names we HLE — skip decrypt/decompress for these (matches PPSSPP ShouldHLEModule). */
+const HLE_PRX_NAMES = new Set([
+  "sceATRAC3plus_Library", "sceAtrac3plus", "sceAudiocodec_Driver",
+  "sceMpeg_library", "scePsmf_library", "scePsmfP_library", "scePsmfPlayer",
+  "sceSAScore", "sceSasCore", "libsas",
+  "sceAudio_Driver", "sceAudio",
+  "sceNet_Library", "sceNetInet_Library", "sceNetApctl_Library",
+  "sceNetAdhoc_Library", "sceNetAdhocctl_Library", "sceNetAdhocMatching_Library",
+  "sceNetResolver_Library", "sceNet_Service", "sceNetIfhandle_Service",
+  "sceFont_Library", "sceLibFont",
+  "sceSsl_Module", "sceParseHTTPheader_Library", "sceParseUri_Library",
+  "sceHttp_Library", "sceHttps_Module",
+  "sceDeflt", "sceNpDrm_user_Module", "sceNp",
+  "sceOpenPSID_Library", "scePauth_Module",
+  "sceMp3_Library", "sceAac_Library",
+  "sceP3da_Library", "sceGameUpdate_Library",
+  "sceMpegbase_Driver", "sceVideocodec_Driver",
+  "sceNetAdhocAuth_Service", "sceNetAdhocDownload_Library",
+  "sceNetAdhocDiscover_Library", "sceMemab_Driver",
+]);
+
+/** Decompress gzip data, tolerating truncated/corrupt trailers (common in PSP PRXes). */
+async function decompressGzip(data: Uint8Array): Promise<Uint8Array | null> {
+  const rawDeflate = skipGzipHeader(data);
+  // Try with and without the 8-byte gzip trailer
+  for (const strip of [0, 8]) {
+    const input = strip > 0 && rawDeflate.byteLength > strip
+      ? rawDeflate.subarray(0, rawDeflate.byteLength - strip)
+      : rawDeflate;
+    try {
+      const ds = new DecompressionStream("deflate-raw");
+      const writer = ds.writable.getWriter();
+      const reader = ds.readable.getReader();
+      writer.write(new Uint8Array(input) as unknown as Uint8Array<ArrayBuffer>);
+      writer.close();
+      const chunks: Uint8Array[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+      if (totalLen === 0) continue;
+      const out = new Uint8Array(totalLen);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+      return out;
+    } catch {
+      // Try next strip size
+    }
+  }
+  return null;
+}
+
+/** Skip a gzip header to get to the raw deflate stream. */
+function skipGzipHeader(data: Uint8Array): Uint8Array {
+  if (data.byteLength < 10 || data[0] !== 0x1f || data[1] !== 0x8b) return data;
+  let off = 10;
+  const flg = data[3]!;
+  if (flg & 0x04) { // FEXTRA
+    if (off + 2 > data.byteLength) return data;
+    const xlen = data[off]! | (data[off + 1]! << 8);
+    off += 2 + xlen;
+  }
+  if (flg & 0x08) { // FNAME
+    while (off < data.byteLength && data[off] !== 0) off++;
+    off++; // skip null terminator
+  }
+  if (flg & 0x10) { // FCOMMENT
+    while (off < data.byteLength && data[off] !== 0) off++;
+    off++;
+  }
+  if (flg & 0x02) off += 2; // FHCRC
+  return data.subarray(off);
+}
+
 /**
  * PSPEmulator
  *
@@ -75,8 +151,9 @@ export class PSPEmulator {
       }
     }
 
-    const { entryPoint, moduleStartFunc, gp, nidBySyscall, loadedEnd } = loadElf(data, this.bus);
+    const { entryPoint, moduleStartFunc, gp, nidBySyscall, loadedEnd, nextSyscallCode } = loadElf(data, this.bus);
     this.hle.setHeapBase(loadedEnd);
+    this.hle.nextSyscallCode = nextSyscallCode;
     // Use module_start_func from export table if available, otherwise ELF entry
     const startAddr = moduleStartFunc ?? entryPoint;
     this.cpu.regs.pc = startAddr;
@@ -142,8 +219,98 @@ export class PSPEmulator {
 
     log.info(`ELF loaded, entry=0x${entryPoint.toString(16)}, module_start=0x${startAddr.toString(16)}, SP=0x0BFFF000, RA=0x${TRAMPOLINE_ADDR.toString(16)}`);
 
+    // Pre-decrypt all PRX files in the filesystem so sceKernelLoadModule can be synchronous
+    await this._preDecryptModules();
+
     this.coreTiming.init();
     this._initVblankSchedule();
+  }
+
+  /** Pre-process PRX files: decompress gzip, decrypt ~PSP encryption. */
+  private async _preDecryptModules(): Promise<void> {
+    let prxCount = 0;
+    for (const [path, data] of this.hle.fileData) {
+      if (!path.toLowerCase().endsWith(".prx")) continue;
+      prxCount++;
+      log.info(`Pre-processing PRX: ${path} (${data.byteLength} bytes, magic=0x${data.byteLength >= 2 ? (data[0]!.toString(16) + data[1]!.toString(16)) : "?"})`);
+
+      if (data.byteLength < 4) continue;
+
+      let processed = data;
+
+      // PPSSPP: check module name from ~PSP header BEFORE decrypting.
+      // If it's a known HLE module, skip decrypt+decompress entirely — it'll be faked at load time.
+      if (processed.byteLength > 0x2A) {
+        const hdrMagic = new DataView(processed.buffer, processed.byteOffset, 4).getUint32(0, false);
+        if (hdrMagic === MAGIC_PSP_ENC) {
+          let modName = "";
+          for (let i = 0; i < 28; i++) {
+            const b = processed[0x0A + i]!;
+            if (b === 0) break;
+            modName += String.fromCharCode(b);
+          }
+          if (modName && HLE_PRX_NAMES.has(modName)) {
+            log.info(`Pre-processing PRX: ${path} — HLE module "${modName}", skipping decrypt`);
+            continue;
+          }
+        }
+      }
+
+      // Loop: PRX files can be multi-layered (~PSP encrypted → gzip → ELF, etc.)
+      for (let pass = 0; pass < 4; pass++) {
+        if (processed.byteLength < 4) break;
+        const m0 = processed[0]!;
+        const m1 = processed[1]!;
+        const magic32 = new DataView(processed.buffer, processed.byteOffset, 4).getUint32(0, false);
+
+        if (m0 === 0x1f && m1 === 0x8b) {
+          // Gzip compressed — use raw deflate (skip header + trailer) to avoid CRC issues
+          const decompressed = await decompressGzip(processed);
+          if (decompressed && decompressed.byteLength > 0) {
+            processed = decompressed;
+            log.info(`Decompressed PRX: ${path} (${processed.byteLength} bytes)`);
+            continue;
+          } else {
+            log.warn(`Failed to decompress PRX: ${path}`);
+            break;
+          }
+        } else if (magic32 === MAGIC_PSP_ENC) {
+          // ~PSP encrypted — read header fields before decryption
+          const prxView = new DataView(processed.buffer, processed.byteOffset, processed.byteLength);
+          const compAttr = prxView.getUint16(6, true);
+          const elfSize = prxView.getUint32(0x28, true);
+          const isGzip = (compAttr & 1) !== 0;
+
+          const decrypted = await pspDecryptPRX(processed);
+          if (decrypted) {
+            processed = decrypted;
+            log.info(`Decrypted PRX: ${path} (${processed.byteLength} bytes, gzip=${isGzip}, elfSize=${elfSize})`);
+
+            // Decompress gzip if comp_attribute flag set (matches PPSSPP sceKernelModule.cpp:1108)
+            if (isGzip && processed.byteLength > 0) {
+              const decompressed = await decompressGzip(processed);
+              if (decompressed && decompressed.byteLength > 0) {
+                processed = decompressed;
+                log.info(`Decompressed gzipped PRX: ${path} (${processed.byteLength} bytes)`);
+              } else {
+                log.warn(`Failed to decompress gzipped PRX: ${path}`);
+              }
+            }
+            continue;
+          } else {
+            log.warn(`Failed to decrypt PRX: ${path}`);
+            break;
+          }
+        } else {
+          break; // no more transforms needed
+        }
+      }
+
+      if (processed !== data) {
+        this.hle.fileData.set(path, processed);
+      }
+    }
+    log.info(`Pre-processed ${prxCount} PRX file(s)`);
   }
 
   private _initVblankSchedule(): void {

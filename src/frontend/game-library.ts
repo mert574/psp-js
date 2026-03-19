@@ -88,8 +88,14 @@ async function extractIsoMetadata(file: File): Promise<GameMeta> {
 
 const ISO_EXTENSIONS = new Set([".iso", ".pbp"]);
 
-async function scanDirectory(dirHandle: FileSystemDirectoryHandle): Promise<File[]> {
-  const results: File[] = [];
+interface ScannedFile {
+  file: File;
+  handle: FileSystemFileHandle;
+  parentDir: FileSystemDirectoryHandle;
+}
+
+async function scanDirectory(dirHandle: FileSystemDirectoryHandle): Promise<ScannedFile[]> {
+  const results: ScannedFile[] = [];
 
   async function walk(handle: FileSystemDirectoryHandle): Promise<void> {
     for await (const entry of handle.values()) {
@@ -97,7 +103,8 @@ async function scanDirectory(dirHandle: FileSystemDirectoryHandle): Promise<File
         const ext = entry.name.slice(entry.name.lastIndexOf(".")).toLowerCase();
         if (ISO_EXTENSIONS.has(ext)) {
           try {
-            results.push(await entry.getFile());
+            const file = await (entry as FileSystemFileHandle).getFile();
+            results.push({ file, handle: entry as FileSystemFileHandle, parentDir: handle });
           } catch { /* permission denied — skip */ }
         }
       } else if (entry.kind === "directory") {
@@ -334,7 +341,9 @@ export class GameLibrary extends HTMLElement {
   private root: ShadowRoot;
   private dirHandle: FileSystemDirectoryHandle | null = null;
   private games: GameMeta[] = [];
-  private fileMap = new Map<string, File>(); // fileName+size → File handle
+  private fileMap = new Map<string, File>();
+  private fileHandleMap = new Map<string, FileSystemFileHandle>();
+  private parentDirMap = new Map<string, FileSystemDirectoryHandle>();
 
   // Hover preview state
   private _hoverAbort: AbortController | null = null;
@@ -388,13 +397,14 @@ export class GameLibrary extends HTMLElement {
       const nameSlug = game.fileName.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
       if (discSlug.toLowerCase() === slugLower || nameSlug.toLowerCase() === slugLower) {
         const fileKey = `${game.fileName}:${game.fileSize}`;
-        const file = this.fileMap.get(fileKey);
-        if (file) {
-          this.dispatchEvent(new CustomEvent("game-select", {
-            bubbles: true, composed: true, detail: { file },
-          }));
-          return true;
-        }
+        void this._getFile(fileKey).then(file => {
+          if (file) {
+            this.dispatchEvent(new CustomEvent("game-select", {
+              bubbles: true, composed: true, detail: { file },
+            }));
+          }
+        });
+        return true;
       }
     }
     return false;
@@ -482,16 +492,20 @@ export class GameLibrary extends HTMLElement {
     // Bind events
     for (const card of this.container.querySelectorAll(".card")) {
       card.addEventListener("click", () => {
+        this._stopHoverPreview();
+
         const fileName = (card as HTMLElement).dataset.file!;
         const fileSize = Number((card as HTMLElement).dataset.size!);
-        const file = this.fileMap.get(`${fileName}:${fileSize}`);
-        if (file) {
-          this.dispatchEvent(new CustomEvent("game-select", {
-            bubbles: true,
-            composed: true,
-            detail: { file },
-          }));
-        }
+        const fileKey = `${fileName}:${fileSize}`;
+        void this._getFile(fileKey).then(file => {
+          if (file) {
+            this.dispatchEvent(new CustomEvent("game-select", {
+              bubbles: true,
+              composed: true,
+              detail: { file, parentDir: this.parentDirMap.get(fileKey) ?? null },
+            }));
+          }
+        });
       });
     }
 
@@ -522,23 +536,28 @@ export class GameLibrary extends HTMLElement {
     if (!this.dirHandle) return;
     this.renderSpinner("Scanning for games...");
 
-    let files: File[];
+    let scanned: ScannedFile[];
     try {
-      files = await scanDirectory(this.dirHandle);
+      scanned = await scanDirectory(this.dirHandle);
     } catch {
       this.renderEmpty();
       return;
     }
 
-    files.sort((a, b) => a.name.localeCompare(b.name));
+    scanned.sort((a, b) => a.file.name.localeCompare(b.file.name));
 
     this.games = [];
     this.fileMap.clear();
+    this.fileHandleMap.clear();
+    this.parentDirMap.clear();
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]!;
-      this.renderSpinner(`Scanning ${i + 1} / ${files.length}: ${file.name}`);
-      this.fileMap.set(`${file.name}:${file.size}`, file);
+    for (let i = 0; i < scanned.length; i++) {
+      const { file, handle, parentDir } = scanned[i]!;
+      this.renderSpinner(`Scanning ${i + 1} / ${scanned.length}: ${file.name}`);
+      const key = `${file.name}:${file.size}`;
+      this.fileMap.set(key, file);
+      this.fileHandleMap.set(key, handle);
+      this.parentDirMap.set(key, parentDir);
 
       const cached = getCached(file.name, file.size);
       if (cached) {
@@ -603,7 +622,7 @@ export class GameLibrary extends HTMLElement {
     const fileName = card.dataset.file!;
     const fileSize = Number(card.dataset.size!);
     const fileKey = `${fileName}:${fileSize}`;
-    const file = this.fileMap.get(fileKey);
+    const file = await this._getFile(fileKey);
     if (!file) return;
 
     this._hoverCard = card;
@@ -684,6 +703,17 @@ export class GameLibrary extends HTMLElement {
     }
 
     this._hoverCard = null;
+  }
+
+  /** Get a fresh File — prefer re-acquiring from FileSystemFileHandle (survives page lifecycle). */
+  private async _getFile(fileKey: string): Promise<File | null> {
+    const handle = this.fileHandleMap.get(fileKey);
+    if (handle) {
+      try {
+        return await handle.getFile();
+      } catch { /* permission lost */ }
+    }
+    return this.fileMap.get(fileKey) ?? null;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

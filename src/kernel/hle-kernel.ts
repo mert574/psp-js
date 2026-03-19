@@ -68,7 +68,19 @@ export interface InputSnapshot {
 }
 
 export enum ThreadState { RUNNING, READY, WAITING, DORMANT, DEAD }
-export enum WaitType { NONE, DELAY, VBLANK, SLEEP, SEMA, EVENT_FLAG, AUDIO, ATRAC_DECODE, GE_DRAW_SYNC, GE_LIST_SYNC, THREAD_END, MUTEX, FPL, VPL }
+export enum WaitType { NONE, DELAY, VBLANK, SLEEP, SEMA, EVENT_FLAG, AUDIO, ATRAC_DECODE, GE_DRAW_SYNC, GE_LIST_SYNC, THREAD_END, MUTEX, FPL, VPL, MODULE }
+
+export interface LoadedModule {
+  id: number;
+  name: string;
+  path: string;
+  entryAddr: number;
+  gp: number;
+  baseAddr: number;
+  size: number;
+  isFake: boolean;
+  status: number; // 0=loaded, 1=started
+}
 
 /** GE display list states — must match PSP values (PPSSPP GPUDefinitions.h).
  *  NONE=0, QUEUED=1, DRAWING/RUNNING=2, COMPLETED=3, PAUSED=4.
@@ -391,6 +403,12 @@ export class HLEKernel {
   private nextFd = 3; // 0/1/2 reserved for stdin/stdout/stderr
 
 
+  /** Next available syscall code for dynamically loaded modules (set after main EBOOT load). */
+  nextSyscallCode = 1;
+
+  /** Loaded modules (sceKernelLoadModule tracking). */
+  readonly loadedModules = new Map<number, LoadedModule>();
+
   /** Scheduling / timing */
   vblankCount: number = 0;
   cycleCount: number = 0;
@@ -604,6 +622,14 @@ export class HLEKernel {
   get inlineGeListCount(): number { return this.inlineGe?.totalListCount ?? 0; }
   get inlineGePrimCount(): number { return this.inlineGe?.totalPrimCount ?? 0; }
 
+  /** Access the inline GE processor (for attaching WebGL renderer). */
+  get geProcessor(): GEProcessor | null { return this.inlineGe; }
+  /** Ensure the inline GE processor exists. */
+  ensureGeProcessor(): GEProcessor {
+    if (!this.inlineGe) this.inlineGe = new GEProcessor(this.bus);
+    return this.inlineGe;
+  }
+
   /** Register a handler for a given NID. Overwrites any existing handler. */
   register(nid: number, handler: HLEHandler): void {
     if (this.handlers.has(nid)) {
@@ -667,6 +693,29 @@ export class HLEKernel {
     }
   }
 
+  /** Merge additional syscall→NID mappings for a dynamically loaded sub-module.
+   *  Returns the number of unimplemented imports. */
+  remapSyscallsAdditive(nidBySyscall: Map<number, number>): number {
+    let mapped = 0;
+    let stubCount = 0;
+    const unmapped: string[] = [];
+    for (const [syscallCode, nid] of nidBySyscall) {
+      const handler = this.handlers.get(nid);
+      if (handler) {
+        this.handlers.set(syscallCode, handler);
+        this.syscallToNid.set(syscallCode, nid);
+        mapped++;
+        if ((handler as { isStub?: boolean }).isStub) stubCount++;
+      } else {
+        const name = NID_NAMES.get(nid);
+        unmapped.push(name ? `${name} (0x${nid.toString(16)})` : `0x${nid.toString(16)}`);
+      }
+    }
+    log.info(`Remapped ${mapped} syscalls (${mapped - stubCount} real, ${stubCount} stubs, ${unmapped.length} unimplemented)`);
+    if (unmapped.length > 0) log.warn(`Unimplemented: ${unmapped.join(', ')}`);
+    return unmapped.length;
+  }
+
   /** For testing: look up the NID registered for a given syscall code. */
   getNidBySyscallForTest(syscallCode: number): number | undefined {
     return this.syscallToNid.get(syscallCode);
@@ -675,8 +724,6 @@ export class HLEKernel {
   /** Dispatch a syscall. The syscall code is the lower 20 bits of the SYSCALL instruction. */
   dispatch(syscallCode: number, regs: AllegrexRegisters): void {
     const nid = this.syscallToNid.get(syscallCode);
-
-
 
     const handler = this.handlers.get(syscallCode);
     if (!handler) {

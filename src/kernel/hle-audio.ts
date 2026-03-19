@@ -14,6 +14,7 @@
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel, HLEHandler } from "./hle-kernel.js";
 import { parseAtracHeader, decodeAtrac, getCachedAtrac, getCachedAtracBySize, type AtracInfo } from "../audio/atrac-decoder.js";
+import { Mp3FrameAccumulator, decodeAudioFrame } from "../audio/frame-decoder.js";
 import { AUDIO, ATRAC, AAC, AUDIOCODEC, VAUDIO, MP3, MP4 } from "./nids.js";
 
 const log = Logger.get("HLE-AUDIO");
@@ -209,16 +210,22 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   const atracWaiters = new Map<number, number[]>();
   /** Rate-limit success logs: channel → call count */
   const outputCallCount = new Map<number, number>();
+  /** Fake channel counter for when audio engine is disabled */
+  let fakeNextCh = 0;
 
   // ── sceAudioChReserve(channel, sampleCount, format) → channelIndex ──────
+  // Always succeed even when audio is disabled — games expect channel reservation to work.
+  // Actual PCM output is silently discarded when the engine is off.
   kernel.register(AUDIO.sceAudioChReserve, (regs) => {
     const engine = kernel.audioEngine;
-    if (!engine?.isReady) { regs.setGpr(2, 0x80260008); return; } // SCE_ERROR_AUDIO_NOT_INITIALIZED
-    const ch = engine.reserveChannel(
-      regs.getGpr(4) >>> 0,
-      regs.getGpr(5) >>> 0,
-      regs.getGpr(6) >>> 0,
-    );
+    let ch: number;
+    if (engine?.isReady) {
+      ch = engine.reserveChannel(regs.getGpr(4) >>> 0, regs.getGpr(5) >>> 0, regs.getGpr(6) >>> 0);
+    } else {
+      // Audio disabled — auto-assign a fake channel index so the game proceeds
+      const req = regs.getGpr(4) | 0;
+      ch = req === -1 ? (fakeNextCh < 8 ? fakeNextCh++ : -1) : (req < 8 ? req : -1);
+    }
     log.info(`sceAudioChReserve: tid=${kernel.currentThreadId} req=${regs.getGpr(4) | 0} samples=${regs.getGpr(5)} fmt=${regs.getGpr(6)} → ch=${ch}`);
     regs.setGpr(2, ch >>> 0);
   });
@@ -264,11 +271,10 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       regs.setGpr(2, 0);
     }
 
-    if (blocking && kernel.audioEngine?.isReady) {
-      // Block for the real-time duration of the audio buffer.
-      // Also block when bufPtr=0 (drain/sync call) — the PSP DMA still takes time.
-      // Skip when audio is disabled (audioEngine never initialised) so the thread
-      // doesn't stall on timing delays with no actual audio output.
+    if (blocking) {
+      // Always block for the real-time duration of the audio buffer, even when
+      // audio is disabled. The PSP DMA takes real time regardless of output.
+      // Without this, audio threads spin infinitely when the engine is off.
       kernel.blockForAudio(regs, ch?.sampleCount ?? 512, 44_100);
     }
   }
@@ -841,15 +847,208 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   kernel.stub(AAC.sceAacResetPlayPosition);
   kernel.stub(AAC.sceAacSetLoopNum);
   kernel.stub(AAC.sceAacTermResource);
-  // ── AUDIOCODEC ──────────────────────────────────────────────────────────
-  kernel.stub(AUDIOCODEC.sceAudiocodecCheckNeedMem);
-  kernel.stub(AUDIOCODEC.sceAudiocodecDecode);
-  kernel.stub(AUDIOCODEC.sceAudiocodecGetEDRAM);
-  kernel.stub(AUDIOCODEC.sceAudiocodecGetInfo);
-  kernel.stub(AUDIOCODEC.sceAudiocodecGetOutputBytes);
-  kernel.stub(AUDIOCODEC.sceAudiocodecInit, 1);
-  kernel.stub(AUDIOCODEC.sceAudiocodecInitMono, 1);
-  kernel.stub(AUDIOCODEC.sceAudiocodecReleaseEDRAM);
+  // ── AUDIOCODEC — PPSSPP sceAudiocodec.cpp ─────────────────────────────
+  // SceAudiocodecCodec struct layout (128 bytes, from sceAudiocodec.h):
+  //   0x00: unk_init (s32) — firmware version indicator (0x5100601)
+  //   0x04: unk4 (s32)
+  //   0x08: err (s32)
+  //   0x0C: edramAddr (s32)
+  //   0x10: neededMem (s32)
+  //   0x14: inited (s32)
+  //   0x18: inBuf (u32) — pointer to input compressed data
+  //   0x1C: srcBytesRead (s32) — bytes consumed from input
+  //   0x20: outBuf (u32) — pointer to output PCM buffer
+  //   0x24: dstSamplesWritten (s32) — samples written to output
+  //   0x28: unk40/formatOutSamples (union)
+  //   0x38: mp3_9999 (s32)
+  //   0x3C: mp3_3 (s32)
+  //   0x40: unk64 (s32) — AT3+ size related
+  //   0x44: mp3_9 (s32)
+  //   0x48: mp3_0 (s32)
+  //   0x50: mp3_1_first (s32)
+  //   0x58: mp3_1 (s32)
+  //   0x68: allocMem (u32)
+
+  // sceAudiocodecCheckNeedMem(ctxPtr, codec) — PPSSPP sceAudiocodec.cpp:302-338
+  kernel.register(AUDIOCODEC.sceAudiocodecCheckNeedMem, (regs, bus) => {
+    const ctxPtr = regs.getGpr(4);
+    const codec = regs.getGpr(5);
+    if (codec < 0x1000 || codec >= 0x1006) {
+      regs.setGpr(2, 0x80000025); // SCE_KERNEL_ERROR_BAD_ARGUMENT
+      return;
+    }
+    let neededMem = 0x3de0;
+    switch (codec) {
+      case 0x1000: neededMem = 0x7bc0; break; // AT3+
+      case 0x1001: neededMem = 0x3de0; break; // AT3
+      case 0x1002: neededMem = 0x3b68; break; // MP3
+      case 0x1003: neededMem = 0x18f20; break; // AAC
+    }
+    bus.writeU32(ctxPtr + 0x10, neededMem);  // neededMem
+    bus.writeU32(ctxPtr + 0x08, 0);          // err = 0
+    bus.writeU32(ctxPtr + 0x00, 0x5100601);  // unk_init
+    regs.setGpr(2, 0);
+  });
+
+  // sceAudiocodecGetEDRAM(ctxPtr, codec) — PPSSPP sceAudiocodec.cpp:340-354
+  kernel.register(AUDIOCODEC.sceAudiocodecGetEDRAM, (regs, bus) => {
+    const ctxPtr = regs.getGpr(4);
+    const codec = regs.getGpr(5);
+    let allocMem = 0x0018ea90;
+    if (codec === 0x1002) allocMem = 0x001B3124; // MP3
+    bus.writeU32(ctxPtr + 0x68, allocMem);                     // allocMem
+    bus.writeU32(ctxPtr + 0x0C, (allocMem + 0x3f) & ~0x3f);   // edramAddr (aligned)
+    regs.setGpr(2, 0);
+  });
+
+  // sceAudiocodecReleaseEDRAM(ctxPtr, codec) — PPSSPP sceAudiocodec.cpp:356-361
+  kernel.register(AUDIOCODEC.sceAudiocodecReleaseEDRAM, (regs) => {
+    const ctxPtr = regs.getGpr(4);
+    audiocodecContexts.delete(ctxPtr);
+    regs.setGpr(2, 0);
+  });
+
+  // Per-context decoder state for sceAudiocodec
+  interface AudiocodecCtx {
+    codec: number;
+    channels: number;
+    sampleRate: number;
+    mp3Accum: Mp3FrameAccumulator | null;
+  }
+  const audiocodecContexts = new Map<number, AudiocodecCtx>();
+
+  function initAudiocodecCtx(ctxPtr: number, codec: number): void {
+    const existing = audiocodecContexts.get(ctxPtr);
+    if (existing) audiocodecContexts.delete(ctxPtr);
+    audiocodecContexts.set(ctxPtr, {
+      codec,
+      channels: 2,
+      sampleRate: 44100,
+      mp3Accum: codec === 0x1002 ? new Mp3FrameAccumulator(3) : null,
+    });
+  }
+
+  // sceAudiocodecInit(ctxPtr, codec) — PPSSPP sceAudiocodec.cpp:133-199
+  kernel.register(AUDIOCODEC.sceAudiocodecInit, (regs, bus) => {
+    const ctxPtr = regs.getGpr(4);
+    const codec = regs.getGpr(5);
+    bus.writeU32(ctxPtr + 0x00, 0x5100601);  // unk_init
+    bus.writeU32(ctxPtr + 0x08, 0);          // err = 0
+    if (codec === 0x1002) bus.writeU32(ctxPtr + 0x38, 9999); // mp3_9999
+    initAudiocodecCtx(ctxPtr, codec);
+    regs.setGpr(2, 0);
+  });
+
+  // sceAudiocodecInitMono(ctxPtr, codec) — same as Init
+  kernel.register(AUDIOCODEC.sceAudiocodecInitMono, (regs, bus) => {
+    const ctxPtr = regs.getGpr(4);
+    const codec = regs.getGpr(5);
+    bus.writeU32(ctxPtr + 0x00, 0x5100601);
+    bus.writeU32(ctxPtr + 0x08, 0);
+    initAudiocodecCtx(ctxPtr, codec);
+    regs.setGpr(2, 0);
+  });
+
+  // sceAudiocodecGetInfo(ctxPtr, codec) — PPSSPP sceAudiocodec.cpp:275-300
+  kernel.register(AUDIOCODEC.sceAudiocodecGetInfo, (regs, bus) => {
+    const ctxPtr = regs.getGpr(4);
+    const codec = regs.getGpr(5);
+    if (codec === 0x1002) {
+      // MP3: write expected response fields (offsets from SceAudiocodecCodec struct)
+      bus.writeU32(ctxPtr + 0x3C, 3);  // mp3_3 (offset 60)
+      bus.writeU32(ctxPtr + 0x44, 9);  // mp3_9 (offset 68)
+      bus.writeU32(ctxPtr + 0x48, 0);  // mp3_0 (offset 72)
+      bus.writeU32(ctxPtr + 0x60, 1);  // mp3_1 (offset 96)
+      bus.writeU32(ctxPtr + 0x54, 1);  // mp3_1_first (offset 84)
+    }
+    regs.setGpr(2, 0);
+  });
+
+  // sceAudiocodecGetOutputBytes(ctxPtr, codec, outBytesAddr) — PPSSPP sceAudiocodec.cpp:363-380
+  kernel.register(AUDIOCODEC.sceAudiocodecGetOutputBytes, (regs, bus) => {
+    const codec = regs.getGpr(5);
+    const outAddr = regs.getGpr(6);
+    let bytes = 0;
+    switch (codec) {
+      case 0x1000: bytes = 0x2000; break; // AT3+
+      case 0x1001: bytes = 0x1000; break; // AT3
+      case 0x1002: bytes = 0x1200; break; // MP3
+    }
+    if (outAddr !== 0) bus.writeU32(outAddr, bytes);
+    regs.setGpr(2, 0);
+  });
+
+  // sceAudiocodecDecode(ctxPtr, codec) — PPSSPP sceAudiocodec.cpp:205-271
+  // Decodes one compressed frame to PCM. Blocks thread during async decode.
+  kernel.register(AUDIOCODEC.sceAudiocodecDecode, (regs, bus) => {
+    const ctxPtr = regs.getGpr(4);
+    const codec = regs.getGpr(5);
+    const inBuf = bus.readU32(ctxPtr + 0x18);
+    const outBuf = bus.readU32(ctxPtr + 0x20);
+
+    // Determine frame size
+    let bytesPerFrame = bus.readU32(ctxPtr + 0x1C); // srcBytesRead (game sets this for MP3/AAC)
+    if (codec === 0x1000) {
+      // AT3+: unk41 * 8 + 8
+      const unk41 = bus.readU8(ctxPtr + 0x29);
+      bytesPerFrame = unk41 * 8 + 8;
+    } else if (codec === 0x1001) {
+      bytesPerFrame = 384; // AT3 fixed
+    }
+    if (bytesPerFrame <= 0 || bytesPerFrame > 0x10000) bytesPerFrame = 384;
+
+    // Default output sizes per codec (samples written to outBuf)
+    let outSamples = 1024;
+    switch (codec) {
+      case 0x1000: outSamples = 2048; break; // AT3+ = 2048 samples
+      case 0x1001: outSamples = 1024; break; // AT3 = 1024 samples
+      case 0x1002: outSamples = 1152; break; // MP3 = 1152 samples
+      case 0x1003: outSamples = 1024; break; // AAC
+    }
+
+    // Read compressed frame from PSP RAM
+    const frameData = bus.readBytes(inBuf, bytesPerFrame);
+    const actx = audiocodecContexts.get(ctxPtr);
+    const channels = actx?.channels ?? 2;
+    const sampleRate = actx?.sampleRate ?? 44100;
+
+    // For MP3: use frame accumulator for bit reservoir handling
+    const decodePromise: Promise<Int16Array | null> =
+      codec === 0x1002 && actx?.mp3Accum
+        ? (actx.mp3Accum.addFrame(frameData), actx.mp3Accum.decode())
+        : decodeAudioFrame(frameData, codec, channels, sampleRate);
+
+    // Block the current thread, decode async, wake with results
+    let decodedPcm: Int16Array | null = null;
+    const tid = kernel.currentThreadId;
+
+    kernel.blockAtracDecode(regs, () => {
+      // Wake callback: write PCM to PSP RAM
+      if (decodedPcm && outBuf !== 0) {
+        const writeBytes = Math.min(decodedPcm.byteLength, outSamples * 2 * channels);
+        const pcmBytes = new Uint8Array(decodedPcm.buffer, decodedPcm.byteOffset, writeBytes);
+        bus.writeBytes(outBuf, pcmBytes);
+        bus.writeU32(ctxPtr + 0x1C, bytesPerFrame);
+        bus.writeU32(ctxPtr + 0x24, writeBytes / (2 * channels));
+      } else {
+        // Decode failed — write silence, set err = 0x20b (PPSSPP sceAudiocodec.cpp:263)
+        const silenceBytes = outSamples * 2 * channels;
+        if (outBuf !== 0) {
+          for (let i = 0; i < silenceBytes; i += 4) bus.writeU32(outBuf + i, 0);
+        }
+        bus.writeU32(ctxPtr + 0x08, 0x20b);  // err field
+        bus.writeU32(ctxPtr + 0x1C, bytesPerFrame);
+        bus.writeU32(ctxPtr + 0x24, outSamples);
+      }
+    });
+
+    decodePromise.then(pcm => {
+      decodedPcm = pcm;
+      kernel.pendingAtracWakes.add(tid);
+    }).catch(() => {
+      kernel.pendingAtracWakes.add(tid);
+    });
+  });
   // ── VAUDIO ──────────────────────────────────────────────────────────
   kernel.stub(VAUDIO.sceVaudioChReserve, 1);
   kernel.stub(VAUDIO.sceVaudioChReserveBuffering, 1);

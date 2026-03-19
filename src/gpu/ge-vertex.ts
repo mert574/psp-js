@@ -30,7 +30,8 @@ export function computeVertexStride(vtype: number): number {
   else if (posFmt === 2) { s = (s + 1) & ~1; s += 6; }
   else if (posFmt === 3) { s = (s + 3) & ~3; s += 12; }
 
-  return s;
+  // PPSSPP VertexDecoderCommon.cpp:1404: final stride is aligned to 4 bytes.
+  return (s + 3) & ~3;
 }
 
 /** Read vertices from memory based on vertex format. Supports indexed drawing. */
@@ -55,16 +56,15 @@ export function readVertices(
   const normFmt     = (vtype >>> 5)  & 3;  // 0=none,1=s8,2=s16,3=float
 
   const vertices: Vertex[] = [];
-  let addr = vertexAddr;
 
-  // Calculate vertex stride for indexed access
-  let vertexStride = 0;
-  if (indexFmt !== 0) {
-    vertexStride = computeVertexStride(vtype);
-  }
+  // Always compute stride — PSP reads vertices at fixed stride offsets.
+  // Field alignment within each vertex is relative to the vertex start (offset 0),
+  // NOT to the absolute memory address. Using a running addr caused alignment drift
+  // when stride wasn't a multiple of the largest alignment (e.g. stride=14 with u32 color).
+  const vertexStride = computeVertexStride(vtype);
 
   for (let i = 0; i < count; i++) {
-    // For indexed drawing, read index and compute vertex address
+    // Compute vertex base address
     let vAddr: number;
     if (indexFmt === 1) { // u8 indices
       const idx = bus.readU8(indexAddr + i);
@@ -73,112 +73,107 @@ export function readVertices(
       const idx = bus.readU16(indexAddr + i * 2);
       vAddr = vertexAddr + idx * vertexStride;
     } else {
-      vAddr = addr;
+      vAddr = vertexAddr + i * vertexStride;
     }
-    addr = vAddr; // for non-indexed, addr advances below
+    // Track offset within vertex (0-based) for alignment, then read at vAddr + off.
+    // PSP hardware aligns fields relative to vertex start, NOT absolute address.
+    // Using absolute addr caused alignment drift when stride isn't a multiple of 4.
+    let off = 0;
+    const align2 = () => { off = (off + 1) & ~1; };
+    const align4 = () => { off = (off + 3) & ~3; };
 
-    // Default vertex color: when no per-vertex color in vtype, use material ambient.
-    // PSP hardware: getMaterialAmbientRGBA() = (materialambient & 0xFFFFFF) | (materialalpha << 24)
     const defaultColor = ((materialAlpha & 0xFF) * 0x1000000) | (materialAmbient & 0xFFFFFF);
     const v: Vertex = { x: 0, y: 0, z: 0, u: 0, v: 0, color: defaultColor, nx: 0, ny: 0, nz: 1, clipw: 1.0 };
 
     // Read bone weights (appear before UV in PSP vertex layout)
     if (weightFmt === 1) {
       const ws: number[] = [];
-      for (let wi = 0; wi < weightCount; wi++) ws.push(bus.readU8(addr++) / 128.0);
+      for (let wi = 0; wi < weightCount; wi++) ws.push(bus.readU8(vAddr + off++) / 128.0);
       v.weights = ws;
     } else if (weightFmt === 2) {
-      addr = (addr + 1) & ~1;
+      align2();
       const ws: number[] = [];
-      for (let wi = 0; wi < weightCount; wi++) { ws.push(bus.readU16(addr) / 32768.0); addr += 2; }
+      for (let wi = 0; wi < weightCount; wi++) { ws.push(bus.readU16(vAddr + off) / 32768.0); off += 2; }
       v.weights = ws;
     } else if (weightFmt === 3) {
-      addr = (addr + 3) & ~3;
+      align4();
       const ws: number[] = [];
-      for (let wi = 0; wi < weightCount; wi++) { ws.push(readFloat(bus, addr)); addr += 4; }
+      for (let wi = 0; wi < weightCount; wi++) { ws.push(readFloat(bus, vAddr + off)); off += 4; }
       v.weights = ws;
     }
 
-    // Texture coords:
-    // Through mode (bit 23 of vtype): UV is raw texel coordinates (no prescaling).
-    // Transform mode: u8 -> /128, u16 -> /32768, float -> as-is (PPSSPP convention).
-    // sampleTexture applies texScaleU/V and uses the result directly as texel coords.
+    // Texture coords
     const through = (vtypeRaw >>> 23) & 1;
     if (texFmt === 1) { // u8
-      const raw_u = bus.readU8(addr); addr++;
-      const raw_v = bus.readU8(addr); addr++;
+      const raw_u = bus.readU8(vAddr + off); off++;
+      const raw_v = bus.readU8(vAddr + off); off++;
       v.u = through ? raw_u : raw_u / 128.0;
       v.v = through ? raw_v : raw_v / 128.0;
     } else if (texFmt === 2) { // u16
-      addr = (addr + 1) & ~1; // align to 2
-      const raw_u = bus.readU16(addr); addr += 2;
-      const raw_v = bus.readU16(addr); addr += 2;
+      align2();
+      const raw_u = bus.readU16(vAddr + off); off += 2;
+      const raw_v = bus.readU16(vAddr + off); off += 2;
       v.u = through ? raw_u : raw_u / 32768.0;
       v.v = through ? raw_v : raw_v / 32768.0;
     } else if (texFmt === 3) { // float
-      addr = (addr + 3) & ~3; // align to 4
-      v.u = readFloat(bus, addr); addr += 4;
-      v.v = readFloat(bus, addr); addr += 4;
+      align4();
+      v.u = readFloat(bus, vAddr + off); off += 4;
+      v.v = readFloat(bus, vAddr + off); off += 4;
     }
 
     // Color
     if (colorFmt === 4) { // 16-bit 5551
-      addr = (addr + 1) & ~1;
-      const c = bus.readU16(addr); addr += 2;
-      v.color = color5551to8888(c);
+      align2();
+      v.color = color5551to8888(bus.readU16(vAddr + off)); off += 2;
     } else if (colorFmt === 5) { // 16-bit 5650
-      addr = (addr + 1) & ~1;
-      const c = bus.readU16(addr); addr += 2;
-      v.color = color5650to8888(c);
+      align2();
+      v.color = color5650to8888(bus.readU16(vAddr + off)); off += 2;
     } else if (colorFmt === 6) { // 16-bit 4444
-      addr = (addr + 1) & ~1;
-      const c = bus.readU16(addr); addr += 2;
-      v.color = color4444to8888(c);
+      align2();
+      v.color = color4444to8888(bus.readU16(vAddr + off)); off += 2;
     } else if (colorFmt === 7) { // 32-bit 8888
-      addr = (addr + 3) & ~3;
-      v.color = bus.readU32(addr); addr += 4;
+      align4();
+      v.color = bus.readU32(vAddr + off); off += 4;
     }
 
-    // Read normals (between color and position in PSP vertex layout)
-    // PPSSPP VertexDecoderCommon.h:162-185 ReadNrm:
-    //   s8: / 127.0, s16: / 32767.0, float: as-is
+    // Normals
     if (normFmt === 1) { // s8
-      v.nx = ((bus.readU8(addr) << 24) >> 24) / 127.0; addr++;
-      v.ny = ((bus.readU8(addr) << 24) >> 24) / 127.0; addr++;
-      v.nz = ((bus.readU8(addr) << 24) >> 24) / 127.0; addr++;
+      v.nx = ((bus.readU8(vAddr + off) << 24) >> 24) / 127.0; off++;
+      v.ny = ((bus.readU8(vAddr + off) << 24) >> 24) / 127.0; off++;
+      v.nz = ((bus.readU8(vAddr + off) << 24) >> 24) / 127.0; off++;
     } else if (normFmt === 2) { // s16
-      addr = (addr + 1) & ~1;
-      v.nx = ((bus.readU16(addr) << 16) >> 16) / 32767.0; addr += 2;
-      v.ny = ((bus.readU16(addr) << 16) >> 16) / 32767.0; addr += 2;
-      v.nz = ((bus.readU16(addr) << 16) >> 16) / 32767.0; addr += 2;
+      align2();
+      v.nx = ((bus.readU16(vAddr + off) << 16) >> 16) / 32767.0; off += 2;
+      v.ny = ((bus.readU16(vAddr + off) << 16) >> 16) / 32767.0; off += 2;
+      v.nz = ((bus.readU16(vAddr + off) << 16) >> 16) / 32767.0; off += 2;
     } else if (normFmt === 3) { // float
-      addr = (addr + 3) & ~3;
-      v.nx = readFloat(bus, addr); addr += 4;
-      v.ny = readFloat(bus, addr); addr += 4;
-      v.nz = readFloat(bus, addr); addr += 4;
+      align4();
+      v.nx = readFloat(bus, vAddr + off); off += 4;
+      v.ny = readFloat(bus, vAddr + off); off += 4;
+      v.nz = readFloat(bus, vAddr + off); off += 4;
     }
 
-    // Position (through mode = screen coords)
+    // Position
     if (posFmt === 1) { // s8
-      v.x = (bus.readU8(addr) << 24) >> 24; addr++;
-      v.y = (bus.readU8(addr) << 24) >> 24; addr++;
-      v.z = (bus.readU8(addr) << 24) >> 24; addr++;
+      v.x = (bus.readU8(vAddr + off) << 24) >> 24; off++;
+      v.y = (bus.readU8(vAddr + off) << 24) >> 24; off++;
+      v.z = (bus.readU8(vAddr + off) << 24) >> 24; off++;
     } else if (posFmt === 2) { // s16
-      addr = (addr + 1) & ~1;
-      v.x = (bus.readU16(addr) << 16) >> 16; addr += 2;
-      v.y = (bus.readU16(addr) << 16) >> 16; addr += 2;
-      v.z = (bus.readU16(addr) << 16) >> 16; addr += 2;
+      align2();
+      v.x = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
+      v.y = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
+      v.z = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
     } else if (posFmt === 3) { // float
-      addr = (addr + 3) & ~3;
-      v.x = readFloat(bus, addr); addr += 4;
-      v.y = readFloat(bus, addr); addr += 4;
-      v.z = readFloat(bus, addr); addr += 4;
+      align4();
+      v.x = readFloat(bus, vAddr + off); off += 4;
+      v.y = readFloat(bus, vAddr + off); off += 4;
+      v.z = readFloat(bus, vAddr + off); off += 4;
     }
 
     vertices.push(v);
   }
 
-  return { vertices, newVertexAddr: indexFmt === 0 ? addr : vertexAddr };
+  return { vertices, newVertexAddr: indexFmt === 0 ? vertexAddr + count * vertexStride : vertexAddr };
 }
 
 /**

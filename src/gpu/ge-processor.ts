@@ -15,6 +15,7 @@ import {
 import { computeVertexLighting } from "./ge-lighting.js";
 import type { LightingState } from "./ge-lighting.js";
 import { tessellateBezier, tessellateSpline } from "./ge-patches.js";
+import type { WebGLGERenderer, GEDrawState } from "./ge-webgl-renderer.js";
 
 export type { GeExecuteResult } from "./ge-types.js";
 export type { Vertex } from "./ge-types.js";
@@ -37,6 +38,9 @@ export class GEProcessor {
 
   /** When true, skip per-pixel sprite/triangle rasterization (keep clears + block transfers). */
   skipSoftwareRaster = false;
+
+  /** When set, route PRIM and clear commands to WebGL instead of software rasterization. */
+  webglRenderer: WebGLGERenderer | null = null;
 
   // GE state registers
   private baseAddr = 0;
@@ -302,7 +306,6 @@ export class GEProcessor {
   private _dbgBadFbOff = 0; // draws skipped because fbOff was out of VRAM bounds
   /** One-shot alpha=0 probe: logs once per unique (texFmt|texFunc|texFuncAlpha|blend) key. */
   private _dbgAlpha0Seen = new Set<number>();
-  private _loggedFirstDraw = false;
 
   /** Current GE draw framebuffer address (0 = VRAM offset 0 = 0x04000000). */
   private toPhysical(ptr: number): number {
@@ -316,6 +319,86 @@ export class GEProcessor {
   get totalPrimCount(): number { return this._dbgTotalPrim; }
   get totalClearCount(): number { return this._dbgTotalClear; }
   get totalSkipCount(): number { return this._dbgTotalSkip; }
+
+  /** Snapshot all GE state needed for a WebGL draw call. */
+  get drawState(): GEDrawState {
+    return {
+      throughMode: ((this.vtypeRaw >>> 23) & 1) === 1,
+      texEnable: this.texEnable,
+      texState: {
+        texAddr0: this.texAddr0,
+        texBufWidth0: this.texBufWidth0,
+        texWidth0: this.texWidth0,
+        texHeight0: this.texHeight0,
+        texFormat: this.texFormat,
+        texSwizzle: this.texSwizzle,
+        texWrapU: this.texWrapU,
+        texWrapV: this.texWrapV,
+        texMinFilter: this.texMinFilter,
+        texMagFilter: this.texMagFilter,
+        texMapMode: this.texMapMode,
+        texScaleU: this.texScaleU,
+        texScaleV: this.texScaleV,
+        texOffsetU: this.texOffsetU,
+        texOffsetV: this.texOffsetV,
+        vtypeRaw: this.vtypeRaw,
+        clutAddr: this.clutAddr,
+        clutFormat: this.clutFormat,
+        clutShift: this.clutShift,
+        clutMask: this.clutMask,
+        clutStart: this.clutStart,
+      },
+      fragState: {
+        alphaTestEnable: this.alphaTestEnable,
+        alphaTestFunc: this.alphaTestFunc,
+        alphaTestRef: this.alphaTestRef,
+        alphaTestMask: this.alphaTestMask,
+        colorTestEnable: this.colorTestEnable,
+        colorTestFunc: this.colorTestFunc,
+        colorTestRef: this.colorTestRef,
+        colorTestMask: this.colorTestMask,
+        stencilTestEnable: this.stencilTestEnable,
+        stencilFunc: this.stencilFunc,
+        stencilRef: this.stencilRef,
+        stencilMask: this.stencilMask,
+        stencilSFail: this.stencilSFail,
+        stencilZFail: this.stencilZFail,
+        stencilZPass: this.stencilZPass,
+        alphaBlendEnable: this.alphaBlendEnable,
+        blendSrc: this.blendSrc,
+        blendDst: this.blendDst,
+        blendOp: this.blendOp,
+        blendFixedA: this.blendFixedA,
+        blendFixedB: this.blendFixedB,
+        logicOpEnable: this.logicOpEnable,
+        logicOp: this.logicOp,
+        ditherEnable: this.ditherEnable,
+        ditherMatrix: this.ditherMatrix,
+        fbFormat: this.fbFormat,
+        maskRgb: this.maskRgb,
+        maskAlpha: this.maskAlpha,
+        texFunc: this.texFunc,
+        texFuncAlpha: this.texFuncAlpha,
+        texEnvColor: this.texEnvColor,
+      },
+      fbPtr: this.fbPtr,
+      fbWidth: this.fbWidth,
+      fbFormat: this.fbFormat,
+      clearMode: this.clearMode,
+      clearColorWrite: this.clearColorWrite,
+      clearAlphaWrite: this.clearAlphaWrite,
+      clearDepthWrite: this.clearDepthWrite,
+      depthTestEnable: this.depthTestEnable,
+      depthFunc: this.depthFunc,
+      depthWriteDisable: this.depthWriteDisable,
+      cullEnable: this.cullEnable,
+      cullCW: this.cullCW,
+      scissorX1: this.scissorX1,
+      scissorY1: this.scissorY1,
+      scissorX2: this.scissorX2,
+      scissorY2: this.scissorY2,
+    };
+  }
 
   /** Set the GE draw framebuffer externally (e.g. from sceDisplaySetFrameBuf double-buffer swap). */
   setFramebuf(addr: number, width: number, format: number): void {
@@ -388,18 +471,18 @@ export class GEProcessor {
 
         case GE_CMD.FRAMEBUFPTR:
           this.fbPtr = (this.fbPtr & 0xFF000000) | param;
-          if (traceFb) log.info(`FRAMEBUFPTR param=0x${param.toString(16)} → fbPtr=0x${this.fbPtr.toString(16)}`);
+          if (traceFb) log.debug(`FRAMEBUFPTR param=0x${param.toString(16)} → fbPtr=0x${this.fbPtr.toString(16)}`);
           break;
 
         case GE_CMD.FRAMEBUFWIDTH:
           this.fbPtr = (this.fbPtr & 0x00FFFFFF) | ((param & 0xFF0000) << 8);
           this.fbWidth = param & 0x07FF;
-          if (traceFb) log.info(`FRAMEBUFWIDTH param=0x${param.toString(16)} → fbPtr=0x${this.fbPtr.toString(16)} fbWidth=${this.fbWidth}`);
+          if (traceFb) log.debug(`FRAMEBUFWIDTH param=0x${param.toString(16)} → fbPtr=0x${this.fbPtr.toString(16)} fbWidth=${this.fbWidth}`);
           break;
 
         case GE_CMD.FRAMEBUFPIXFMT:
           this.fbFormat = param & 3;
-          if (traceFb) log.info(`FRAMEBUFPIXFMT param=0x${param.toString(16)} → fmt=${this.fbFormat}`);
+          if (traceFb) log.debug(`FRAMEBUFPIXFMT param=0x${param.toString(16)} → fmt=${this.fbFormat}`);
           break;
 
         // Vertex type
@@ -475,9 +558,6 @@ export class GEProcessor {
           break;
 
         case GE_CMD.CLEAR:
-          if (this._dbgListCount <= 5) {
-            log.info(`CLEAR param=0x${param.toString(16)} fbFmt=${this.fbFormat}`);
-          }
           if (param & 1) {
             this.clearMode = true;
             this._dbgClearCount++;
@@ -938,9 +1018,7 @@ export class GEProcessor {
           this._dbgTotalPrim    += this._dbgPrimCount;
           this._dbgTotalClear   += this._dbgClearCount;
           this._dbgTotalSkip    += this._dbgSkipCount;
-          if (this._dbgListCount <= 3) {
-            log.info(`List #${this._dbgListCount} END: drawn=${this._dbgPrimCount - this._dbgSkipCount} clear=${this._dbgClearCount} fbPtr=0x${this.fbPtr.toString(16)}`);
-          }
+          log.debug(`List #${this._dbgListCount} END: drawn=${this._dbgPrimCount - this._dbgSkipCount} clear=${this._dbgClearCount} fbPtr=0x${this.fbPtr.toString(16)}`);
           this._dbgBadFbOff = 0;
           return { stoppedPc: -1, commandsProcessed: count }; // completed
         }
@@ -1023,10 +1101,11 @@ export class GEProcessor {
           break;
 
         default:
-          // Log once per unique unknown opcode (same pattern as HLE syscall warnings)
+          // Unknown opcodes are NOPs in PPSSPP (stored in cmdmem but no execute handler).
+          // Log once at debug level to avoid console spam.
           if (!this._warnedOpcodes.has(opcode)) {
             this._warnedOpcodes.add(opcode);
-            log.warn(`Unhandled GE opcode 0x${opcode.toString(16)} param=0x${param.toString(16)}`);
+            log.debug(`Unhandled GE opcode 0x${opcode.toString(16)} param=0x${param.toString(16)}`);
           }
           break;
       }
@@ -1326,35 +1405,22 @@ export class GEProcessor {
 
     this._dbgPrimCount += Math.floor(vertices.length / (primType === 6 ? 2 : 3));
 
+    // WebGL rendering path — GPU-accelerated draw calls via twgl.js
+    if (this.webglRenderer) {
+      this.lastDrawFbPtr = this.fbPtr;
+      this.lastDrawFbWidth = this.fbWidth;
+      this.lastDrawFbFormat = this.fbFormat;
+      this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
+      return;
+    }
+
     // Skip expensive software rasterization for non-clear primitives.
-    // Clears and block transfers still render. Sprites/triangles are counted but not drawn.
-    // TODO: Replace with WebGL-based rendering for full-speed textured rendering.
     if (this.skipSoftwareRaster) return;
 
     // Record which buffer is receiving actual pixel draws
     this.lastDrawFbPtr = this.fbPtr;
     this.lastDrawFbWidth = this.fbWidth;
     this.lastDrawFbFormat = this.fbFormat;
-
-    // One-shot diagnostic: log full GE state on first real draw
-    if (!this._loggedFirstDraw) {
-      this._loggedFirstDraw = true;
-      const dv = (i: number) => { const v = vertices[i]; return v ? `v${i}=(${v.x},${v.y}) uv=(${v.u.toFixed(1)},${v.v.toFixed(1)})` : ''; };
-      console.log(
-        `[GE] First draw: prim=${primType} verts=${vertices.length} vtype=0x${this.vtypeRaw.toString(16)}` +
-        ` ${dv(0)} ${dv(1)} ${dv(2)} ${dv(3)}` +
-        ` texEnable=${this.texEnable} texFmt=${this.texFormat} texAddr=0x${this.texAddr0.toString(16)}` +
-        ` texW=${this.texWidth0} texH=${this.texHeight0} texBufW=${this.texBufWidth0}` +
-        ` texSwizzle=${this.texSwizzle}` +
-        ` texScaleU=${this.texScaleU.toFixed(4)} texScaleV=${this.texScaleV.toFixed(4)}` +
-        ` texOffU=${this.texOffsetU.toFixed(4)} texOffV=${this.texOffsetV.toFixed(4)}` +
-        ` texFunc=${this.texFunc} texFuncAlpha=${this.texFuncAlpha}` +
-        ` blend=${this.alphaBlendEnable} s=${this.blendSrc} d=${this.blendDst} op=${this.blendOp}` +
-        ` alphaTest=${this.alphaTestEnable} alphaFunc=${this.alphaTestFunc} alphaRef=${this.alphaTestRef}` +
-        ` fbPtr=0x${this.fbPtr.toString(16)} fbW=${this.fbWidth} fbFmt=${this.fbFormat}` +
-        ` clutAddr=0x${this.clutAddr.toString(16)} clutFmt=${this.clutFormat}`
-      );
-    }
 
     // SPRITES (type 6): pairs of vertices define axis-aligned rectangles
     if (primType === 6) {
@@ -1673,12 +1739,27 @@ export class GEProcessor {
     const x1 = Math.min(480, Math.max(v0.x, v1.x) | 0);
     const y1 = Math.min(272, Math.max(v0.y, v1.y) | 0);
 
-    // Vertex color is ABGR8888; swap R/B for writePixel convention
+    // Vertex color is ABGR8888 packed as (A<<24)|(B<<16)|(G<<8)|R
     const col = v1.color;
-    const r = (col >>> 16) & 0xFF;
-    const g = (col >>>  8) & 0xFF;
-    const b = (col >>>  0) & 0xFF;
-    const a = (col >>> 24) & 0xFF;
+    const colR = col & 0xFF;
+    const colG = (col >>> 8) & 0xFF;
+    const colB = (col >>> 16) & 0xFF;
+    const colA = (col >>> 24) & 0xFF;
+
+    // WebGL clear path — pass true R,G,B,A
+    if (this.webglRenderer) {
+      this.webglRenderer.clearRect(
+        x0, y0, x1, y1, colR, colG, colB, colA,
+        this.clearColorWrite, this.clearAlphaWrite, this.clearDepthWrite,
+      );
+      return;
+    }
+
+    // Software path: writePixel uses internal BGR convention (r=B, g=G, b=R)
+    const r = colB;
+    const g = colG;
+    const b = colR;
+    const a = colA;
 
     const vram = this.bus.vramBuffer;
     const fbOff = this.toVramOffset(this.fbPtr);
@@ -1732,6 +1813,11 @@ export class GEProcessor {
           this.bus.writeU8(dstAddr + dstOff + b, val);
         }
       }
+    }
+
+    // Invalidate WebGL texture cache after block transfer (textures may have changed)
+    if (this.webglRenderer) {
+      this.webglRenderer.invalidateTextures();
     }
   }
 
@@ -1869,6 +1955,13 @@ export class GEProcessor {
 
     // Immediate vertices are already in screen space — draw directly
     const primType = this.immPrim;
+
+    // WebGL path for immediate mode
+    if (this.webglRenderer) {
+      this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
+      return;
+    }
+
     if (primType === 6) { // SPRITES
       for (let i = 0; i + 1 < vertices.length; i += 2) {
         this.drawSprite(vertices[i]!, vertices[i + 1]!);
