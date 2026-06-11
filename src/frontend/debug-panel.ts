@@ -157,10 +157,12 @@ export class DebugPanel {
 
   private _updateGe(emu: PSPEmulator): void {
     const h = emu.hle;
+    const ge = h.geProcessor?.webglRenderer ?? null;
     this.geBody.innerHTML =
       `<div>Lists: <b>${h.geListCount}</b> &nbsp; Prims: <b>${h.gePrimCount}</b> &nbsp; Clears: <b>${h.geClearCount}</b> &nbsp; Skips: <b>${h.geSkipCount}</b></div>` +
       `<div>GE FB: <b>0x${h.geFbAddr.toString(16)}</b> &nbsp; W: <b>${h.geFbWidth}</b> &nbsp; Fmt: <b>${h.geFbFormat}</b></div>` +
-      `<div>Display FB: <b>0x${h.framebufAddr.toString(16)}</b> &nbsp; W: <b>${h.framebufWidth}</b> &nbsp; Fmt: <b>${h.framebufFormat}</b></div>`;
+      `<div>Display FB: <b>0x${h.framebufAddr.toString(16)}</b> &nbsp; W: <b>${h.framebufWidth}</b> &nbsp; Fmt: <b>${h.framebufFormat}</b></div>` +
+      (ge ? `<div>VFBs: <b>${ge.dbgVFBCount}</b> [${ge.dbgVFBKeys}] &nbsp; Path: <b>${ge._dbgDisplayPath}</b> &nbsp; Blits: <b>${ge._dbgBlitCount}</b> &nbsp; Readbacks: <b>${ge._dbgReadbackCount}</b></div>` : "");
   }
 
   private _updateSavedata(emu: PSPEmulator, now: number): void {

@@ -80,6 +80,7 @@ export class GEProcessor {
   private texWrapV = 0;
   private texFunc = 0;   // 0=modulate, 1=decal, 2=blend, 3=replace, 4=add
   private texFuncAlpha = false;
+  private colorDoubling = false;
   private texEnvColor = 0; // 24-bit BGR for BLEND texture function (GE_CMD_TEXENVCOLOR = 0xCA)
   // Texture filter (GE_CMD_TEXFILTER = 0xC6)
   // PPSSPP GPUState.h: getMinFilt() = texfilter & 7, getMagFilt() = (texfilter >> 8) & 1
@@ -397,6 +398,12 @@ export class GEProcessor {
       scissorY1: this.scissorY1,
       scissorX2: this.scissorX2,
       scissorY2: this.scissorY2,
+      fogEnable: this.fogEnable,
+      fogColor: this.fogColor,
+      fogEnd: this.fogEnd,
+      fogSlope: this.fogSlope,
+      colorDoubling: this.colorDoubling,
+      shadeMode: this.shadeMode,
     };
   }
 
@@ -434,8 +441,6 @@ export class GEProcessor {
     this._dbgClearCount = 0;
     this._dbgSkipCount = 0;
     this._dbgOpcodes.clear();
-    const traceThis = false;
-    const traceFb = this._dbgListCount <= 1;
     let pc = listAddr;
     let count = 0;
 
@@ -446,13 +451,52 @@ export class GEProcessor {
       const opcode = cmd >>> 24;
       const param = cmd & 0x00FFFFFF;
       this._dbgOpcodes.add(opcode);
-      this._dbgTotalCmds++;
-      this._dbgAllOpcodes.set(opcode, (this._dbgAllOpcodes.get(opcode) ?? 0) + 1);
-      if (traceThis) {
-        log.info(`TRACE @0x${pc.toString(16)} op=0x${opcode.toString(16)} param=0x${param.toString(16)}`);
-      }
 
-      switch (opcode) {
+      const nextPc = this.executeOp(opcode, param, pc);
+      count++;
+      if (nextPc < 0) {
+        // END — list completed
+        log.debug(`List #${this._dbgListCount} END: drawn=${this._dbgPrimCount - this._dbgSkipCount} clear=${this._dbgClearCount} fbPtr=0x${this.fbPtr.toString(16)}`);
+        this._dbgBadFbOff = 0;
+        return { stoppedPc: -1, commandsProcessed: count };
+      }
+      pc = nextPc;
+    }
+
+    return { stoppedPc: pc, commandsProcessed: count }; // stalled or budget exhausted
+  }
+
+  /** Set the vertex address directly (used by the HLE list scanner, which owns
+   *  relative-address computation via its own base/offset tracking). */
+  setVertexAddr(addr: number): void { this.vertexAddr = addr; }
+
+  /** Set the index address directly (used by the HLE list scanner). */
+  setIndexAddr(addr: number): void { this.indexAddr = addr; }
+
+  /** Count a new display list started by an external list walker (HLE scanner). */
+  noteListStart(): void { this._dbgListCount++; this._dbgTotalCalls++; }
+
+  /**
+   * Execute a single state/draw GE command from an external list walker
+   * (the HLE kernel's headless scanner). The walker owns the program counter
+   * and handles control flow (JUMP/CALL/RET/END/SIGNAL/FINISH) plus relative
+   * addressing (VADDR/IADDR via setVertexAddr/setIndexAddr) — do NOT forward
+   * those opcodes here.
+   */
+  executeCommand(opcode: number, param: number): void {
+    this.executeOp(opcode, param, 0);
+  }
+
+  /**
+   * Execute one GE command. Returns the next pc, or -1 when END completes
+   * the list. `pc` is only used by control-flow opcodes (JUMP/CALL/RET/
+   * SIGNAL/ORIGIN_ADDR).
+   */
+  private executeOp(opcode: number, param: number, pc: number): number {
+    this._dbgTotalCmds++;
+    this._dbgAllOpcodes.set(opcode, (this._dbgAllOpcodes.get(opcode) ?? 0) + 1);
+
+    switch (opcode) {
         case GE_CMD.NOP:
           break;
 
@@ -471,18 +515,15 @@ export class GEProcessor {
 
         case GE_CMD.FRAMEBUFPTR:
           this.fbPtr = (this.fbPtr & 0xFF000000) | param;
-          if (traceFb) log.debug(`FRAMEBUFPTR param=0x${param.toString(16)} → fbPtr=0x${this.fbPtr.toString(16)}`);
           break;
 
         case GE_CMD.FRAMEBUFWIDTH:
           this.fbPtr = (this.fbPtr & 0x00FFFFFF) | ((param & 0xFF0000) << 8);
           this.fbWidth = param & 0x07FF;
-          if (traceFb) log.debug(`FRAMEBUFWIDTH param=0x${param.toString(16)} → fbPtr=0x${this.fbPtr.toString(16)} fbWidth=${this.fbWidth}`);
           break;
 
         case GE_CMD.FRAMEBUFPIXFMT:
           this.fbFormat = param & 3;
-          if (traceFb) log.debug(`FRAMEBUFPIXFMT param=0x${param.toString(16)} → fmt=${this.fbFormat}`);
           break;
 
         // Vertex type
@@ -498,6 +539,7 @@ export class GEProcessor {
         // Draw primitives
         case GE_CMD.PRIM:
           this._dbgPrimCount++;
+          this._dbgTotalPrim++;
           this.doPrim(param);
           break;
 
@@ -561,6 +603,7 @@ export class GEProcessor {
           if (param & 1) {
             this.clearMode = true;
             this._dbgClearCount++;
+            this._dbgTotalClear++;
             // Bits 8/9/10 control which channels are written during clear-mode PRIMs
             this.clearColorWrite = (param & 0x100) !== 0;
             this.clearAlphaWrite = (param & 0x200) !== 0;
@@ -624,10 +667,12 @@ export class GEProcessor {
           this.texWrapV = (param >> 8) & 1;
           break;
 
-        // Texture function (0xC9): modulate, decal, blend, replace, add
+        // Texture function (0xC9): modulate, decal, blend, replace, add + color doubling
         case 0xC9:
           this.texFunc = param & 7;
           this.texFuncAlpha = ((param >> 8) & 1) !== 0;
+          // PPSSPP GPUState.h:301 — isColorDoublingEnabled = (texfunc & 0x10000) != 0
+          this.colorDoubling = ((param >> 16) & 1) !== 0;
           break;
 
         // Texture env color (0xCA) — used by BLEND texture function
@@ -983,45 +1028,32 @@ export class GEProcessor {
           this.doBlockTransfer();
           break;
 
-        case GE_CMD.JUMP: {
-          const target = this.getRelativeAddress(param & 0xFFFFFC);
-          pc = target - 4;
-          break;
-        }
+        case GE_CMD.JUMP:
+          return this.getRelativeAddress(param & 0xFFFFFC);
 
         case GE_CMD.CALL: {
           if (this.callStack.length < CALL_STACK_DEPTH) {
             this.callStack.push({ pc: pc + 4, offsetAddr: this.offsetAddr });
           }
-          const target = this.getRelativeAddress(param & 0xFFFFFC);
-          pc = target - 4;
-          break;
+          return this.getRelativeAddress(param & 0xFFFFFC);
         }
 
         case GE_CMD.RET:
           if (this.callStack.length > 0) {
             const entry = this.callStack.pop()!;
             this.offsetAddr = entry.offsetAddr;
-            pc = entry.pc - 4;
+            return entry.pc;
           }
           break;
 
         case GE_CMD.FINISH:
-          pc += 4;
-          count++;
-          continue;
+          break;
 
-        case GE_CMD.END: {
+        case GE_CMD.END:
           // Check if previous instruction was SIGNAL (SIGNAL+END pair).
           // In that case the pair was already handled by SIGNAL — this END
           // is a standalone list-termination command.
-          this._dbgTotalPrim    += this._dbgPrimCount;
-          this._dbgTotalClear   += this._dbgClearCount;
-          this._dbgTotalSkip    += this._dbgSkipCount;
-          log.debug(`List #${this._dbgListCount} END: drawn=${this._dbgPrimCount - this._dbgSkipCount} clear=${this._dbgClearCount} fbPtr=0x${this.fbPtr.toString(16)}`);
-          this._dbgBadFbOff = 0;
-          return { stoppedPc: -1, commandsProcessed: count }; // completed
-        }
+          return -1; // completed
 
         case GE_CMD.SIGNAL: {
           // SIGNAL+END form a compound pair.  The behaviour type in bits [23:16]
@@ -1038,29 +1070,23 @@ export class GEProcessor {
 
           switch (behaviour) {
             // ── Address control (no interrupt) ──────────────────────────
-            case 0x10: { // PSP_GE_SIGNAL_JUMP — absolute jump
-              const target = ((signalData << 16) | endData);
-              pc = target - 4; // main loop adds +4
-              break;
-            }
-            case 0x11: { // PSP_GE_SIGNAL_CALL — subroutine call (saves offsetAddr + baseAddr)
-              const target = ((signalData << 16) | endData);
+            case 0x10: // PSP_GE_SIGNAL_JUMP — absolute jump
+              return ((signalData << 16) | endData);
+
+            case 0x11: // PSP_GE_SIGNAL_CALL — subroutine call (saves offsetAddr + baseAddr)
               if (this.callStack.length < CALL_STACK_DEPTH) {
                 this.callStack.push({ pc: pc + 8, offsetAddr: this.offsetAddr, baseAddr: this.baseAddr });
               }
-              pc = target - 4;
-              break;
-            }
+              return ((signalData << 16) | endData);
+
             case 0x12: { // PSP_GE_SIGNAL_RET — return from subroutine
               if (this.callStack.length > 0) {
                 const entry = this.callStack.pop()!;
                 this.offsetAddr = entry.offsetAddr;
                 if (entry.baseAddr !== undefined) this.baseAddr = entry.baseAddr;
-                pc = entry.pc - 4;
-              } else {
-                pc += 4; // skip END
+                return entry.pc;
               }
-              break;
+              return pc + 8; // no stack — skip paired END
             }
 
             // ── Interrupt/handler behaviours ────────────────────────────
@@ -1070,19 +1096,15 @@ export class GEProcessor {
               if (this.signalCallback) {
                 this.signalCallback(signalData);
               }
-              pc += 4; // skip paired END
-              break;
+              return pc + 8; // skip paired END
             }
 
             case 0x08: // PSP_GE_SIGNAL_SYNC — memory barrier, no handler
-              pc += 4; // skip paired END
-              break;
+              return pc + 8; // skip paired END
 
             default:
-              pc += 4; // skip paired END
-              break;
+              return pc + 8; // skip paired END
           }
-          break;
         }
 
         // ── Immediate mode vertex commands (0xF0-0xF9) ──────────
@@ -1110,15 +1132,7 @@ export class GEProcessor {
           break;
       }
 
-      pc += 4;
-      count++;
-    }
-
-    this._dbgTotalPrim  += this._dbgPrimCount;
-    this._dbgTotalClear += this._dbgClearCount;
-    this._dbgTotalSkip  += this._dbgSkipCount;
-
-    return { stoppedPc: pc, commandsProcessed: count }; // stalled or budget exhausted
+    return pc + 4;
   }
 
   // ── State accessors for extracted modules ───────────────────────────────
@@ -1385,11 +1399,15 @@ export class GEProcessor {
         }
         // texMapMode === 0 (GE_TEXMAP_TEXTURE_COORDS): use vertex UV as-is (default)
 
-        const { sx, sy, sz, cw } = this.transformVertex(bx, by, bz);
+        const { sx, sy, sz, cw, viewZ } = this.transformVertex(bx, by, bz);
         v.x = sx;
         v.y = sy;
         v.z = sz;
         v.clipw = cw;
+        // PPSSPP SoftwareTransformCommon.cpp:353: fogCoef = (viewZ + fogEnd) * fogSlope
+        if (this.fogEnable) {
+          v.fogCoef = Math.max(0, Math.min(1, (viewZ + this.fogEnd) * this.fogSlope));
+        }
       }
     }
 
@@ -1751,6 +1769,7 @@ export class GEProcessor {
       this.webglRenderer.clearRect(
         x0, y0, x1, y1, colR, colG, colB, colA,
         this.clearColorWrite, this.clearAlphaWrite, this.clearDepthWrite,
+        this.fbPtr,
       );
       return;
     }
@@ -1803,6 +1822,26 @@ export class GEProcessor {
 
     const bpp = this.trBpp; // 2 for 16-bit formats, 4 for 32-bit
 
+    // PPSSPP NotifyBlockTransferBefore: if both src and dst are VFBs, GPU blit (no CPU copy).
+    if (this.webglRenderer) {
+      const srcIsVFB = !!this.webglRenderer.getVFBAt(srcAddr);
+      const dstIsVFB = !!this.webglRenderer.getVFBAt(dstAddr);
+
+      if (srcIsVFB && dstIsVFB) {
+        // Both are VFBs — GPU blit, skip CPU copy entirely.
+        // PPSSPP NotifyBlockTransferBefore returns true (handled).
+        this.webglRenderer.blitVFB(srcAddr, dstAddr);
+        this.webglRenderer.invalidateTextures();
+        return;
+      }
+
+      if (srcIsVFB && !dstIsVFB) {
+        // Source is VFB, dest is plain VRAM — readback source to VRAM first.
+        this.webglRenderer.readbackToVRAM(this.bus.vramBuffer, srcAddr, srcStride);
+      }
+    }
+
+    // CPU copy pixels in VRAM/RAM
     for (let row = 0; row < height; row++) {
       for (let col = 0; col < width; col++) {
         const srcOff = ((srcY + row) * srcStride + (srcX + col)) * bpp;
@@ -1815,7 +1854,7 @@ export class GEProcessor {
       }
     }
 
-    // Invalidate WebGL texture cache after block transfer (textures may have changed)
+    // Invalidate texture cache (textures may have been overwritten)
     if (this.webglRenderer) {
       this.webglRenderer.invalidateTextures();
     }
@@ -1834,7 +1873,7 @@ export class GEProcessor {
    * Transform a vertex position through the world -> view -> proj pipeline,
    * then apply the viewport transform to produce screen-space pixel coordinates.
    */
-  private transformVertex(x: number, y: number, z: number): { sx: number; sy: number; sz: number; cw: number } {
+  private transformVertex(x: number, y: number, z: number): { sx: number; sy: number; sz: number; cw: number; viewZ: number } {
     // World transform (4x3, column-major): col0=[0..2], col1=[3..5], col2=[6..8], col3=[9..11]
     const wm = this.worldMat;
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -1868,7 +1907,7 @@ export class GEProcessor {
     const sy = ndcY * this.vpScaleY + this.vpCenterY - this.geOffsetY / 16.0;
     const sz = (ndcZ * this.vpScaleZ + this.vpCenterZ) / 65535.0;
 
-    return { sx, sy, sz, cw };
+    return { sx, sy, sz, cw, viewZ: vz };
   }
 
   /**
@@ -1929,7 +1968,7 @@ export class GEProcessor {
     const vert: Vertex = {
       x, y, z, u, v, color,
       nx: 0, ny: 0, nz: 1,
-      clipw: 1.0,
+      clipw: 1.0, fogCoef: 1.0,
     };
     this.immBuffer.push(vert);
 

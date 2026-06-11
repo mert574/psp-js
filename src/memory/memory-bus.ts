@@ -25,6 +25,9 @@ export class MemoryBus {
   private vramView:       DataView;
   private scratchpadView: DataView;
 
+  // Word-aligned RAM view for the CPU instruction-fetch fast path
+  private ramU32: Uint32Array;
+
   /** Debug: set to a physical address to log all writes to that address */
   watchWriteAddr: number = 0;
   /** Debug: callback invoked when watchWriteAddr is hit — receives (vaddr, value) */
@@ -42,6 +45,7 @@ export class MemoryBus {
     this.ramView        = new DataView(ramBuf);
     this.vramView       = new DataView(vramBuf);
     this.scratchpadView = new DataView(scratchpadBuf);
+    this.ramU32         = new Uint32Array(ramBuf);
   }
 
   static create(): MemoryBus {
@@ -65,6 +69,7 @@ export class MemoryBus {
     this.ramView        = new DataView(ramSab);
     this.vramView       = new DataView(vramSab);
     this.scratchpadView = new DataView(scratchpadSab);
+    this.ramU32         = new Uint32Array(ramSab);
     return { ramSab, vramSab, scratchpadSab };
   }
 
@@ -235,6 +240,13 @@ export class MemoryBus {
     if (MemoryBus.isKernelRom(addr)) return 0;
 
     return 0; // unmapped — return 0 like real hardware
+  }
+
+  /** CPU instruction-fetch fast path: word-aligned read from RAM.
+   *  `phys` MUST be a physical address already validated to be inside RAM
+   *  (the CPU's step() does this as part of its bad-PC check). */
+  fetchRamU32(phys: number): number {
+    return this.ramU32[(phys - MemoryRegion.RAM_START) >>> 2]!;
   }
 
   readU32(vaddr: number): number {

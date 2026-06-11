@@ -7,15 +7,20 @@
  * pixel coordinates to clip space.
  */
 
+// 10 floats per vertex: x, y, z, u, v, r, g, b, a, fogCoef
+export const FLOATS_PER_VERT = 10;
+
 export const VS_GE = `
 attribute vec3 a_position;
 attribute vec2 a_texcoord;
 attribute vec4 a_color;
+attribute float a_fogCoef;
 
 uniform vec2 u_resolution;
 
 varying vec2 v_texcoord;
 varying vec4 v_color;
+varying float v_fogCoef;
 
 void main() {
   // Screen pixels → clip space: x [0,W]→[-1,1], y [0,H]→[1,-1] (PSP Y-down)
@@ -26,6 +31,7 @@ void main() {
   gl_Position = vec4(ndc, z, 1.0);
   v_texcoord = a_texcoord;
   v_color = a_color;
+  v_fogCoef = a_fogCoef;
 }
 `;
 
@@ -34,6 +40,7 @@ precision mediump float;
 
 varying vec2 v_texcoord;
 varying vec4 v_color;
+varying float v_fogCoef;
 
 uniform sampler2D u_texture;
 uniform bool u_texEnable;
@@ -45,6 +52,23 @@ uniform bool u_alphaTestEnable;
 uniform int u_alphaTestFunc;  // 0=never,1=always,2=eq,3=neq,4=lt,5=le,6=gt,7=ge
 uniform float u_alphaTestRef; // 0-255 range
 
+// Color doubling — PPSSPP FragmentShaderGenerator.cpp:833-834
+uniform bool u_colorDoubling;
+
+// Fog — PPSSPP FragmentShaderGenerator.cpp:854-860
+uniform bool u_fogEnable;
+uniform vec3 u_fogColor;
+
+// Color test — PPSSPP FragmentShaderGenerator.cpp:860-875
+uniform bool u_colorTestEnable;
+uniform int u_colorTestFunc;   // 0=never,1=always,2=equal,3=notequal
+uniform vec3 u_colorTestRef;   // 0-255 range per channel
+uniform vec3 u_colorTestMask;  // 0-255 range per channel
+
+// Stencil-to-alpha — PPSSPP FragmentShaderGenerator.cpp:883-930
+uniform bool u_stencilReplace;
+uniform float u_stencilReplaceValue; // 0-1 range
+
 void main() {
   vec4 prim = v_color;
   vec4 result;
@@ -53,28 +77,39 @@ void main() {
     vec4 tex = texture2D(u_texture, v_texcoord);
 
     if (u_texFunc == 0) {
-      // MODULATE
+      // MODULATE — PPSSPP FragmentShaderGenerator.cpp:793
       result = vec4(prim.rgb * tex.rgb, u_texFuncAlpha ? prim.a * tex.a : prim.a);
     } else if (u_texFunc == 1) {
-      // DECAL
+      // DECAL — PPSSPP FragmentShaderGenerator.cpp:796
       result = vec4(mix(prim.rgb, tex.rgb, tex.a), prim.a);
     } else if (u_texFunc == 2) {
-      // BLEND
+      // BLEND — PPSSPP FragmentShaderGenerator.cpp:799
       result = vec4(mix(prim.rgb, u_texEnvColor, tex.rgb),
                     u_texFuncAlpha ? prim.a * tex.a : prim.a);
     } else if (u_texFunc == 3) {
-      // REPLACE
+      // REPLACE — PPSSPP FragmentShaderGenerator.cpp:802
       result = vec4(tex.rgb, u_texFuncAlpha ? tex.a : prim.a);
     } else {
-      // ADD
+      // ADD — PPSSPP FragmentShaderGenerator.cpp:811
       result = vec4(clamp(prim.rgb + tex.rgb, 0.0, 1.0),
                     u_texFuncAlpha ? prim.a * tex.a : prim.a);
+    }
+
+    // Color doubling — PPSSPP FragmentShaderGenerator.cpp:833-834
+    if (u_colorDoubling) {
+      result.rgb = clamp(result.rgb * 2.0, 0.0, 1.0);
     }
   } else {
     result = prim;
   }
 
-  // Alpha test (no native WebGL1 alpha test)
+  // Fog — PPSSPP FragmentShaderGenerator.cpp:841-843
+  // fogCoef is pre-computed per vertex: clamp((viewZ + fogEnd) * fogSlope, 0, 1)
+  if (u_fogEnable) {
+    result.rgb = mix(u_fogColor, result.rgb, v_fogCoef);
+  }
+
+  // Alpha test FIRST — PPSSPP FragmentShaderGenerator.cpp:859-896
   if (u_alphaTestEnable) {
     float a = floor(result.a * 255.0 + 0.5);
     float ref = u_alphaTestRef;
@@ -88,6 +123,25 @@ void main() {
     else if (u_alphaTestFunc == 6) pass = (a > ref);      // GREATER
     else                           pass = (a >= ref);     // GEQUAL
     if (!pass) discard;
+  }
+
+  // Color test SECOND — PPSSPP FragmentShaderGenerator.cpp:898-936
+  // WebGL1 lacks bitwise ops, use floor-based integer comparison
+  if (u_colorTestEnable) {
+    vec3 pixRgb = floor(result.rgb * 255.0 + 0.5);
+    vec3 maskedPix = floor(pixRgb * u_colorTestMask / 255.0);
+    vec3 maskedRef = floor(u_colorTestRef * u_colorTestMask / 255.0);
+    bool colorPass;
+    if (u_colorTestFunc == 0) colorPass = false;       // NEVER
+    else if (u_colorTestFunc == 1) colorPass = true;   // ALWAYS
+    else if (u_colorTestFunc == 2) colorPass = (maskedPix == maskedRef); // EQUAL
+    else colorPass = (maskedPix != maskedRef);          // NOTEQUAL
+    if (!colorPass) discard;
+  }
+
+  // Stencil-to-alpha — PPSSPP FragmentShaderGenerator.cpp:883-930
+  if (u_stencilReplace) {
+    result.a = u_stencilReplaceValue;
   }
 
   gl_FragColor = result;

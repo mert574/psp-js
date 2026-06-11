@@ -211,6 +211,7 @@ function evalSample(
       (clamp255(ca) << 24) | (clamp255(cb) << 16) | (clamp255(cg) << 8) | clamp255(cr)
     ) >>> 0,
     clipw: 1.0,
+    fogCoef: 1.0,
   };
 }
 

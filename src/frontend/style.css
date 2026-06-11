@@ -357,7 +357,7 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
 .perf-bar__group { display: flex; gap: 2px; }
 
 .gameplay-primary {
-  --psp-scale: 2;
+  --psp-scale: 1;
 }
 
 .perf-bar,

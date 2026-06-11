@@ -14,7 +14,7 @@ import type { Vertex } from "./ge-types.js";
 import type { GEFragmentState } from "./ge-fragment.js";
 import type { GETextureState } from "./ge-texture.js";
 import { decodeTexture } from "./ge-texture-upload.js";
-import { VS_GE, FS_GE, VS_PRESENT, FS_PRESENT } from "./ge-shaders.js";
+import { VS_GE, FS_GE, VS_PRESENT, FS_PRESENT, FLOATS_PER_VERT } from "./ge-shaders.js";
 import { Logger } from "../utils/logger.js";
 
 const log = Logger.get("GE-GL");
@@ -24,9 +24,6 @@ const PSP_HEIGHT = 272;
 
 // Max vertices per batch before flush
 const MAX_VERTS = 65536;
-
-// 9 floats per vertex: x, y, z, u, v, r, g, b, a
-const FLOATS_PER_VERT = 9;
 
 /** Snapshot of GE state needed for a draw call. */
 export interface GEDrawState {
@@ -50,6 +47,15 @@ export interface GEDrawState {
   scissorY1: number;
   scissorX2: number;
   scissorY2: number;
+  // Fog — PPSSPP FragmentShaderGenerator.cpp:854-860
+  fogEnable: boolean;
+  fogColor: number;   // 24-bit BGR
+  fogEnd: number;     // float
+  fogSlope: number;   // float 1/(end-start)
+  // Color doubling — PPSSPP GPUState.h:301
+  colorDoubling: boolean;
+  // Flat shading — PPSSPP SoftwareTransformCommon.cpp:701-712
+  shadeMode: number;  // 0=flat, 1=gouraud
 }
 
 /** Cache key for textures — identifies unique texture configurations. */
@@ -108,24 +114,25 @@ function mapDepthFunc(gl: WebGLRenderingContext, func: number): number {
   }
 }
 
-/** Check if two 24-bit colors are close enough to unify (PPSSPP GPUStateUtils.cpp). */
+/** Check if two 24-bit colors are close enough to unify.
+ *  PPSSPP GPUStateUtils.cpp:912 — default margin is ~25 (0.1 * 255). */
 function colorsClose(refColor: number, a: number, b: number): boolean {
-  // Allow a small tolerance per channel (like PPSSPP does)
   void refColor;
   for (let i = 0; i < 3; i++) {
     const ca = (a >>> (i * 8)) & 0xFF;
     const cb = (b >>> (i * 8)) & 0xFF;
-    if (Math.abs(ca - cb) > 4) return false;
+    if (Math.abs(ca - cb) > 25) return false;
   }
   return true;
 }
 
-/** Approximate a 24-bit fixed color as a standard GL blend factor (PPSSPP blendColor2Func). */
+/** Approximate a 24-bit fixed color as a standard GL blend factor.
+ *  PPSSPP GPUStateUtils.cpp:900-902 — thresholds ~0.01 and ~0.99 normalized. */
 function blendColor2Func(gl: WebGLRenderingContext, color: number): number {
   const r = color & 0xFF, g = (color >>> 8) & 0xFF, b = (color >>> 16) & 0xFF;
-  if (r < 4 && g < 4 && b < 4) return gl.ZERO;
-  if (r > 251 && g > 251 && b > 251) return gl.ONE;
-  return gl.CONSTANT_COLOR; // fallback: use blendColor (set to other fixColor)
+  if (r <= 2 && g <= 2 && b <= 2) return gl.ZERO;
+  if (r >= 253 && g >= 253 && b >= 253) return gl.ONE;
+  return gl.CONSTANT_COLOR;
 }
 
 /** Map PSP stencil function (GEComparison) to WebGL. */
@@ -152,10 +159,34 @@ export class WebGLGERenderer {
   private presentProgram: twgl.ProgramInfo;
   private presentBuffer: twgl.BufferInfo;
 
-  // Offscreen FBO for GE rendering
-  private fbo: WebGLFramebuffer;
-  private fboTex: WebGLTexture;
-  private depthRb: WebGLRenderbuffer;
+  // Virtual framebuffers — PPSSPP FramebufferManagerCommon.h VirtualFramebuffer
+  // One FBO per unique normalized PSP framebuffer address.
+  private vfbs = new Map<number, {
+    fbo: WebGLFramebuffer;
+    tex: WebGLTexture;
+    depthRb: WebGLRenderbuffer;
+    lastFrameUsed: number;
+  }>();
+  private frameCount = 0;
+  private currentRenderAddr = 0; // currently bound VFB address
+
+  // Display buffer tracking — PPSSPP FramebufferManagerCommon.h:displayFramebuf_
+  private displayFbAddr = 0;
+  private displayFbWidth = 512;
+  private displayFbFormat = 3;
+
+  // Fallback texture for presenting RAM/VRAM bytes when no VFB exists
+  // PPSSPP FramebufferManagerCommon.cpp DrawFramebufferToOutput
+  private vramFallbackTex: WebGLTexture | null = null;
+  private vramRef: Uint8Array | null = null;
+
+  // Debug info
+  _dbgDisplayPath = "none";
+  _dbgBlitCount = 0;
+  _dbgReadbackCount = 0;
+  private _dbgClearLog = 0;
+  get dbgVFBCount(): number { return this.vfbs.size; }
+  get dbgVFBKeys(): string { return [...this.vfbs.keys()].map(k => `0x${k.toString(16)}`).join(","); }
 
   // Dynamic vertex buffer
   private vertexData = new Float32Array(MAX_VERTS * FLOATS_PER_VERT);
@@ -199,39 +230,8 @@ export class WebGLGERenderer {
       indices: [0, 1, 2, 2, 1, 3],
     });
 
-    // Create offscreen FBO (512x272 to match PSP stride)
-    const fbo = gl.createFramebuffer()!;
-    this.fbo = fbo;
-
-    const fboTex = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, fboTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 512, PSP_HEIGHT, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    this.fboTex = fboTex;
-
-    const depthRb = gl.createRenderbuffer()!;
-    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRb);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_STENCIL, 512, PSP_HEIGHT);
-    this.depthRb = depthRb;
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTex, 0);
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, depthRb);
-
-    const fbStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    if (fbStatus !== gl.FRAMEBUFFER_COMPLETE) {
-      log.error(`FBO incomplete: 0x${fbStatus.toString(16)}`);
-    }
-
-    // Clear FBO to black
-    gl.viewport(0, 0, 512, PSP_HEIGHT);
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    // VFBs are created lazily per unique PSP framebuffer address.
+    // PPSSPP FramebufferManagerCommon.cpp DoSetRenderFrameBuffer.
 
     // Dynamic vertex buffer
     this.glBuffer = gl.createBuffer()!;
@@ -259,12 +259,13 @@ export class WebGLGERenderer {
   ): void {
     const gl = this.gl;
 
-    // Bind FBO
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+    // Bind the VFB for this draw's framebuffer address
+    this.bindRenderTarget(state.fbPtr);
     gl.viewport(0, 0, 512, PSP_HEIGHT);
 
-    // Set up UV normalization for this draw call
+    // Set up per-draw-call state
     this.setupUVNormalization(state);
+    this.flatColor = -1; // default gouraud
 
     // Apply GE state
     this.applyBlendState(gl, state.fragState);
@@ -282,22 +283,26 @@ export class WebGLGERenderer {
 
     // Build vertex data
     this.vertexCount = 0;
+    const flat = state.shadeMode === 0; // PPSSPP SoftwareTransformCommon.cpp:701-712
 
     if (primType === 6) {
-      // SPRITES: expand each pair to 2 triangles
+      // SPRITES: expand each pair to 2 triangles (sprites always use v1 color)
       for (let i = 0; i + 1 < vertices.length; i += 2) {
         this.expandSprite(vertices[i]!, vertices[i + 1]!);
       }
     } else if (primType === 3) {
-      // TRIANGLES
+      // TRIANGLES — provoking vertex = last (index 2) per PPSSPP
       for (let i = 0; i + 2 < vertices.length; i += 3) {
+        if (flat) this.flatColor = vertices[i + 2]!.color;
         this.pushVertex(vertices[i]!);
         this.pushVertex(vertices[i + 1]!);
         this.pushVertex(vertices[i + 2]!);
+        this.flatColor = -1;
       }
     } else if (primType === 4) {
-      // TRIANGLE_STRIP → expand to individual triangles
+      // TRIANGLE_STRIP — provoking vertex = last (index i+2) per PPSSPP
       for (let i = 0; i + 2 < vertices.length; i++) {
+        if (flat) this.flatColor = vertices[i + 2]!.color;
         if (i & 1) {
           this.pushVertex(vertices[i + 1]!);
           this.pushVertex(vertices[i]!);
@@ -307,25 +312,32 @@ export class WebGLGERenderer {
           this.pushVertex(vertices[i + 1]!);
           this.pushVertex(vertices[i + 2]!);
         }
+        this.flatColor = -1;
       }
     } else if (primType === 5) {
-      // TRIANGLE_FAN
+      // TRIANGLE_FAN — provoking vertex = last (index i+1) per PPSSPP
       for (let i = 1; i + 1 < vertices.length; i++) {
+        if (flat) this.flatColor = vertices[i + 1]!.color;
         this.pushVertex(vertices[0]!);
         this.pushVertex(vertices[i]!);
         this.pushVertex(vertices[i + 1]!);
+        this.flatColor = -1;
       }
     } else if (primType === 1) {
-      // LINES
+      // LINES — provoking vertex = last (index i+1)
       for (let i = 0; i + 1 < vertices.length; i += 2) {
+        if (flat) this.flatColor = vertices[i + 1]!.color;
         this.pushVertex(vertices[i]!);
         this.pushVertex(vertices[i + 1]!);
+        this.flatColor = -1;
       }
     } else if (primType === 2) {
       // LINE_STRIP
       for (let i = 0; i + 1 < vertices.length; i++) {
+        if (flat) this.flatColor = vertices[i + 1]!.color;
         this.pushVertex(vertices[i]!);
         this.pushVertex(vertices[i + 1]!);
+        this.flatColor = -1;
       }
     } else if (primType === 0) {
       // POINTS
@@ -344,11 +356,12 @@ export class WebGLGERenderer {
     // Set up shader
     gl.useProgram(this.geProgram.program);
 
-    // Bind attributes manually (interleaved buffer)
-    const stride = FLOATS_PER_VERT * 4;
+    // Bind attributes manually (interleaved buffer: x,y,z, u,v, r,g,b,a, fogCoef)
+    const stride = FLOATS_PER_VERT * 4; // 10 floats * 4 bytes = 40 bytes
     const posLoc = gl.getAttribLocation(this.geProgram.program, "a_position");
     const uvLoc = gl.getAttribLocation(this.geProgram.program, "a_texcoord");
     const colLoc = gl.getAttribLocation(this.geProgram.program, "a_color");
+    const fogLoc = gl.getAttribLocation(this.geProgram.program, "a_fogCoef");
 
     gl.enableVertexAttribArray(posLoc);
     gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, stride, 0);
@@ -359,6 +372,10 @@ export class WebGLGERenderer {
     if (colLoc >= 0) {
       gl.enableVertexAttribArray(colLoc);
       gl.vertexAttribPointer(colLoc, 4, gl.FLOAT, false, stride, 20);
+    }
+    if (fogLoc >= 0) {
+      gl.enableVertexAttribArray(fogLoc);
+      gl.vertexAttribPointer(fogLoc, 1, gl.FLOAT, false, stride, 36);
     }
 
     // Bind texture to unit 0
@@ -386,6 +403,18 @@ export class WebGLGERenderer {
     const envG = ((frag.texEnvColor >>> 8) & 0xFF) / 255;
     const envB = ((frag.texEnvColor >>> 16) & 0xFF) / 255;
 
+    // Fog color — PPSSPP stores as BGR, convert to normalized RGB
+    const fogR = (state.fogColor & 0xFF) / 255;
+    const fogG = ((state.fogColor >>> 8) & 0xFF) / 255;
+    const fogB = ((state.fogColor >>> 16) & 0xFF) / 255;
+
+    // Color test ref/mask — convert from 24-bit integer to per-channel floats
+    const ctRef = frag.colorTestRef;
+    const ctMask = frag.colorTestMask;
+
+    // Stencil-to-alpha: when stencil op is REPLACE (2), output alpha = stencilRef
+    const stencilReplace = frag.stencilTestEnable && frag.stencilZPass === 2;
+
     twgl.setUniforms(this.geProgram, {
       u_resolution: [PSP_WIDTH, PSP_HEIGHT],
       u_texEnable: state.texEnable,
@@ -395,6 +424,15 @@ export class WebGLGERenderer {
       u_alphaTestEnable: frag.alphaTestEnable,
       u_alphaTestFunc: frag.alphaTestFunc,
       u_alphaTestRef: frag.alphaTestRef,
+      u_colorDoubling: state.colorDoubling,
+      u_fogEnable: state.fogEnable && !state.throughMode,
+      u_fogColor: [fogR, fogG, fogB],
+      u_colorTestEnable: frag.colorTestEnable,
+      u_colorTestFunc: frag.colorTestFunc,
+      u_colorTestRef: [ctRef & 0xFF, (ctRef >>> 8) & 0xFF, (ctRef >>> 16) & 0xFF],
+      u_colorTestMask: [ctMask & 0xFF, (ctMask >>> 8) & 0xFF, (ctMask >>> 16) & 0xFF],
+      u_stencilReplace: stencilReplace,
+      u_stencilReplaceValue: frag.stencilRef / 255,
     });
 
     // Draw
@@ -410,6 +448,7 @@ export class WebGLGERenderer {
     gl.drawArrays(glPrimType, 0, this.vertexCount);
 
     // Clean up
+    if (fogLoc >= 0) gl.disableVertexAttribArray(fogLoc);
     if (uvLoc >= 0) gl.disableVertexAttribArray(uvLoc);
     if (colLoc >= 0) gl.disableVertexAttribArray(colLoc);
     gl.disableVertexAttribArray(posLoc);
@@ -422,9 +461,15 @@ export class WebGLGERenderer {
     x0: number, y0: number, x1: number, y1: number,
     r: number, g: number, b: number, a: number,
     colorWrite: boolean, alphaWrite: boolean, depthWrite: boolean,
+    fbPtr = 0,
   ): void {
     const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+    const normAddr = this.normFb(fbPtr);
+    if (this._dbgClearLog < 5) {
+      this._dbgClearLog++;
+      console.log(`[VFB] Clear 0x${normAddr.toString(16)} rgba(${r},${g},${b},${a})`);
+    }
+    this.bindRenderTarget(fbPtr);
     gl.viewport(0, 0, 512, PSP_HEIGHT);
 
     // Use scissor to limit the clear to the requested rectangle
@@ -485,46 +530,52 @@ export class WebGLGERenderer {
     gl.useProgram(this.presentProgram.program);
     twgl.setBuffersAndAttributes(gl, this.presentProgram, this.presentBuffer);
 
+    // PPSSPP PrepareCopyDisplayToOutput: find VFB at display address.
+    // If found, present FBO texture. If not, fall back to VRAM bytes.
+    const displayAddr = this.displayFbAddr;
+    const displayVfb = displayAddr ? this.vfbs.get(displayAddr) : null;
+    this._dbgDisplayPath = displayVfb ? "vfb" : (displayAddr && this.vramRef ? "vram" : "none");
+
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.fboTex);
     const presTexLoc = gl.getUniformLocation(this.presentProgram.program, "u_texture");
-    gl.uniform1i(presTexLoc, 0);
 
-    twgl.drawBufferInfo(gl, this.presentBuffer);
+    if (displayVfb) {
+      gl.bindTexture(gl.TEXTURE_2D, displayVfb.tex);
+    } else if (displayAddr && this.vramRef) {
+      // No VFB — game uses block transfers to compose the display buffer in VRAM.
+      // Upload VRAM bytes as a texture (like the old FramebufferRenderer).
+      const vram = this.vramRef;
+      const offset = displayAddr - 0x04000000;
+      const stride = this.displayFbWidth;
+      if (offset < 0 || offset + stride * PSP_HEIGHT * 4 > vram.length) return;
 
-  }
-
-  /**
-   * Read back the FBO contents into a VRAM buffer.
-   * Only needed when CPU code reads from the framebuffer region.
-   */
-  readbackToVRAM(vram: Uint8Array, fbPtr: number, fbWidth: number, _fbFormat: number): void {
-    const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
-
-    const buf = new Uint8Array(fbWidth * PSP_HEIGHT * 4);
-    gl.readPixels(0, 0, fbWidth, PSP_HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, buf);
-
-    // Convert RGBA → ABGR8888 and write to VRAM (flip Y since WebGL is bottom-up)
-    const phys = (fbPtr & 0x1FFFFFFF) - 0x04000000;
-    if (phys < 0) return;
-
-    for (let y = 0; y < PSP_HEIGHT; y++) {
-      const srcY = PSP_HEIGHT - 1 - y; // flip
-      for (let x = 0; x < fbWidth; x++) {
-        const si = (srcY * fbWidth + x) * 4;
-        const di = phys + (y * fbWidth + x) * 4;
-        if (di + 3 >= vram.length) continue;
-        // RGBA → ABGR: vram stores as [R, G, B, A] in little-endian ABGR format
-        vram[di]     = buf[si]!;     // R
-        vram[di + 1] = buf[si + 1]!; // G
-        vram[di + 2] = buf[si + 2]!; // B
-        vram[di + 3] = buf[si + 3]!; // A
+      if (!this.vramFallbackTex) {
+        this.vramFallbackTex = gl.createTexture()!;
+        gl.bindTexture(gl.TEXTURE_2D, this.vramFallbackTex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, stride, PSP_HEIGHT, 0,
+          gl.RGBA, gl.UNSIGNED_BYTE, null);
+      } else {
+        gl.bindTexture(gl.TEXTURE_2D, this.vramFallbackTex);
       }
+      // Flip Y: VRAM is PSP-order (row 0 = top), WebGL texture is bottom-up
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, stride, PSP_HEIGHT,
+        gl.RGBA, gl.UNSIGNED_BYTE,
+        new Uint8Array(vram.buffer, vram.byteOffset + offset, stride * PSP_HEIGHT * 4));
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+    } else {
+      return; // nothing to present
     }
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.uniform1i(presTexLoc, 0);
+    twgl.drawBufferInfo(gl, this.presentBuffer);
   }
+
+
 
   /** Invalidate all cached textures (e.g., after block transfer to VRAM).
    *  PPSSPP uses hash-based invalidation with backoff; we invalidate per-frame for correctness.
@@ -537,10 +588,154 @@ export class WebGLGERenderer {
     this.texCache.clear();
   }
 
-  /** Call at the start of each frame to invalidate textures that may have changed.
-   *  PPSSPP would hash texture data; we use a simpler per-frame flush. */
+  /** Called at frame start. Textures are only invalidated on block transfers now,
+   *  not per-frame — PPSSPP uses hash-based invalidation, not per-frame flush. */
   onFrameStart(): void {
-    this.invalidateTextures();
+    this.frameCount++;
+    this.decimateVFBs(); // PPSSPP BeginFrame → DecimateFBOs
+  }
+
+  /** Normalize a PSP framebuffer address to an absolute VRAM address.
+   *  GE uses VRAM-relative (0x0=VRAM base), sceDisplay uses absolute (0x04000000). */
+  private normFb(addr: number): number {
+    const p = addr & 0x1FFFFFFF;
+    return p < 0x04000000 ? 0x04000000 + p : p;
+  }
+
+  /** Get or create a VFB for the given address. PPSSPP DoSetRenderFrameBuffer. */
+  private getOrCreateVFB(addr: number): { fbo: WebGLFramebuffer; tex: WebGLTexture; depthRb: WebGLRenderbuffer; lastFrameUsed: number } {
+    const key = this.normFb(addr);
+    const existing = this.vfbs.get(key);
+    if (existing) { existing.lastFrameUsed = this.frameCount; return existing; }
+
+    const gl = this.gl;
+    const fbo = gl.createFramebuffer()!;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 512, PSP_HEIGHT, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const depthRb = gl.createRenderbuffer()!;
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_STENCIL, 512, PSP_HEIGHT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, depthRb);
+    gl.viewport(0, 0, 512, PSP_HEIGHT);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    const vfb = { fbo, tex, depthRb, lastFrameUsed: this.frameCount };
+    this.vfbs.set(key, vfb);
+    return vfb;
+  }
+
+  /** Bind the VFB for the given address as the render target. */
+  private bindRenderTarget(addr: number): void {
+    const key = this.normFb(addr);
+    if (key === this.currentRenderAddr) return;
+    const vfb = this.getOrCreateVFB(addr);
+    this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, vfb.fbo);
+    this.currentRenderAddr = key;
+  }
+
+  /** Find VFB at address, or null. PPSSPP GetVFBAt. */
+  getVFBAt(addr: number): { fbo: WebGLFramebuffer; tex: WebGLTexture } | null {
+    return this.vfbs.get(this.normFb(addr)) ?? null;
+  }
+
+  /** Read FBO pixels back to VRAM. PPSSPP ReadFramebufferToMemory. */
+  readbackToVRAM(vram: Uint8Array, addr: number, stride: number): void {
+    const key = this.normFb(addr);
+    const vfb = this.vfbs.get(key);
+    if (!vfb) return;
+    this._dbgReadbackCount++;
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, vfb.fbo);
+    const buf = new Uint8Array(stride * PSP_HEIGHT * 4);
+    gl.readPixels(0, 0, stride, PSP_HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const phys = key - 0x04000000;
+    if (phys < 0) return;
+    for (let y = 0; y < PSP_HEIGHT; y++) {
+      const srcY = PSP_HEIGHT - 1 - y;
+      for (let x = 0; x < stride; x++) {
+        const si = (srcY * stride + x) * 4;
+        const di = phys + (y * stride + x) * 4;
+        if (di + 3 >= vram.length) continue;
+        vram[di] = buf[si]!; vram[di+1] = buf[si+1]!;
+        vram[di+2] = buf[si+2]!; vram[di+3] = buf[si+3]!;
+      }
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /** Clean up old VFBs not used for 5+ frames. PPSSPP DecimateFBOs. */
+  decimateVFBs(): void {
+    const gl = this.gl;
+    for (const [key, vfb] of this.vfbs) {
+      if (key === this.displayFbAddr) continue; // protect display buffer
+      if (this.frameCount - vfb.lastFrameUsed > 5) {
+        gl.deleteFramebuffer(vfb.fbo);
+        gl.deleteTexture(vfb.tex);
+        gl.deleteRenderbuffer(vfb.depthRb);
+        this.vfbs.delete(key);
+      }
+    }
+  }
+
+  /** GPU blit from one VFB to another. PPSSPP BlitFramebuffer.
+   *  Used for block transfers where both src and dst are VFBs — no CPU roundtrip needed. */
+  blitVFB(srcAddr: number, dstAddr: number): boolean {
+    const srcKey = this.normFb(srcAddr);
+    const dstKey = this.normFb(dstAddr);
+    const srcVfb = this.vfbs.get(srcKey);
+    const dstVfb = this.vfbs.get(dstKey);
+    if (!srcVfb || !dstVfb || srcKey === dstKey) return false;
+    this._dbgBlitCount++;
+    if (this._dbgBlitCount <= 3) {
+      console.log(`[VFB] Blit 0x${srcKey.toString(16)} → 0x${dstKey.toString(16)}`);
+    }
+
+    const gl = this.gl;
+    // Draw source FBO texture into destination FBO as a fullscreen quad
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dstVfb.fbo);
+    gl.viewport(0, 0, 512, PSP_HEIGHT);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.disable(gl.STENCIL_TEST);
+    gl.colorMask(true, true, true, true);
+
+    gl.useProgram(this.presentProgram.program);
+    twgl.setBuffersAndAttributes(gl, this.presentProgram, this.presentBuffer);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, srcVfb.tex);
+    const loc = gl.getUniformLocation(this.presentProgram.program, "u_texture");
+    gl.uniform1i(loc, 0);
+    twgl.drawBufferInfo(gl, this.presentBuffer);
+
+    // Reset state tracking
+    this.currentBlendEnabled = false;
+    this.currentDepthEnabled = false;
+    this.currentScissorEnabled = false;
+    this.currentCullEnabled = false;
+    this.currentStencilEnabled = false;
+    this.currentRenderAddr = dstKey;
+
+    return true;
+  }
+
+  setVRAM(vram: Uint8Array): void { this.vramRef = vram; }
+
+  /** Set display buffer. PPSSPP displayFramebufPtr_. */
+  setDisplayFramebuf(addr: number, width = 512, format = 3): void {
+    this.displayFbAddr = this.normFb(addr);
+    this.displayFbWidth = width || 512;
+    this.displayFbFormat = format;
   }
 
   /** Get the WebGL context (shared with FramebufferRenderer if needed). */
@@ -550,9 +745,13 @@ export class WebGLGERenderer {
 
   destroy(): void {
     const gl = this.gl;
-    gl.deleteFramebuffer(this.fbo);
-    gl.deleteTexture(this.fboTex);
-    gl.deleteRenderbuffer(this.depthRb);
+    for (const vfb of this.vfbs.values()) {
+      gl.deleteFramebuffer(vfb.fbo);
+      gl.deleteTexture(vfb.tex);
+      gl.deleteRenderbuffer(vfb.depthRb);
+    }
+    this.vfbs.clear();
+    if (this.vramFallbackTex) gl.deleteTexture(this.vramFallbackTex);
     gl.deleteBuffer(this.glBuffer);
     gl.deleteTexture(this.dummyTex);
     for (const tex of this.texCache.values()) {
@@ -563,11 +762,12 @@ export class WebGLGERenderer {
 
   // ── Private helpers ──────────────────────────────────────────────────────
 
-  // UV normalization state (set per draw call)
+  // Per-draw-call state
   private uvScaleU = 1;
   private uvScaleV = 1;
   private uvOffsetU = 0;
   private uvOffsetV = 0;
+  private flatColor = -1;       // -1 = gouraud (use vertex color); >= 0 = flat shading color
 
   /** Configure UV normalization for the current draw call. */
   private setupUVNormalization(state: GEDrawState): void {
@@ -620,11 +820,14 @@ export class WebGLGERenderer {
     d[base + 4] = v.v * this.uvScaleV + this.uvOffsetV;
 
     // Unpack ABGR8888 vertex color to normalized RGBA floats
-    const c = v.color;
+    const c = this.flatColor >= 0 ? this.flatColor : v.color;
     d[base + 5] = (c & 0xFF) / 255;              // R
     d[base + 6] = ((c >>> 8) & 0xFF) / 255;      // G
     d[base + 7] = ((c >>> 16) & 0xFF) / 255;     // B
     d[base + 8] = ((c >>> 24) & 0xFF) / 255;     // A
+
+    // Fog coefficient (pre-computed per vertex, 1.0 = no fog, 0.0 = full fog)
+    d[base + 9] = v.fogCoef;
 
     this.vertexCount++;
   }
@@ -640,13 +843,13 @@ export class WebGLGERenderer {
     const z = v1.z;
 
     // Bottom-right corner = v1 as-is
-    const br: Vertex = { x: v1.x, y: v1.y, z, u: v1.u, v: v1.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1 };
+    const br: Vertex = { x: v1.x, y: v1.y, z, u: v1.u, v: v1.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1, fogCoef: 1 };
     // Top-right: v1's X, v0's Y; v1's U, v0's V
-    const tr: Vertex = { x: v1.x, y: v0.y, z, u: v1.u, v: v0.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1 };
+    const tr: Vertex = { x: v1.x, y: v0.y, z, u: v1.u, v: v0.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1, fogCoef: 1 };
     // Top-left: v0's X and Y; v0's U and V
-    const tl: Vertex = { x: v0.x, y: v0.y, z, u: v0.u, v: v0.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1 };
+    const tl: Vertex = { x: v0.x, y: v0.y, z, u: v0.u, v: v0.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1, fogCoef: 1 };
     // Bottom-left: v0's X, v1's Y; v0's U, v1's V
-    const bl: Vertex = { x: v0.x, y: v1.y, z, u: v0.u, v: v1.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1 };
+    const bl: Vertex = { x: v0.x, y: v1.y, z, u: v0.u, v: v1.v, color: col, nx: 0, ny: 0, nz: 1, clipw: 1, fogCoef: 1 };
 
     // Two triangles: BR-TR-TL, TL-BL-BR (matching PPSSPP's index order)
     this.pushVertex(br);
@@ -658,6 +861,15 @@ export class WebGLGERenderer {
   }
 
   private getOrUploadTexture(texState: GETextureState, bus: MemoryBus): WebGLTexture {
+    // Framebuffer-as-texture: if texture address matches a known VFB, use it directly.
+    // Can't use it if it's the CURRENT render target (would read while writing).
+    // PPSSPP TextureCacheCommon.cpp:629 — GetBestFramebufferCandidate.
+    const texAddrNorm = this.normFb(texState.texAddr0);
+    const texVfb = this.vfbs.get(texAddrNorm);
+    if (texVfb && texAddrNorm !== this.currentRenderAddr) {
+      return texVfb.tex;
+    }
+
     const key = texCacheKey(texState);
     const cached = this.texCache.get(key);
     if (cached) return cached;

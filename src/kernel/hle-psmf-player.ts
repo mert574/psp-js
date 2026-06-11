@@ -219,6 +219,7 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
       return;
     }
 
+    log.info(`Starting video decode: "${filename}" (${(data.byteLength / 1024).toFixed(0)} KB)`);
     loadPsmf(player, data);
     regs.setGpr(2, 0);
   }

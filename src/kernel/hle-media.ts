@@ -128,11 +128,16 @@ export function registerMediaHLE(kernel: HLEKernel): void {
 
   // ── sceRtc ───────────────────────────────────────────────────────────────
 
+  /** Get emulated microseconds from CoreTiming, or 0 if CoreTiming unavailable. */
+  function getEmulatedUsRtc(): number {
+    const ct = kernel.coreTiming;
+    return ct ? ct.cyclesToUs(ct.getTicks()) : 0;
+  }
+
   // sceRtcGetCurrentTick(tick_ptr)
   kernel.register(RTC.sceRtcGetCurrentTick, (regs) => {
     const ptr = regs.getGpr(4);
-    const ct = kernel.coreTiming!;
-    const us = BigInt(ct.cyclesToUs(ct.getTicks()));
+    const us = BigInt(getEmulatedUsRtc());
     kernel.bus.writeU32(ptr, Number(us & 0xFFFFFFFFn));
     kernel.bus.writeU32(ptr + 4, Number((us >> 32n) & 0xFFFFFFFFn));
     regs.setGpr(2, 0);
@@ -164,8 +169,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   kernel.register(RTC.sceRtcGetCurrentClock, (regs, bus) => {
     const ptr = regs.getGpr(4);
     const tz = regs.getGpr(5) | 0; // timezone offset in minutes
-    const ct = kernel.coreTiming!;
-    const emulatedUs = ct.cyclesToUs(ct.getTicks());
+    const emulatedUs = getEmulatedUsRtc();
     const baseMs = Date.now();
     const d = new Date(baseMs + tz * 60000);
     if (ptr >= 0x08000000 && ptr < 0x0C000000) {
@@ -177,8 +181,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // sceRtcGetCurrentClockLocalTime(pspTimePtr) — PPSSPP sceRtc.cpp:324
   kernel.register(RTC.sceRtcGetCurrentClockLocalTime, (regs, bus) => {
     const ptr = regs.getGpr(4);
-    const ct = kernel.coreTiming!;
-    const emulatedUs = ct.cyclesToUs(ct.getTicks());
+    const emulatedUs = getEmulatedUsRtc();
     const d = new Date(); // local time
     if (ptr >= 0x08000000 && ptr < 0x0C000000) {
       writeU16LE(bus, ptr + 0, d.getFullYear());

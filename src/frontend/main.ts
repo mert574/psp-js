@@ -240,6 +240,7 @@ bootBtn.addEventListener("click", () => {
     // Attach WebGL renderer to the GE processor for GPU-accelerated rendering
     if (geRenderer) {
       emulator!.hle.ensureGeProcessor().webglRenderer = geRenderer;
+      geRenderer.setVRAM(emulator!.bus.vramBuffer);
     }
 
     startRafLoop();
@@ -380,6 +381,7 @@ function runOneFrame(): void {
 
   // Present: WebGL GE renderer → screen (GPU-accelerated path)
   if (geRenderer) {
+    geRenderer.setDisplayFramebuf(fbAddr, hle.framebufWidth, hle.framebufFormat);
     geRenderer.presentToScreen();
   } else if (fbAddr !== 0 && renderer) {
     // Fallback: upload VRAM bytes as texture

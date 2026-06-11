@@ -590,16 +590,226 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   kernel.stub(UTILITY.sceUtility_EF3582B2);
 
   // ── HEAP ──────────────────────────────────────────────────────────
-  kernel.stub(HEAP.sceHeapAllocHeapMemory, 1);
-  kernel.stub(HEAP.sceHeapAllocHeapMemoryWithOption, 1);
-  kernel.stub(HEAP.sceHeapCreateHeap, 1);
-  kernel.stub(HEAP.sceHeapDeleteHeap);
-  kernel.stub(HEAP.sceHeapFreeHeapMemory);
-  kernel.stub(HEAP.sceHeapGetMallinfo);
-  kernel.stub(HEAP.sceHeapGetTotalFreeSize);
-  kernel.stub(HEAP.sceHeapIsAllocatedHeapMemory, 1);
-  kernel.stub(HEAP.sceHeapReallocHeapMemory, 1);
-  kernel.stub(HEAP.sceHeapReallocHeapMemoryWithOption, 1);
+  // PPSSPP sceHeap.cpp — user-space heap allocator wrapping partition memory.
+  // Uses a simple block allocator: doubly-linked list of blocks sorted by address.
+
+  const SCE_KERNEL_ERROR_INVALID_ID      = 0x80000100 >>> 0;
+  const SCE_KERNEL_ERROR_INVALID_POINTER = 0x80000103 >>> 0;
+  const PSP_HEAP_ATTR_HIGHMEM = 0x4000;
+
+  interface HeapBlock { start: number; size: number; taken: boolean; }
+
+  interface HeapState {
+    address: number;     // base address (also the heap handle)
+    size: number;        // total allocated size
+    fromtop: boolean;
+    poolStart: number;   // address + 128
+    poolSize: number;    // size - 128
+    blocks: HeapBlock[]; // sorted by start address
+    memBlockId: number;  // kernel memBlock ID for cleanup
+  }
+
+  const heaps = new Map<number, HeapState>();
+
+  const HEAP_MIN_GRAIN = 4; // PPSSPP BlockAllocator constructed with grain=4
+
+  /** Allocate within a heap's block list. fromTop=true scans from high end. */
+  function heapAlloc(heap: HeapState, size: number, grain: number, fromTop: boolean): number {
+    if (size === 0 || size > heap.poolSize) return -1;
+    // Clamp grain to allocator minimum — PPSSPP AllocAligned lines 65-66
+    if (grain < HEAP_MIN_GRAIN) grain = HEAP_MIN_GRAIN;
+    // Align size up to grain
+    size = (size + grain - 1) & ~(grain - 1);
+
+    if (fromTop) {
+      // Scan from high to low
+      for (let i = heap.blocks.length - 1; i >= 0; i--) {
+        const b = heap.blocks[i]!;
+        if (b.taken || b.size < size) continue;
+        // Align allocation to end of block
+        const offset = (b.start + b.size - size) % grain;
+        const needed = offset + size;
+        if (b.size < needed) continue;
+        const allocStart = b.start + b.size - size; // aligned to end
+        // Split block
+        if (allocStart === b.start && b.size === size) {
+          b.taken = true;
+          return b.start;
+        }
+        // Free space before
+        const newBlocks: HeapBlock[] = [];
+        if (allocStart > b.start) {
+          newBlocks.push({ start: b.start, size: allocStart - b.start, taken: false });
+        }
+        newBlocks.push({ start: allocStart, size, taken: true });
+        // Free space after (shouldn't happen with fromTop alignment, but be safe)
+        const afterEnd = allocStart + size;
+        const blockEnd = b.start + b.size;
+        if (afterEnd < blockEnd) {
+          newBlocks.push({ start: afterEnd, size: blockEnd - afterEnd, taken: false });
+        }
+        heap.blocks.splice(i, 1, ...newBlocks);
+        return allocStart;
+      }
+    } else {
+      // Scan from low to high
+      for (let i = 0; i < heap.blocks.length; i++) {
+        const b = heap.blocks[i]!;
+        if (b.taken || b.size < size) continue;
+        // Align start up
+        const alignedStart = (b.start + grain - 1) & ~(grain - 1);
+        const needed = alignedStart - b.start + size;
+        if (b.size < needed) continue;
+        const newBlocks: HeapBlock[] = [];
+        if (alignedStart > b.start) {
+          newBlocks.push({ start: b.start, size: alignedStart - b.start, taken: false });
+        }
+        newBlocks.push({ start: alignedStart, size, taken: true });
+        const afterEnd = alignedStart + size;
+        const blockEnd = b.start + b.size;
+        if (afterEnd < blockEnd) {
+          newBlocks.push({ start: afterEnd, size: blockEnd - afterEnd, taken: false });
+        }
+        heap.blocks.splice(i, 1, ...newBlocks);
+        return alignedStart;
+      }
+    }
+    return -1;
+  }
+
+  /** Free an exact address. Returns true on success. */
+  function heapFreeExact(heap: HeapState, addr: number): boolean {
+    const idx = heap.blocks.findIndex(b => b.taken && b.start === addr);
+    if (idx === -1) return false;
+    heap.blocks[idx]!.taken = false;
+    // Merge adjacent free blocks
+    heapMergeFree(heap);
+    return true;
+  }
+
+  /** Merge adjacent free blocks in the list. */
+  function heapMergeFree(heap: HeapState): void {
+    for (let i = heap.blocks.length - 2; i >= 0; i--) {
+      const a = heap.blocks[i]!;
+      const b = heap.blocks[i + 1]!;
+      if (!a.taken && !b.taken) {
+        a.size = (b.start + b.size) - a.start;
+        heap.blocks.splice(i + 1, 1);
+      }
+    }
+  }
+
+  /** Get total free bytes in heap. */
+  function heapTotalFree(heap: HeapState): number {
+    let total = 0;
+    for (const b of heap.blocks) { if (!b.taken) total += b.size; }
+    return total;
+  }
+
+  // sceHeapCreateHeap(name, heapSize, attr, paramsPtr)
+  // PPSSPP sceHeap.cpp:179-204
+  kernel.register(HEAP.sceHeapCreateHeap, (regs, bus) => {
+    const namePtr  = regs.getGpr(4);
+    const heapSize = regs.getGpr(5);
+    const attr     = regs.getGpr(6);
+
+    if (namePtr === 0) { regs.setGpr(2, 0); return; }
+    let name = "";
+    for (let i = 0; i < 31; i++) { const b = bus.readU8(namePtr + i); if (b === 0) break; name += String.fromCharCode(b); }
+
+    const allocSize = (heapSize + 3) & ~3;
+    const fromtop = (attr & PSP_HEAP_ATTR_HIGHMEM) !== 0;
+
+    const addr = kernel.userMemory.alloc(allocSize, fromtop, `Heap/${name}`);
+    if (addr === -1) { regs.setGpr(2, 0); return; }
+    const blockId = kernel.nextBlockId++;
+
+    const poolStart = addr + 128;
+    const poolSize = allocSize - 128;
+    const heap: HeapState = {
+      address: addr, size: allocSize, fromtop,
+      poolStart, poolSize,
+      blocks: [{ start: poolStart, size: poolSize, taken: false }],
+      memBlockId: blockId,
+    };
+    heaps.set(addr, heap);
+    log.debug(`sceHeapCreateHeap("${name}", size=0x${heapSize.toString(16)}, attr=0x${attr.toString(16)}) → 0x${addr.toString(16)}`);
+    regs.setGpr(2, addr);
+  });
+
+  // sceHeapDeleteHeap(heapAddr) — PPSSPP sceHeap.cpp:168-177
+  // Note: PPSSPP does NOT free the underlying partition memory — just deletes the heap object.
+  kernel.register(HEAP.sceHeapDeleteHeap, (regs) => {
+    const heapAddr = regs.getGpr(4);
+    const heap = heaps.get(heapAddr);
+    if (!heap) { regs.setGpr(2, SCE_KERNEL_ERROR_INVALID_ID); return; }
+    heaps.delete(heapAddr);
+    regs.setGpr(2, 0);
+  });
+
+  // sceHeapAllocHeapMemory(heapAddr, memSize) — PPSSPP sceHeap.cpp:206-218
+  kernel.register(HEAP.sceHeapAllocHeapMemory, (regs) => {
+    const heapAddr = regs.getGpr(4);
+    const memSize  = regs.getGpr(5);
+    const heap = heaps.get(heapAddr);
+    if (!heap) { regs.setGpr(2, SCE_KERNEL_ERROR_INVALID_ID); return; }
+    const addr = heapAlloc(heap, memSize + 8, 4, true); // +8 overhead, fromTop, grain=4
+    regs.setGpr(2, addr === -1 ? 0xFFFFFFFF : addr);
+  });
+
+  // sceHeapAllocHeapMemoryWithOption(heapAddr, memSize, paramsPtr) — PPSSPP sceHeap.cpp:116-139
+  kernel.register(HEAP.sceHeapAllocHeapMemoryWithOption, (regs, bus) => {
+    const heapAddr  = regs.getGpr(4);
+    const memSize   = regs.getGpr(5);
+    const paramsPtr = regs.getGpr(6);
+    const heap = heaps.get(heapAddr);
+    if (!heap) { regs.setGpr(2, 0); return; } // returns 0, not error
+    let grain = 4;
+    if (paramsPtr !== 0) {
+      const pSize = bus.readU32(paramsPtr);
+      if (pSize < 8) { regs.setGpr(2, 0); return; }
+      grain = bus.readU32(paramsPtr + 4) || 4;
+    }
+    const addr = heapAlloc(heap, memSize + 8, grain, true);
+    regs.setGpr(2, addr === -1 ? 0xFFFFFFFF : addr);
+  });
+
+  // sceHeapFreeHeapMemory(heapAddr, memAddr) — PPSSPP sceHeap.cpp:94-109
+  kernel.register(HEAP.sceHeapFreeHeapMemory, (regs) => {
+    const heapAddr = regs.getGpr(4);
+    const memAddr  = regs.getGpr(5);
+    const heap = heaps.get(heapAddr);
+    if (!heap) { regs.setGpr(2, SCE_KERNEL_ERROR_INVALID_ID); return; }
+    if (memAddr === 0) { regs.setGpr(2, 0); return; } // null free is OK
+    if (!heapFreeExact(heap, memAddr)) { regs.setGpr(2, SCE_KERNEL_ERROR_INVALID_POINTER); return; }
+    regs.setGpr(2, 0);
+  });
+
+  // sceHeapGetTotalFreeSize(heapAddr) — PPSSPP sceHeap.cpp:141-153
+  kernel.register(HEAP.sceHeapGetTotalFreeSize, (regs) => {
+    const heapAddr = regs.getGpr(4);
+    const heap = heaps.get(heapAddr);
+    if (!heap) { regs.setGpr(2, SCE_KERNEL_ERROR_INVALID_ID); return; }
+    let free = heapTotalFree(heap);
+    if (free >= 8) free -= 8; // reserve overhead for next alloc
+    regs.setGpr(2, free);
+  });
+
+  // sceHeapIsAllocatedHeapMemory(heapPtr, memPtr) — PPSSPP sceHeap.cpp:155-166
+  kernel.register(HEAP.sceHeapIsAllocatedHeapMemory, (regs) => {
+    const heapPtr = regs.getGpr(4);
+    const memPtr  = regs.getGpr(5);
+    if (memPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_INVALID_POINTER); return; }
+    const heap = heaps.get(heapPtr);
+    if (!heap) { regs.setGpr(2, 0); return; } // not found in any heap
+    const found = heap.blocks.some(b => b.taken && b.start === memPtr);
+    regs.setGpr(2, found ? 1 : 0);
+  });
+
+  // Unimplemented in PPSSPP too — return 0
+  kernel.register(HEAP.sceHeapGetMallinfo, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(HEAP.sceHeapReallocHeapMemory, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(HEAP.sceHeapReallocHeapMemoryWithOption, (regs) => { regs.setGpr(2, 0); });
   // ── HPRM ──────────────────────────────────────────────────────────
   kernel.stub(HPRM.sceHprmIsHeadphoneExist);
   kernel.stub(HPRM.sceHprmIsMicrophoneExist);

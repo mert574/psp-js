@@ -33,39 +33,67 @@ const HLE_PRX_NAMES = new Set([
   "sceMpegbase_Driver", "sceVideocodec_Driver",
   "sceNetAdhocAuth_Service", "sceNetAdhocDownload_Library",
   "sceNetAdhocDiscover_Library", "sceMemab_Driver",
+  "sceUSB_Driver", "sceUsbPspcm_Driver", "sceUsbAcc_Driver",
+  "sceUsbCam_Driver", "sceUsbGps_Driver", "sceUsbMic_Driver",
+  "sceIdStorage_Service", "sceReg_Service",
 ]);
 
-/** Decompress gzip data, tolerating truncated/corrupt trailers (common in PSP PRXes). */
+/**
+ * Decompress gzip data, tolerating truncated/corrupt trailers common in PSP PRXes.
+ *
+ * DecompressionStream("deflate-raw") is used instead of "gzip" because PSP gzip
+ * streams often have invalid CRC32 trailers. We strip the gzip header ourselves
+ * and try with/without the 8-byte trailer to handle both cases.
+ */
 async function decompressGzip(data: Uint8Array): Promise<Uint8Array | null> {
   const rawDeflate = skipGzipHeader(data);
-  // Try with and without the 8-byte gzip trailer
+  // Try with full data first, then without the 8-byte gzip trailer (CRC32 + ISIZE)
   for (const strip of [0, 8]) {
     const input = strip > 0 && rawDeflate.byteLength > strip
       ? rawDeflate.subarray(0, rawDeflate.byteLength - strip)
       : rawDeflate;
-    try {
-      const ds = new DecompressionStream("deflate-raw");
-      const writer = ds.writable.getWriter();
-      const reader = ds.readable.getReader();
-      writer.write(new Uint8Array(input) as unknown as Uint8Array<ArrayBuffer>);
-      writer.close();
-      const chunks: Uint8Array[] = [];
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-      const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
-      if (totalLen === 0) continue;
-      const out = new Uint8Array(totalLen);
-      let off = 0;
-      for (const c of chunks) { out.set(c, off); off += c.byteLength; }
-      return out;
-    } catch {
-      // Try next strip size
-    }
+    const result = await tryDeflateRaw(input);
+    if (result && result.byteLength > 0) return result;
   }
   return null;
+}
+
+/**
+ * Attempt raw deflate decompression.
+ * Keeps any data that was successfully decompressed even if the stream errors
+ * on trailing bytes — PSP gzip streams often have CRC/padding that the browser's
+ * strict DecompressionStream rejects ("Junk found after end of compressed data").
+ */
+async function tryDeflateRaw(input: Uint8Array): Promise<Uint8Array | null> {
+  const ds = new DecompressionStream("deflate-raw");
+  const writer = ds.writable.getWriter();
+  const reader = ds.readable.getReader();
+
+  // Write input and close — don't await, let the pipe process asynchronously.
+  // Errors from write/close will surface when we read.
+  writer.write(new Uint8Array(input) as unknown as Uint8Array<ArrayBuffer>).catch(() => {});
+  writer.close().catch(() => {});
+
+  // Read all available decompressed chunks. If the stream errors partway
+  // through (e.g. trailing junk after a valid deflate stream), keep whatever
+  // was already decompressed — that's the actual file content.
+  const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  } catch {
+    // Stream errored — use whatever chunks we got so far
+  }
+
+  const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+  if (totalLen === 0) return null;
+  const out = new Uint8Array(totalLen);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
 }
 
 /** Skip a gzip header to get to the raw deflate stream. */
@@ -165,8 +193,12 @@ export class PSPEmulator {
     // Set up initial register state like the PSP kernel does before entry
     this.cpu.regs.setGpr(28, gp); // $gp = absolute GP address from module_info
     log.info(`[EMU] Initializing GP=0x${gp.toString(16)}`);
-    // SP: top of user memory (PSP-2000/3000: 64 MB RAM ends at 0x0C000000, leave some space)
-    this.cpu.regs.setGpr(29, 0x0BFFF000); // $sp
+
+    // Allocate module_start stack from userMemory (matching PPSSPP root thread setup)
+    const MODULE_START_STACK = 0x40000; // 256KB default — PPSSPP sceKernelModule.cpp:1805
+    const moduleStackBase = this.hle.userMemory.alloc(MODULE_START_STACK, true, "stack/module_start_root");
+    const moduleStackSP = moduleStackBase === -1 ? 0x0BFFF000 : (moduleStackBase + MODULE_START_STACK);
+    this.cpu.regs.setGpr(29, moduleStackSP); // $sp
 
     // Write a "module return" trampoline at a reserved address.
     const TRAMPOLINE_ADDR = 0x0BFFF800;

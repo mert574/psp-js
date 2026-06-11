@@ -191,35 +191,26 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     const MIN_STACK  = 512;
     const safeSize   = Math.max(stackSize, MIN_STACK);
     const aligned    = (safeSize + 0xFF) & ~0xFF;
-    const totalSize  = aligned + 0x100;
 
-    kernel.nextStackTopAddr -= totalSize;
-    const stackBase = kernel.nextStackTopAddr;
-
-    if (stackBase < kernel.nextAllocAddr + 0x4000) {
-      log.error(`sceKernelCreateThread: stack/heap collision`);
+    // Allocate from userMemory (same pool as sceKernelAllocPartitionMemory)
+    // PPSSPP sceKernelThread.cpp:334 — StackAllocator() returns userMemory, fromTop=true
+    // Auto-init userMemory if not yet initialized (e.g., raw boot tests without setHeapBase)
+    if (!kernel.userMemory.isInitialized()) {
+      kernel.userMemory.init(0x08800000, 0x0C000000 - 0x08800000);
+    }
+    const stackBase = kernel.userMemory.alloc(aligned, true, `stack/thread${tid}`);
+    if (stackBase === -1) {
+      log.error(`sceKernelCreateThread: stack allocation failed`);
       regs.setGpr(2, -1);
       return;
     }
 
-    const stackTop = (stackBase + aligned) >>> 0;
-    const sp = stackTop - 256;
-    const k0 = sp;
-
-    // PPSSPP FillStack: fill entire region with 0xFF, then write k0 fields.
-    // Note: PPSSPP zeros the entire 256-byte k0 section, but the sysmem test
-    // counts 0xFF bytes in this region. On real PSP hardware, the k0 section
-    // may not be zeroed (or is zeroed separately and not counted by the test).
-    // We only write the specific k0 fields used by tests, keeping the rest 0xFF.
-    for (let i = 0; i < totalSize; i += 4) {
-      kernel.bus.writeU32(stackBase + i, 0xFFFFFFFF);
-    }
-    // Write k0 fields (keep rest 0xFF)
-    kernel.bus.writeU32(k0 + 0xC0, tid);
-    kernel.bus.writeU32(k0 + 0xC8, stackBase);
-    kernel.bus.writeU32(k0 + 0xF8, 0xFFFFFFFF);
-    kernel.bus.writeU32(k0 + 0xFC, 0xFFFFFFFF);
-    kernel.bus.writeU32(stackBase, tid);
+    // Stack layout matching PPSSPP sceKernelThread.cpp:328-366:
+    // [stackBase, stackBase+aligned) = entire stack allocation
+    // SP = stackBase + aligned, then SP -= 256 for k0 area
+    // Fill + k0 setup happens in sceKernelStartThread (FillStack)
+    const sp = (stackBase + aligned) >>> 0;
+    const k0 = (sp - 0x100) >>> 0;
 
     const ctx: ThreadContext = {
       gpr: new Uint32Array(32),
@@ -234,7 +225,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     };
     resetThreadContext(ctx);
     const thread = {
-      id: tid, entry, stackSize: aligned, stackBase, stackTop: sp, k0,
+      id: tid, entry, stackSize: aligned, stackBase, stackTop: k0, k0,
       priority: regs.getGpr(6),
       state: ThreadState.DORMANT,
       waitType: WaitType.NONE,
@@ -277,6 +268,25 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     if (thread) {
       // PPSSPP __KernelResetThread: reset context before starting
       resetThreadContext(thread.context);
+
+      // FillStack — PPSSPP sceKernelThread.cpp:348-366 (called from __KernelStartThread)
+      const bus = kernel.bus;
+      // Fill entire stack with 0xFF
+      for (let i = 0; i < thread.stackSize; i += 4) {
+        bus.writeU32(thread.stackBase + i, 0xFFFFFFFF);
+      }
+      // Zero k0 area (top 256 bytes of stack)
+      for (let i = 0; i < 0x100; i += 4) {
+        bus.writeU32(thread.k0 + i, 0);
+      }
+      // Write k0 fields
+      bus.writeU32(thread.k0 + 0xC0, thread.id);
+      bus.writeU32(thread.k0 + 0xC8, thread.stackBase); // initialStack
+      bus.writeU32(thread.k0 + 0xF8, 0xFFFFFFFF);
+      bus.writeU32(thread.k0 + 0xFC, 0xFFFFFFFF);
+      // Write thread UID at initialStack
+      bus.writeU32(thread.stackBase, thread.id);
+
       let sp = thread.stackTop;
       thread.context.pc        = thread.entry;
       thread.context.gpr[26]   = thread.k0;
@@ -305,6 +315,11 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
       log.info(`sceKernelStartThread(tid=${thid}, arglen=${arglen}, argp=0x${argp.toString(16)}, sp=0x${sp.toString(16)})`);
 
+      // Set the caller's return value BEFORE any reschedule — reschedule saves
+      // the caller's register context, so a later setGpr would write v0 into
+      // the NEW thread's registers and the caller would resume with garbage.
+      regs.setGpr(2, 0);
+
       if (kernel.currentThreadId === 0) {
         kernel.pendingThreadEntry = { entry: thread.entry, arglen, argp, sp, k0: thread.k0 };
       } else {
@@ -314,6 +329,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
           kernel.reschedule(regs);
         }
       }
+      return;
     }
     regs.setGpr(2, 0);
   });
@@ -489,8 +505,8 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
     // Compute memory needed and allocate
     const memSize = computeElfMemorySize(fileData);
-    const loadAddr = kernel.allocLow(memSize || 0x10000);
-    if (loadAddr < 0) {
+    const loadAddr = kernel.userMemory.alloc(memSize || 0x10000, false, `module/${name}`);
+    if (loadAddr === -1) {
       log.error(`sceKernelLoadModule("${name}"): memory allocation failed`);
       regs.setGpr(2, 0x800200d9); // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
       return;
@@ -564,16 +580,19 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     const tid = kernel.nextBlockId++;
     const stackSize = 0x4000;
     const aligned = (stackSize + 0xFF) & ~0xFF;
-    const totalStackAlloc = aligned + 0x100;
-    kernel.nextStackTopAddr -= totalStackAlloc;
-    const stackBase = kernel.nextStackTopAddr;
+    const stackBase = kernel.userMemory.alloc(aligned, true, `stack/module_start`);
+    if (stackBase === -1) { log.error("module_start: stack alloc failed"); regs.setGpr(2, -1); return; }
     const sp = (stackBase + aligned) >>> 0;
-    const k0 = sp;
+    const k0 = (sp - 0x100) >>> 0;
 
-    // Fill stack
-    for (let i = 0; i < totalStackAlloc; i += 4) bus.writeU32(stackBase + i, 0xFFFFFFFF);
+    // FillStack — this is a module_start thread, fill immediately (started right away)
+    for (let i = 0; i < aligned; i += 4) bus.writeU32(stackBase + i, 0xFFFFFFFF);
+    for (let i = 0; i < 0x100; i += 4) bus.writeU32(k0 + i, 0);
     bus.writeU32(k0 + 0xC0, tid);
     bus.writeU32(k0 + 0xC8, stackBase);
+    bus.writeU32(k0 + 0xF8, 0xFFFFFFFF);
+    bus.writeU32(k0 + 0xFC, 0xFFFFFFFF);
+    bus.writeU32(stackBase, tid);
 
     const ctx: ThreadContext = {
       gpr: new Uint32Array(32), hi: 0, lo: 0, pc: mod.entryAddr,
@@ -586,13 +605,13 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     ctx.pc = mod.entryAddr;
     ctx.gpr[26] = k0;         // $k0
     ctx.gpr[28] = mod.gp;     // $gp
-    ctx.gpr[29] = sp - 64;    // $sp
-    ctx.gpr[30] = sp - 64;    // $fp
+    ctx.gpr[29] = k0 - 64;   // $sp (below k0 area)
+    ctx.gpr[30] = k0 - 64;   // $fp
     ctx.gpr[31] = kernel.threadReturnAddr; // $ra → trampoline
 
     // Pass args: a0 = argsize, a1 = argp
     if (argsize > 0 && argp !== 0) {
-      const argDst = sp - 64 - ((argsize + 0xf) & ~0xf);
+      const argDst = k0 - 64 - ((argsize + 0xf) & ~0xf);
       for (let i = 0; i < argsize; i++) bus.writeU8(argDst + i, bus.readU8(argp + i));
       ctx.gpr[4] = argsize;
       ctx.gpr[5] = argDst;
@@ -605,7 +624,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
     kernel.threads.set(tid, {
       id: tid, entry: mod.entryAddr,
-      stackSize: aligned, stackBase, stackTop: sp, k0,
+      stackSize: aligned, stackBase, stackTop: k0, k0,
       priority: 0x20,
       state: ThreadState.READY, waitType: WaitType.NONE,
       context: ctx,
@@ -701,8 +720,9 @@ export function registerThreadHLE(kernel: HLEKernel): void {
       // PPSSPP: after notifying, calls __KernelCheckCallbacks which reschedules
       // to let the target thread (if in CB-wait) run its callback.
       // Our reschedule() already promotes WAITING threads with pending callbacks.
-      kernel.reschedule(regs);
+      // v0 must be set BEFORE reschedule so it lands in the caller's saved context.
       regs.setGpr(2, 0);
+      kernel.reschedule(regs);
     } else {
       regs.setGpr(2, 0x80020198);
     }
@@ -765,7 +785,8 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
   // Helper: get emulated microseconds from CoreTiming
   function getEmulatedUs(): bigint {
-    const ct = kernel.coreTiming!;
+    const ct = kernel.coreTiming;
+    if (!ct) return 0n;
     return BigInt(ct.cyclesToUs(ct.getTicks()));
   }
 
@@ -974,10 +995,9 @@ export function registerThreadHLE(kernel: HLEKernel): void {
       // (see sceKernelThread.h:154)
       bus.writeU32(statusPtr + 40, t.state);                        // status
       bus.writeU32(statusPtr + 44, t.entry);                        // entrypoint
-      // stack — on PSP, this is the end (top) of the stack allocation.
-      // Test evidence: sysmem.c reads stack[-n] and counts 0xFF bytes
-      // from the top. k0.c compares with k0->stackAddr (= stackBase) → not equal.
-      bus.writeU32(statusPtr + 48, (t.stackBase + t.stackSize) >>> 0);
+      // stack — PPSSPP: initialStack = currentStack.start (base address)
+      // On real PSP, memory below this is 0xFF (pre-filled stack pool).
+      bus.writeU32(statusPtr + 48, t.stackBase);
       bus.writeU32(statusPtr + 52, t.stackSize);                    // stackSize
       bus.writeU32(statusPtr + 56, t.context.gpr[28] ?? 0);        // gpReg ($gp)
       bus.writeU32(statusPtr + 60, t.priority);                     // initialPriority
@@ -1442,11 +1462,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.UtilsForKernel_6C6887EE);
   kernel.stub(KERNEL._sceKernelAllocateTlspl, 1);
   kernel.stub(KERNEL._sceKernelExitThread);
-  kernel.stub(KERNEL._sceKernelLockLwMutex);
-  kernel.stub(KERNEL._sceKernelLockLwMutexCB);
   kernel.stub(KERNEL._sceKernelReturnFromTimerHandler);
-  kernel.stub(KERNEL._sceKernelTryLockLwMutex);
-  kernel.stub(KERNEL._sceKernelUnlockLwMutex);
   kernel.stub(KERNEL.memcmp);
   kernel.stub(KERNEL.memcpy);
   kernel.stub(KERNEL.memmove);
@@ -1490,15 +1506,12 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelLoadModuleForLoadExecVSHDisc, 1);
   kernel.stub(KERNEL.sceKernelLoadModuleMs, 1);
   kernel.stub(KERNEL.sceKernelLoadModuleNpDrm, 1);
-  kernel.stub(KERNEL.sceKernelLockLwMutex);
-  kernel.stub(KERNEL.sceKernelLockLwMutexCB);
   kernel.stub(KERNEL.sceKernelQueryModuleInfo);
   kernel.stub(KERNEL.sceKernelReferAlarmStatus);
   kernel.stub(KERNEL.sceKernelReferCallbackStatus);
   kernel.stub(KERNEL.sceKernelReferEventFlagStatus);
   kernel.stub(KERNEL.sceKernelReferFplStatus);
   kernel.stub(KERNEL.sceKernelReferGlobalProfiler);
-  kernel.stub(KERNEL.sceKernelReferLwMutexStatus);
   kernel.stub(KERNEL.sceKernelReferMbxStatus);
   kernel.stub(KERNEL.sceKernelReferMsgPipeStatus);
   kernel.stub(KERNEL.sceKernelReferMutexStatus);
@@ -1529,9 +1542,6 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelStopUnloadSelfModule, 1);
   kernel.stub(KERNEL.sceKernelSuspendDispatchThread);
   kernel.stub(KERNEL.sceKernelSuspendSubIntr);
-  kernel.stub(KERNEL.sceKernelTryLockLwMutex);
-  kernel.stub(KERNEL.sceKernelTryLockLwMutex_600);
-  kernel.stub(KERNEL.sceKernelUnlockLwMutex);
   kernel.stub(KERNEL.sceKernelUnloadModule);
   kernel.stub(KERNEL.sceKernelUnregisterSubIntrHandler);
   kernel.stub(KERNEL.sceKernelUtilsMt19937Init, 1);

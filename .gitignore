@@ -3,3 +3,6 @@ dist/
 dist-web/
 .claude/
 test/fixtures/
+ppsspp-reference/
+public/*.iso
+public/Duke3D/

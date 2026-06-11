@@ -41,10 +41,10 @@ export function registerCtrlHLE(kernel: HLEKernel): void {
     }
   }
 
-  // sceCtrlReadBufferPositive(pad_data*, count)
+  // sceCtrlReadBufferPositive(pad_data*, count) — blocks until next VBlank
   kernel.register(CTRL.sceCtrlReadBufferPositive, (regs, bus) => {
     writePadData(bus, regs.getGpr(4));
-    regs.setGpr(2, 1);
+    kernel.blockCurrentThreadOnCtrl(regs, 1);
   });
 
   // sceCtrlPeekBufferPositive(pad_data*, count)
@@ -53,7 +53,7 @@ export function registerCtrlHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 1);
   });
 
-  // sceCtrlReadBufferNegative(pad_data*, count) — buttons field inverted
+  // sceCtrlReadBufferNegative(pad_data*, count) — blocks until next VBlank, buttons inverted
   kernel.register(CTRL.sceCtrlReadBufferNegative, (regs, bus) => {
     const padDataPtr = regs.getGpr(4);
     if (padDataPtr !== 0) {
@@ -65,7 +65,7 @@ export function registerCtrlHLE(kernel: HLEKernel): void {
       bus.writeU8(padDataPtr + 8, lx);
       bus.writeU8(padDataPtr + 9, ly);
     }
-    regs.setGpr(2, 1);
+    kernel.blockCurrentThreadOnCtrl(regs, 1);
   });
 
   // sceCtrlPeekBufferNegative(pad_data*, count)
