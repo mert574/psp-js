@@ -1,8 +1,9 @@
 import { AllegrexRegisters } from "./registers.js";
 import { MemoryBus } from "../memory/memory-bus.js";
 import { MemoryRegion } from "../memory/memory-map.js";
-import { decodeInstruction } from "./decoder.js";
+import { decodeInto } from "./decoder.js";
 import { executeInstruction } from "./executor.js";
+import type { Instruction } from "./instruction.js";
 import type { HLEKernel } from "../kernel/hle-kernel.js";
 import { Logger } from "../utils/logger.js";
 
@@ -57,6 +58,12 @@ export class AllegrexCPU {
   private traceBuffer = new Uint32Array(512);
   private traceIdx = 0;
 
+  /** Reusable decoded-instruction scratch — avoids allocating one object per step. */
+  private readonly _instr: Instruction = {
+    raw: 0, pc: 0, op: 0, rs: 0, rt: 0, rd: 0,
+    shamt: 0, funct: 0, imm16: 0, imm16s: 0, target26: 0,
+  };
+
   /** Optional PC watchpoint for debugging — set to non-zero to log registers at that PC. */
   watchPC: number = 0;
 
@@ -80,10 +87,10 @@ export class AllegrexCPU {
 
     // Catch execution outside valid code regions.
     // PPSSPP: PSP_GetKernelMemoryBase()=RAM_START, PSP_GetUserMemoryEnd()=RAM_START+g_MemorySize.
+    const phys = pc & 0x1FFFFFFF;
+    const RAM_END = MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE;
+    const inRAM = phys >= MemoryRegion.RAM_START && phys < RAM_END;
     {
-      const phys = pc & 0x1FFFFFFF;
-      const RAM_END = MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE;
-      const inRAM = phys >= MemoryRegion.RAM_START && phys < RAM_END;
       const inScratch = phys >= MemoryRegion.SCRATCHPAD_START &&
                         phys <  MemoryRegion.SCRATCHPAD_START + MemoryRegion.SCRATCHPAD_SIZE;
       if (!inRAM && !inScratch) {
@@ -121,24 +128,14 @@ export class AllegrexCPU {
       }
     }
 
-    let raw: number;
-    try {
-      raw = this.bus.readU32(pc);
-    } catch (e) {
-      // Dump recent PC trace
-      const trace = [];
-      for (let i = Math.max(0, this.traceIdx - 16); i < this.traceIdx; i++) {
-        trace.push('0x' + this.traceBuffer[i & 15]!.toString(16));
-      }
-      log.error(`Fetch fault at PC=0x${pc.toString(16)}: ${e}`);
-      log.error(`Recent PCs: ${trace.join(' → ')}`);
-      this.stepFaulted = true;
-      return false;
-    }
+    // Fetch — the PC was validated above, so RAM fetches can skip the bus's
+    // region dispatch entirely (readU32 never throws; it returns 0 for unmapped).
+    const raw = inRAM ? this.bus.fetchRamU32(phys) : this.bus.readU32(pc);
 
     this.regs.pc = pc + 4;
 
-    const instr = decodeInstruction(raw, pc);
+    const instr = this._instr;
+    decodeInto(instr, raw, pc);
 
     const inDelaySlot = this.inDelaySlot;
     const delayTarget = this.delaySlotTarget;

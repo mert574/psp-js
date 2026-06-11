@@ -14,24 +14,44 @@ export function computeVertexStride(vtype: number): number {
   const normFmt  = (vtype >>> 5)  & 3;
   const posFmt  = (vtype >>> 7) & 3;
 
+  // Component alignments (PPSSPP VertexDecoderCommon.cpp:41-45)
+  const wtAlign  = [0, 1, 2, 4][weightFmt]!;
+  const tcAlign  = [0, 1, 2, 4][texFmt]!;
+  const colAlign = [0, 0, 0, 0, 2, 2, 2, 4][colorFmt]!;
+  const nrmAlign = [0, 1, 2, 4][normFmt]!;
+  const posAlign = [1, 1, 2, 4][posFmt]!;
+
+  // Track the largest component alignment for final stride alignment
+  let biggest = 0;
   let s = 0;
-  if (weightFmt === 1) s += weightCount;
+
+  if (weightFmt === 1) { s += weightCount; }
   else if (weightFmt === 2) { s = (s + 1) & ~1; s += weightCount * 2; }
   else if (weightFmt === 3) { s = (s + 3) & ~3; s += weightCount * 4; }
+  if (wtAlign > biggest) biggest = wtAlign;
+
   if (texFmt === 1) s += 2;
   else if (texFmt === 2) { s = (s + 1) & ~1; s += 4; }
   else if (texFmt === 3) { s = (s + 3) & ~3; s += 8; }
+  if (tcAlign > biggest) biggest = tcAlign;
+
   if (colorFmt >= 4 && colorFmt <= 6) { s = (s + 1) & ~1; s += 2; }
   else if (colorFmt === 7) { s = (s + 3) & ~3; s += 4; }
+  if (colAlign > biggest) biggest = colAlign;
+
   if (normFmt === 1) s += 3;
   else if (normFmt === 2) { s = (s + 1) & ~1; s += 6; }
   else if (normFmt === 3) { s = (s + 3) & ~3; s += 12; }
+  if (nrmAlign > biggest) biggest = nrmAlign;
+
   if (posFmt === 1) s += 3;
   else if (posFmt === 2) { s = (s + 1) & ~1; s += 6; }
   else if (posFmt === 3) { s = (s + 3) & ~3; s += 12; }
+  if (posAlign > biggest) biggest = posAlign;
 
-  // PPSSPP VertexDecoderCommon.cpp:1404: final stride is aligned to 4 bytes.
-  return (s + 3) & ~3;
+  // PPSSPP VertexDecoderCommon.cpp:1408: align final stride to largest component alignment
+  if (biggest > 0) s = (s + biggest - 1) & ~(biggest - 1);
+  return s;
 }
 
 /** Read vertices from memory based on vertex format. Supports indexed drawing. */
@@ -83,7 +103,7 @@ export function readVertices(
     const align4 = () => { off = (off + 3) & ~3; };
 
     const defaultColor = ((materialAlpha & 0xFF) * 0x1000000) | (materialAmbient & 0xFFFFFF);
-    const v: Vertex = { x: 0, y: 0, z: 0, u: 0, v: 0, color: defaultColor, nx: 0, ny: 0, nz: 1, clipw: 1.0 };
+    const v: Vertex = { x: 0, y: 0, z: 0, u: 0, v: 0, color: defaultColor, nx: 0, ny: 0, nz: 1, clipw: 1.0, fogCoef: 1.0 };
 
     // Read bone weights (appear before UV in PSP vertex layout)
     if (weightFmt === 1) {

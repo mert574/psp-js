@@ -464,6 +464,338 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
+  // ── Lightweight Mutexes ──────────────────────────────────────────────
+  // PPSSPP sceKernelMutex.cpp — LwMutex stores lock state in user-space
+  // memory (workarea). Kernel only tracks waiting threads.
+  //
+  // NativeLwMutexWorkarea layout (32 bytes):
+  //   0x00: s32 lockLevel       — recursion count
+  //   0x04: s32 lockThread      — thread ID holding lock (0 = unlocked)
+  //   0x08: u32 attr            — creation attributes
+  //   0x0C: s32 numWaitThreads  — not actively maintained
+  //   0x10: s32 uid             — kernel object ID
+  //   0x14: s32[3] pad
+
+  interface LwMutexState {
+    name: string;
+    attr: number;
+    uid: number;
+    workareaPtr: number;
+    initialCount: number;
+    waitingThreads: number[];  // thread IDs
+  }
+  const lwMutexes = new Map<number, LwMutexState>();
+
+  // Error codes — PPSSPP sceKernelMutex.cpp
+  const SCE_KERNEL_ERROR_ILLEGAL_ATTR     = 0x80020010 >>> 0;
+  const SCE_KERNEL_ERROR_ILLEGAL_COUNT    = 0x80020011 >>> 0;
+  const SCE_KERNEL_ERROR_ILLEGAL_ADDR     = 0x80020006 >>> 0;
+  const SCE_KERNEL_ERROR_ACCESS_ERROR     = 0x8002007f >>> 0;
+  const SCE_KERNEL_ERROR_WAIT_DELETE      = 0x800201a8 >>> 0;
+  const SCE_MUTEX_ERROR_TRYLOCK_FAILED    = 0x800201c4 >>> 0;
+  const SCE_LWMUTEX_ERROR_NO_SUCH_LWMUTEX = 0x800201ca >>> 0;
+  const SCE_LWMUTEX_ERROR_TRYLOCK_FAILED  = 0x800201cb >>> 0;
+  const SCE_LWMUTEX_ERROR_NOT_LOCKED      = 0x800201cc >>> 0;
+  const SCE_LWMUTEX_ERROR_LOCK_OVERFLOW   = 0x800201cd >>> 0;
+  const SCE_LWMUTEX_ERROR_UNLOCK_UNDERFLOW = 0x800201ce >>> 0;
+  const SCE_LWMUTEX_ERROR_ALREADY_LOCKED  = 0x800201cf >>> 0;
+  const PSP_MUTEX_ATTR_PRIORITY           = 0x100;
+
+  /** Read workarea fields from PSP memory */
+  function lwReadWorkarea(bus: import("../memory/memory-bus.js").MemoryBus, ptr: number) {
+    return {
+      lockLevel:      bus.readU32(ptr + 0x00) | 0,
+      lockThread:     bus.readU32(ptr + 0x04) | 0,
+      attr:           bus.readU32(ptr + 0x08),
+      numWaitThreads: bus.readU32(ptr + 0x0C) | 0,
+      uid:            bus.readU32(ptr + 0x10) | 0,
+    };
+  }
+
+  /** Write workarea fields to PSP memory */
+  function lwWriteWorkarea(bus: import("../memory/memory-bus.js").MemoryBus, ptr: number,
+    lockLevel: number, lockThread: number, attr: number, numWaitThreads: number, uid: number) {
+    bus.writeU32(ptr + 0x00, lockLevel);
+    bus.writeU32(ptr + 0x04, lockThread);
+    bus.writeU32(ptr + 0x08, attr);
+    bus.writeU32(ptr + 0x0C, numWaitThreads);
+    bus.writeU32(ptr + 0x10, uid);
+  }
+
+  /**
+   * Try to acquire lock on workarea. Returns:
+   *   { acquired: true }              — lock obtained
+   *   { acquired: false, error: n }   — validation error
+   *   { acquired: false, error: 0 }   — must block (contended)
+   * Matches PPSSPP __KernelLockLwMutex (sceKernelMutex.cpp:766-815)
+   */
+  function lwTryLock(bus: import("../memory/memory-bus.js").MemoryBus, ptr: number, count: number):
+    { acquired: true } | { acquired: false; error: number } {
+    const wa = lwReadWorkarea(bus, ptr);
+    // Validation
+    if (count <= 0) return { acquired: false, error: SCE_KERNEL_ERROR_ILLEGAL_COUNT };
+    if (count > 1 && !(wa.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE))
+      return { acquired: false, error: SCE_KERNEL_ERROR_ILLEGAL_COUNT };
+    if ((wa.lockLevel + count) < 0) return { acquired: false, error: SCE_LWMUTEX_ERROR_LOCK_OVERFLOW };
+    if (wa.uid === -1) return { acquired: false, error: SCE_LWMUTEX_ERROR_NO_SUCH_LWMUTEX };
+
+    if (wa.lockLevel === 0) {
+      // Unlocked — acquire
+      bus.writeU32(ptr + 0x00, count);
+      bus.writeU32(ptr + 0x04, kernel.currentThreadId);
+      return { acquired: true };
+    }
+    if (wa.lockThread === kernel.currentThreadId) {
+      // Already held by us
+      if (!(wa.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE))
+        return { acquired: false, error: SCE_LWMUTEX_ERROR_ALREADY_LOCKED };
+      bus.writeU32(ptr + 0x00, wa.lockLevel + count);
+      return { acquired: true };
+    }
+    // Contended — must block
+    return { acquired: false, error: 0 };
+  }
+
+  /**
+   * Wake the next waiter on a fully-unlocked lwmutex.
+   * Returns true if a thread was woken (needs reschedule).
+   * Matches PPSSPP __KernelUnlockLwMutex (sceKernelMutex.cpp:817-844)
+   */
+  function lwWakeNextWaiter(bus: import("../memory/memory-bus.js").MemoryBus, ptr: number, lwm: LwMutexState): boolean {
+    if (lwm.waitingThreads.length === 0) {
+      bus.writeU32(ptr + 0x04, 0); // lockThread = 0 (unlocked)
+      return false;
+    }
+    // Pick thread: PRIORITY → highest priority; else FIFO
+    let bestIdx = 0;
+    if (lwm.attr & PSP_MUTEX_ATTR_PRIORITY) {
+      let bestPri = Infinity;
+      for (let i = 0; i < lwm.waitingThreads.length; i++) {
+        const t = kernel.threads.get(lwm.waitingThreads[i]!);
+        if (t && t.priority < bestPri) { bestPri = t.priority; bestIdx = i; }
+      }
+    }
+    const tid = lwm.waitingThreads.splice(bestIdx, 1)[0]!;
+    const t = kernel.threads.get(tid);
+    if (!t || t.state !== ThreadState.WAITING || t.waitType !== WaitType.LWMUTEX) {
+      // Stale — try next recursively
+      return lwWakeNextWaiter(bus, ptr, lwm);
+    }
+    // Transfer lock to woken thread
+    bus.writeU32(ptr + 0x00, t.waitMutexCount); // lockLevel = requested count
+    bus.writeU32(ptr + 0x04, tid);               // lockThread = woken thread
+    t.state = ThreadState.READY;
+    t.waitType = WaitType.NONE;
+    t.context.gpr[2] = 0; // return 0 to woken thread
+    return true;
+  }
+
+  // sceKernelCreateLwMutex(workareaPtr, name, attr, initialCount, optionsPtr)
+  // PPSSPP sceKernelMutex.cpp:668-711
+  kernel.register(MUTEX.sceKernelCreateLwMutex, (regs, bus) => {
+    const workareaPtr = regs.getGpr(4);
+    const namePtr     = regs.getGpr(5);
+    const attr        = regs.getGpr(6);
+    const initialCount = regs.getGpr(7) | 0;
+
+    if (namePtr === 0) { regs.setGpr(2, 0x80020001 >>> 0); return; } // SCE_KERNEL_ERROR_ERROR
+    if (attr >= 0x400) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    if (initialCount < 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_COUNT); return; }
+    if (!(attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE) && initialCount > 1) {
+      regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_COUNT); return;
+    }
+
+    let name = "";
+    for (let i = 0; i < 31; i++) { const b = bus.readU8(namePtr + i); if (b === 0) break; name += String.fromCharCode(b); }
+
+    const uid = kernel.nextBlockId++;
+    const lwm: LwMutexState = { name, attr, uid, workareaPtr, initialCount, waitingThreads: [] };
+    lwMutexes.set(uid, lwm);
+
+    // Initialize workarea (memset 0 then set fields) — PPSSPP line 696-703
+    for (let i = 0; i < 32; i += 4) bus.writeU32(workareaPtr + i, 0);
+    lwWriteWorkarea(bus, workareaPtr,
+      initialCount,
+      initialCount === 0 ? 0 : kernel.currentThreadId,
+      attr, 0, uid);
+
+    log.debug(`sceKernelCreateLwMutex("${name}", attr=0x${attr.toString(16)}, init=${initialCount}) → uid=${uid}`);
+    regs.setGpr(2, 0);
+  });
+
+  // sceKernelDeleteLwMutex(workareaPtr)
+  // PPSSPP sceKernelMutex.cpp:738-764
+  kernel.register(MUTEX.sceKernelDeleteLwMutex, (regs, bus) => {
+    const workareaPtr = regs.getGpr(4);
+    if (workareaPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    const uid = bus.readU32(workareaPtr + 0x10) | 0;
+    const lwm = lwMutexes.get(uid);
+    if (!lwm) { regs.setGpr(2, SCE_LWMUTEX_ERROR_NO_SUCH_LWMUTEX); return; }
+
+    // Wake all waiters with SCE_KERNEL_ERROR_WAIT_DELETE
+    let woke = false;
+    for (const tid of lwm.waitingThreads) {
+      const t = kernel.threads.get(tid);
+      if (t && t.state === ThreadState.WAITING && t.waitType === WaitType.LWMUTEX) {
+        t.state = ThreadState.READY;
+        t.waitType = WaitType.NONE;
+        t.context.gpr[2] = SCE_KERNEL_ERROR_WAIT_DELETE;
+        woke = true;
+      }
+    }
+
+    // Clear workarea — PPSSPP NativeLwMutexWorkarea::clear(): only lockLevel, lockThread, uid
+    bus.writeU32(workareaPtr + 0x00, 0);  // lockLevel = 0
+    bus.writeU32(workareaPtr + 0x04, -1); // lockThread = -1
+    bus.writeU32(workareaPtr + 0x10, -1); // uid = -1
+    lwMutexes.delete(uid);
+
+    if (woke && !kernel.reschedule(regs)) kernel.idleBreak = true;
+    regs.setGpr(2, 0);
+  });
+
+  // Shared lock handler for sceKernelLockLwMutex / _sceKernelLockLwMutex
+  // PPSSPP sceKernelMutex.cpp:929-960
+  const lwmLockHandler = (regs: import("../cpu/registers.js").AllegrexRegisters, bus: import("../memory/memory-bus.js").MemoryBus, cb: boolean) => {
+    const workareaPtr = regs.getGpr(4);
+    const count       = regs.getGpr(5) | 0;
+    if (workareaPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ACCESS_ERROR); return; }
+
+    const result = lwTryLock(bus, workareaPtr, count);
+    if (result.acquired) { regs.setGpr(2, 0); return; }
+    if (result.error !== 0) { regs.setGpr(2, result.error); return; }
+
+    // Must block — contended
+    const uid = bus.readU32(workareaPtr + 0x10) | 0;
+    const lwm = lwMutexes.get(uid);
+    if (!lwm) { regs.setGpr(2, SCE_LWMUTEX_ERROR_NO_SUCH_LWMUTEX); return; }
+
+    const t = kernel.threads.get(kernel.currentThreadId);
+    if (!t) return;
+    // Avoid duplicate entries (PPSSPP line 951-952)
+    if (!lwm.waitingThreads.includes(t.id)) lwm.waitingThreads.push(t.id);
+    t.state = ThreadState.WAITING;
+    t.waitType = WaitType.LWMUTEX;
+    t.waitMutexId = uid;
+    t.waitMutexCount = count;
+    if (cb) t.isProcessingCallbacks = true;
+    kernel.saveContext(t, regs);
+    t.context.gpr[2] = 0;
+    if (!kernel.reschedule(regs)) kernel.idleBreak = true;
+  };
+
+  kernel.register(KERNEL.sceKernelLockLwMutex, (regs, bus) => lwmLockHandler(regs, bus, false));
+  kernel.register(KERNEL._sceKernelLockLwMutex, (regs, bus) => lwmLockHandler(regs, bus, false));
+  kernel.register(KERNEL.sceKernelLockLwMutexCB, (regs, bus) => lwmLockHandler(regs, bus, true));
+  kernel.register(KERNEL._sceKernelLockLwMutexCB, (regs, bus) => lwmLockHandler(regs, bus, true));
+
+  // sceKernelTryLockLwMutex — pre-600: always returns TRYLOCK_FAILED on any error
+  // PPSSPP sceKernelMutex.cpp:892-909
+  kernel.register(KERNEL.sceKernelTryLockLwMutex, (regs, bus) => {
+    const workareaPtr = regs.getGpr(4);
+    const count       = regs.getGpr(5) | 0;
+    if (workareaPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ACCESS_ERROR); return; }
+    const result = lwTryLock(bus, workareaPtr, count);
+    if (result.acquired) { regs.setGpr(2, 0); return; }
+    regs.setGpr(2, SCE_MUTEX_ERROR_TRYLOCK_FAILED);
+  });
+  kernel.register(KERNEL._sceKernelTryLockLwMutex, (regs, bus) => {
+    const workareaPtr = regs.getGpr(4);
+    const count       = regs.getGpr(5) | 0;
+    if (workareaPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ACCESS_ERROR); return; }
+    const result = lwTryLock(bus, workareaPtr, count);
+    if (result.acquired) { regs.setGpr(2, 0); return; }
+    regs.setGpr(2, SCE_MUTEX_ERROR_TRYLOCK_FAILED);
+  });
+
+  // sceKernelTryLockLwMutex_600 — returns actual error code
+  // PPSSPP sceKernelMutex.cpp:911-927
+  kernel.register(KERNEL.sceKernelTryLockLwMutex_600, (regs, bus) => {
+    const workareaPtr = regs.getGpr(4);
+    const count       = regs.getGpr(5) | 0;
+    if (workareaPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ACCESS_ERROR); return; }
+    const result = lwTryLock(bus, workareaPtr, count);
+    if (result.acquired) { regs.setGpr(2, 0); return; }
+    regs.setGpr(2, result.error !== 0 ? result.error : SCE_LWMUTEX_ERROR_TRYLOCK_FAILED);
+  });
+
+  // sceKernelUnlockLwMutex(workareaPtr, count)
+  // PPSSPP sceKernelMutex.cpp:997-1029
+  const lwmUnlockHandler = (regs: import("../cpu/registers.js").AllegrexRegisters, bus: import("../memory/memory-bus.js").MemoryBus) => {
+    const workareaPtr = regs.getGpr(4);
+    const count       = regs.getGpr(5) | 0;
+    if (workareaPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ACCESS_ERROR); return; }
+
+    const wa = lwReadWorkarea(bus, workareaPtr);
+    if (wa.uid === -1) { regs.setGpr(2, SCE_LWMUTEX_ERROR_NO_SUCH_LWMUTEX); return; }
+    if (count <= 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_COUNT); return; }
+    if (count > 1 && !(wa.attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) {
+      regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_COUNT); return;
+    }
+    if (wa.lockLevel === 0 || wa.lockThread !== kernel.currentThreadId) {
+      regs.setGpr(2, SCE_LWMUTEX_ERROR_NOT_LOCKED); return;
+    }
+    if (wa.lockLevel < count) { regs.setGpr(2, SCE_LWMUTEX_ERROR_UNLOCK_UNDERFLOW); return; }
+
+    const newLevel = wa.lockLevel - count;
+    bus.writeU32(workareaPtr + 0x00, newLevel);
+
+    if (newLevel === 0) {
+      const lwm = lwMutexes.get(wa.uid);
+      if (lwm && lwWakeNextWaiter(bus, workareaPtr, lwm)) {
+        if (!kernel.reschedule(regs)) kernel.idleBreak = true;
+      }
+    }
+    regs.setGpr(2, 0);
+  };
+
+  kernel.register(KERNEL.sceKernelUnlockLwMutex, lwmUnlockHandler);
+  kernel.register(KERNEL._sceKernelUnlockLwMutex, lwmUnlockHandler);
+
+  // sceKernelReferLwMutexStatus(workareaPtr, infoPtr)
+  // PPSSPP sceKernelMutex.cpp:1063-1070
+  kernel.register(KERNEL.sceKernelReferLwMutexStatus, (regs, bus) => {
+    const workareaPtr = regs.getGpr(4);
+    const infoPtr     = regs.getGpr(5);
+    if (workareaPtr === 0 || infoPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    const uid = bus.readU32(workareaPtr + 0x10) | 0;
+    const lwm = lwMutexes.get(uid);
+    if (!lwm) { regs.setGpr(2, SCE_LWMUTEX_ERROR_NO_SUCH_LWMUTEX); return; }
+    const wa = lwReadWorkarea(bus, workareaPtr);
+    // Write NativeLwMutex to infoPtr — PPSSPP __KernelReferLwMutexStatus
+    bus.writeU32(infoPtr + 0x00, 0x40); // size = sizeof(NativeLwMutex)
+    // Name at offset 0x04, 32 bytes
+    for (let i = 0; i < 32; i++) bus.writeU8(infoPtr + 0x04 + i, i < lwm.name.length ? lwm.name.charCodeAt(i) : 0);
+    bus.writeU32(infoPtr + 0x24, lwm.attr);
+    bus.writeU32(infoPtr + 0x28, uid);
+    bus.writeU32(infoPtr + 0x2C, lwm.workareaPtr);
+    bus.writeU32(infoPtr + 0x30, lwm.initialCount);
+    bus.writeU32(infoPtr + 0x34, wa.lockLevel);
+    bus.writeU32(infoPtr + 0x38, wa.lockThread === 0 ? -1 : wa.lockThread); // 0 → -1 for API
+    bus.writeU32(infoPtr + 0x3C, lwm.waitingThreads.length);
+    regs.setGpr(2, 0);
+  });
+
+  // sceKernelReferLwMutexStatusByID(uid, infoPtr)
+  kernel.register(MUTEX.sceKernelReferLwMutexStatusByID, (regs, bus) => {
+    const uid     = regs.getGpr(4);
+    const infoPtr = regs.getGpr(5);
+    const lwm = lwMutexes.get(uid);
+    if (!lwm) { regs.setGpr(2, SCE_LWMUTEX_ERROR_NO_SUCH_LWMUTEX); return; }
+    if (infoPtr === 0) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    const wa = lwReadWorkarea(bus, lwm.workareaPtr);
+    bus.writeU32(infoPtr + 0x00, 0x3C);
+    for (let i = 0; i < 32; i++) bus.writeU8(infoPtr + 0x04 + i, i < lwm.name.length ? lwm.name.charCodeAt(i) : 0);
+    bus.writeU32(infoPtr + 0x24, lwm.attr);
+    bus.writeU32(infoPtr + 0x28, uid);
+    bus.writeU32(infoPtr + 0x2C, lwm.workareaPtr);
+    bus.writeU32(infoPtr + 0x30, lwm.initialCount);
+    bus.writeU32(infoPtr + 0x34, wa.lockLevel);
+    bus.writeU32(infoPtr + 0x38, wa.lockThread === 0 ? -1 : wa.lockThread);
+    bus.writeU32(infoPtr + 0x3C, lwm.waitingThreads.length);
+    regs.setGpr(2, 0);
+  });
+
   // ── Event Flags ───────────────────────────────────────────────────────
 
   interface EventFlag {
@@ -645,7 +977,8 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const fplId = kernel.nextBlockId++;
     const aligned = (blockSize + 3) & ~3; // 4-byte align (PPSSPP uses BlockAllocator)
     const totalSize = aligned * numBlocks;
-    const addr = kernel.allocLow(totalSize);
+    const addr = kernel.userMemory.alloc(totalSize, false, "FPL");
+    if (addr === -1) { regs.setGpr(2, 0x800200d9 >>> 0); return; }
     fpls.set(fplId, { base: addr, blockSize: aligned, numBlocks, freeBlocks: new Array(numBlocks).fill(true) });
     kernel.memBlocks.set(fplId, { addr, size: totalSize, name: "FPL" });
     regs.setGpr(2, fplId);
@@ -751,8 +1084,8 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     if (vplSize <= 0x30) vplSize = 0x1000;
     vplSize = (vplSize + 7) & ~7;
 
-    const memBlockPtr = kernel.allocLow(vplSize);
-    if (memBlockPtr < 0) { regs.setGpr(2, SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    const memBlockPtr = kernel.userMemory.alloc(vplSize, false, "VPL");
+    if (memBlockPtr === -1) { regs.setGpr(2, SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     const vplId = kernel.nextBlockId++;
     const firstBlockOffset = 0x18;
@@ -896,31 +1229,33 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       name += String.fromCharCode(b);
     }
 
+    // PPSSPP sceKernelMemory.cpp: dispatch to BlockAllocator based on type
     let addr: number;
     if (allocType === 2) {
-      addr = addrHint & ~0xFF;
-    } else if (allocType === 1 || allocType === 4) {
-      // High allocation (grows downward)
-      const sizeAligned = (size + 0xFF) & ~0xFF;
-      addr = (kernel.nextHighAddr - sizeAligned) & ~0xFF;
-      if (addr < kernel.nextAllocAddr + 0x4000) {
-        log.error(`sceKernelAllocPartitionMemory: high heap exhausted`);
-        regs.setGpr(2, -1);
-        return;
-      }
-      kernel.nextHighAddr = addr;
+      // PSP_SMEM_Addr — allocate at specific address
+      addr = kernel.userMemory.allocAt(addrHint, size, name);
+    } else if (allocType === 3) {
+      // PSP_SMEM_LowAligned — low allocation with alignment from addrHint
+      const alignment = Math.max(addrHint || 256, 256);
+      addr = kernel.userMemory.allocAligned(size, 0x100, alignment, false, name);
+    } else if (allocType === 4) {
+      // PSP_SMEM_HighAligned — high allocation with alignment from addrHint
+      const alignment = Math.max(addrHint || 256, 256);
+      addr = kernel.userMemory.allocAligned(size, 0x100, alignment, true, name);
+    } else if (allocType === 1) {
+      // PSP_SMEM_High — allocate from top
+      addr = kernel.userMemory.alloc(size, true, name);
     } else {
-      // Low allocation — use free list first
-      addr = kernel.allocLow(size);
-      if (addr < 0) {
-        regs.setGpr(2, 0x800200d9 >>> 0); // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
-        return;
-      }
+      // PSP_SMEM_Low (0) — allocate from bottom
+      addr = kernel.userMemory.alloc(size, false, name);
+    }
+    if (addr === -1) {
+      regs.setGpr(2, 0x800200d9 >>> 0); // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
+      return;
     }
 
-    const isHigh = allocType === 1 || allocType === 4;
     const blockId = kernel.nextBlockId++;
-    kernel.memBlocks.set(blockId, { addr, size, name, high: isHigh });
+    kernel.memBlocks.set(blockId, { addr, size, name });
     log.debug(`sceKernelAllocPartitionMemory(part=${partition}, "${name}", type=${allocType}, size=0x${size.toString(16)}) → uid=${blockId} addr=0x${addr.toString(16)}`);
     regs.setGpr(2, blockId);
   });
@@ -939,35 +1274,20 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const blockId = regs.getGpr(4);
     const block = kernel.memBlocks.get(blockId);
     if (block) {
-      if (block.high) kernel.freeHigh(block.addr, block.size);
-      else kernel.freeLow(block.addr, block.size);
+      kernel.userMemory.free(block.addr);
       kernel.memBlocks.delete(blockId);
     }
     regs.setGpr(2, 0);
   });
 
   // sceKernelMaxFreeMemSize — largest contiguous allocatable block
-  // Must account for alignment overhead so the returned value can actually be allocated
   kernel.register(SYSMEM.sceKernelMaxFreeMemSize, (regs) => {
-    // Bump allocator gap — subtract alignment overhead so the returned value
-    // can actually be allocated (allocLow rounds size up to 0x100 boundary)
-    const rawGap = Math.max(0, kernel.nextHighAddr - kernel.nextAllocAddr - 0x4000);
-    const bumpGap = rawGap & ~0xFF; // round DOWN to alignment
-    let maxFree = bumpGap;
-    // Check free list regions
-    for (const r of kernel.freeRegions) {
-      if (r.size > maxFree) maxFree = r.size;
-    }
-    regs.setGpr(2, maxFree >>> 0);
+    regs.setGpr(2, kernel.userMemory.getLargestFreeBlockSize() >>> 0);
   });
 
   // sceKernelTotalFreeMemSize — total free memory
   kernel.register(SYSMEM.sceKernelTotalFreeMemSize, (regs) => {
-    let total = Math.max(0, kernel.nextHighAddr - kernel.nextAllocAddr);
-    for (const r of kernel.freeRegions) {
-      total += r.size;
-    }
-    regs.setGpr(2, total >>> 0);
+    regs.setGpr(2, kernel.userMemory.getTotalFreeBytes() >>> 0);
   });
 
   // sceKernelMemset(addr, fillByte, n) — also serves as sce_paf_private_memset
@@ -1015,21 +1335,12 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       regs.setGpr(2, 0x80020001 >>> 0); return; // SCE_KERNEL_ERROR_ERROR
     }
 
-    let addr: number;
-    if (type === 1) {
-      // High allocation
-      const aligned = (size + 0xFF) & ~0xFF;
-      addr = (kernel.nextHighAddr - aligned) & ~0xFF;
-      kernel.nextHighAddr = addr;
-    } else {
-      addr = kernel.allocLow(size);
-      if (addr < 0) {
-        regs.setGpr(2, 0x800200d9 >>> 0); return; // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
-      }
+    const addr = kernel.userMemory.alloc(size, type === 1, "UserBlock");
+    if (addr === -1) {
+      regs.setGpr(2, 0x800200d9 >>> 0); return; // SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED
     }
-    const aligned = (size + 0xFF) & ~0xFF;
     const uid = kernel.nextBlockId++;
-    kernel.memBlocks.set(uid, { addr, size: aligned, name: "UserBlock", high: type === 1 });
+    kernel.memBlocks.set(uid, { addr, size, name: "UserBlock" });
     log.debug(`AllocMemoryBlock(size=${size}) → uid=${uid} addr=0x${addr.toString(16)}`);
     regs.setGpr(2, uid);
   });
@@ -1051,8 +1362,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     const uid = regs.getGpr(4);
     const block = kernel.memBlocks.get(uid);
     if (block) {
-      if (block.high) kernel.freeHigh(block.addr, block.size);
-      else kernel.freeLow(block.addr, block.size);
+      kernel.userMemory.free(block.addr);
       kernel.memBlocks.delete(uid);
       regs.setGpr(2, 0);
     } else {
@@ -1118,11 +1428,6 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   });
 
   // ── Stubs (no-op / unimplemented) ───────────────────────────────────
-
-  kernel.stub(MUTEX.sceKernelCreateLwMutex);
-  kernel.stub(MUTEX.sceKernelReferLwMutexStatusByID);
-  kernel.stub(MUTEX.sceKernelDeleteLwMutex);
-
 
   kernel.stub(MSG_PIPE.sceKernelDeleteMsgPipe);
   kernel.stub(MSG_PIPE.sceKernelSendMsgPipe);

@@ -56,6 +56,9 @@ interface AtracContext {
   /** Marked true by sceAtracReleaseAtracID — context kept alive so the playback
    *  thread can continue calling sceAtracDecodeData after the decode worker exits. */
   released: boolean;
+  /** Loop count from sceAtracSetLoopNum: 0 = no loop, -1 = infinite, >0 = N loops.
+   *  PPSSPP AtracCtx.cpp: loopNum_ starts 0; looping only happens when != 0. */
+  loopNum: number;
   /** PSP RAM address of the AT3 buffer (for streaming re-read on AddStreamData). */
   bufPtr: number;
   /** Total size of the AT3 buffer as passed to SetDataAndGetID. */
@@ -82,13 +85,30 @@ function atracDecodeData(
   const samplesPerFrame = ctx?.info.samplesPerFrame ?? 512;
 
   if (!ctx?.decodedPcm) {
-    // Decode not yet complete — write silence
+    // Decode unavailable (still running, failed, or no audio backend) — write
+    // silence but keep correct stream pacing: advance the position and raise
+    // the finish flag at the track's declared end so games that wait for a
+    // sound to end don't hang, and BGM player threads don't bail out early.
     if (outAddr !== 0) {
       bus.writeBytes(outAddr, new Uint8Array(samplesPerFrame * 4));
     }
+    let finishFlag = 0;
+    if (ctx) {
+      const total = ctx.info.totalSamples;
+      ctx.decodePos += samplesPerFrame;
+      if (total > 0 && ctx.decodePos >= total) {
+        const hasLoop = ctx.info.loopStart >= 0 && ctx.info.loopEnd > ctx.info.loopStart;
+        if (hasLoop && ctx.loopNum !== 0) {
+          ctx.decodePos = ctx.info.loopStart;
+          if (ctx.loopNum > 0) ctx.loopNum--;
+        } else {
+          finishFlag = 1;
+        }
+      }
+    }
     if (numSamplesPtr !== 0) bus.writeU32(numSamplesPtr, samplesPerFrame);
-    if (finishFlagPtr !== 0) bus.writeU32(finishFlagPtr, 0);
-    if (remainPtr     !== 0) bus.writeU32(remainPtr, 2);
+    if (finishFlagPtr !== 0) bus.writeU32(finishFlagPtr, finishFlag);
+    if (remainPtr     !== 0) bus.writeU32(remainPtr, ctx && ctx.status === AtracStatus.ALL_DATA_LOADED ? (-1 >>> 0) : 2);
     return;
   }
 
@@ -105,16 +125,18 @@ function atracDecodeData(
 
   ctx.decodePos = end;
 
-  // Handle looping: if we've reached the end and valid loop points exist, wrap
-  // back to loopStart and keep playing (finishFlag = 0).
+  // Handle looping at end of stream — PPSSPP Atrac::DecodeData loops only when
+  // loopNum != 0 (set via sceAtracSetLoopNum; -1 = infinite, >0 counts down)
+  // and the track has valid loop points.
   const hasLoop =
     ctx.info.loopStart >= 0 && ctx.info.loopEnd > ctx.info.loopStart;
   let finishFlag: number;
   if (end >= totalPcmFrames) {
-    if (hasLoop) {
+    if (hasLoop && ctx.loopNum !== 0) {
       ctx.decodePos = ctx.info.loopStart;
+      if (ctx.loopNum > 0) ctx.loopNum--;
       finishFlag = 0;
-      log.info(`sceAtracDecodeData id=${ctx.id}: loop wrap loopStart=${ctx.info.loopStart}`);
+      log.info(`sceAtracDecodeData id=${ctx.id}: loop wrap loopStart=${ctx.info.loopStart} loopNum=${ctx.loopNum}`);
     } else {
       finishFlag = 1;
       log.info(`sceAtracDecodeData id=${ctx.id}: end of stream (no loop), finishFlag=1 totalFrames=${totalPcmFrames}`);
@@ -126,10 +148,11 @@ function atracDecodeData(
   if (numSamplesPtr !== 0) bus.writeU32(numSamplesPtr, actualSamples);
   if (finishFlagPtr !== 0) bus.writeU32(finishFlagPtr, finishFlag);
 
-  const remainFrames = Math.max(
-    0,
-    Math.ceil((totalPcmFrames - ctx.decodePos) / samplesPerFrame),
-  );
+  // PPSSPP Atrac::RemainingFrames — ALL_DATA_LOADED returns
+  // PSP_ATRAC_ALLDATA_IS_ON_MEMORY (-1), not a frame count.
+  const remainFrames = ctx.status === AtracStatus.ALL_DATA_LOADED
+    ? (-1 >>> 0)
+    : Math.max(0, Math.ceil((totalPcmFrames - ctx.decodePos) / samplesPerFrame));
   if (remainPtr !== 0) bus.writeU32(remainPtr, remainFrames);
 
   // Log first 20 calls per atrac id to trace game behaviour
@@ -219,10 +242,13 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   kernel.register(AUDIO.sceAudioChReserve, (regs) => {
     const engine = kernel.audioEngine;
     let ch: number;
-    if (engine?.isReady) {
+    if (engine) {
+      // Record channel state even when the engine isn't initialized yet (audio
+      // disabled / headless): blocking output calls read ch.sampleCount to know
+      // how long to block. Leaving it 0 makes audio threads spin forever.
       ch = engine.reserveChannel(regs.getGpr(4) >>> 0, regs.getGpr(5) >>> 0, regs.getGpr(6) >>> 0);
     } else {
-      // Audio disabled — auto-assign a fake channel index so the game proceeds
+      // No engine at all — auto-assign a fake channel index so the game proceeds
       const req = regs.getGpr(4) | 0;
       ch = req === -1 ? (fakeNextCh < 8 ? fakeNextCh++ : -1) : (req < 8 ? req : -1);
     }
@@ -272,10 +298,12 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     }
 
     if (blocking) {
-      // Always block for the real-time duration of the audio buffer, even when
-      // audio is disabled. The PSP DMA takes real time regardless of output.
-      // Without this, audio threads spin infinitely when the engine is off.
-      kernel.blockForAudio(regs, ch?.sampleCount ?? 512, 44_100);
+      // Always block for the duration of the audio buffer, even when audio is
+      // disabled. The PSP DMA takes time regardless of output. Without this,
+      // audio threads spin infinitely when the engine is off. Guard against a
+      // zero sampleCount for the same reason.
+      const samples = ch?.sampleCount || 512;
+      kernel.blockForAudio(regs, samples, 44_100);
     }
   }
 
@@ -351,7 +379,9 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       log.info(`sceAudioSRCOutputBlocking: no-op bufPtr=0x${bufPtr.toString(16)} ch=${ch?.reserved}`);
       regs.setGpr(2, 0);
     }
-    if (engine?.isReady) kernel.blockForAudio(regs, ch?.sampleCount ?? 512, engine.srcRate ?? 44_100);
+    // Always block — even with no audio backend, the call paces the thread
+    // (see outputPcm). Never blocking makes SRC audio threads spin forever.
+    kernel.blockForAudio(regs, (ch?.sampleCount || 512), engine?.srcRate || 44_100);
   });
 
   // ── sceAudioOutput2 API (single shared stereo channel, index 9) ──────────
@@ -386,7 +416,8 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       log.debug(`sceAudioOutput2OutputBlocking: no-op ch=${ch?.reserved} bufPtr=0x${bufPtr.toString(16)}`);
       regs.setGpr(2, 0);
     }
-    if (engine?.isReady) kernel.blockForAudio(regs, ch?.sampleCount ?? 512, 44_100);
+    // Always block — paces the game's mixer thread even with no audio backend.
+    kernel.blockForAudio(regs, (ch?.sampleCount || 512), 44_100);
   });
 
   // sceAudioOutput2GetRestSample() → 0
@@ -409,12 +440,12 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       const sizeHit   = sizeGuess > 0 ? getCachedAtracBySize(sizeGuess, id) : null;
       if (sizeHit) {
         log.debug(`sceAtrac id=${id}: empty buffer — size-based cache hit (bufAlloc=${sizeGuess}, fileSize=${sizeHit.fileSize}, ${sizeHit.pcm.length} samples)`);
-        atracContexts.set(id, { id, info: sizeHit.info, decodedPcm: sizeHit.pcm, decodePos: 0, decoding: false, released: false, bufPtr, bufSize, status, codecType });
+        atracContexts.set(id, { id, info: sizeHit.info, decodedPcm: sizeHit.pcm, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
         return;
       }
       log.warn(`sceAtrac id=${id}: header parse failed: ${err}`);
       info = { codecType: "AT3", totalSamples: 0, loopStart: -1, loopEnd: -1, channels: 2, sampleRate: 44100, samplesPerFrame: 512 };
-      atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: false, released: false, bufPtr, bufSize, status, codecType });
+      atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
       return;
     }
 
@@ -422,11 +453,11 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     const cached = getCachedAtrac(data);
     if (cached) {
       log.debug(`sceAtrac id=${id}: cache hit, ${cached.length / info.channels} frames, totalSamples=${info.totalSamples}, loop=${info.loopStart}..${info.loopEnd}`);
-      atracContexts.set(id, { id, info, decodedPcm: cached, decodePos: 0, decoding: false, released: false, bufPtr, bufSize, status, codecType });
+      atracContexts.set(id, { id, info, decodedPcm: cached, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
       return;
     }
 
-    atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: true, released: false, bufPtr, bufSize, status, codecType });
+    atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: true, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
 
     decodeAtrac(data, info).then((pcm) => {
       const ctx = atracContexts.get(id);
@@ -503,9 +534,10 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   // ── sceAtracDecodeData(id, out, numSamplesPtr, finishFlagPtr, remainPtr) ──
   // NID: 0x6a8c3cd5 (PPSSPP canonical)
   const decodeHandler: HLEHandler = (regs, bus) => {
-    // Skip decode entirely when audio is disabled (engine never initialised).
-    if (!kernel.audioEngine?.isReady) { regs.setGpr(2, 0); return; }
-
+    // NOTE: this must work even when the audio engine is unavailable —
+    // PPSSPP's Atrac::DecodeData always writes numSamples/finishFlag/remains.
+    // Skipping the writes leaves garbage in the out-params and games kill
+    // their BGM threads when they read a bogus finish flag.
     const id  = regs.getGpr(4);
     const ctx = atracContexts.get(id);
     const outAddr = regs.getGpr(5);
@@ -546,12 +578,16 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   kernel.register(ATRAC.sceAtracDecodeData, decodeHandler); // 0x6a8c3cd5 — PPSSPP canonical
 
   // ── sceAtracGetRemainFrame(id, remainAddr) ───────────────────────────────
+  // PPSSPP Atrac::RemainingFrames (AtracCtx.cpp:639): ALL_DATA_LOADED →
+  // PSP_ATRAC_ALLDATA_IS_ON_MEMORY (-1); otherwise frames left in the buffer.
   kernel.register(ATRAC.sceAtracGetRemainFrame, (regs, bus) => {
     const ctx = atracContexts.get(regs.getGpr(4));
-    if (!ctx) { regs.setGpr(2, -1 >>> 0); return; }
-    const remain = ctx.decodedPcm === null
-      ? 1
-      : Math.max(0, Math.ceil((ctx.info.totalSamples - ctx.decodePos) / ctx.info.samplesPerFrame));
+    if (!ctx) { regs.setGpr(2, SCE_ERROR_ATRAC_BAD_ATRACID); return; }
+    const remain = ctx.status === AtracStatus.ALL_DATA_LOADED
+      ? (-1 >>> 0)
+      : (ctx.decodedPcm === null
+          ? 1
+          : Math.max(0, Math.ceil((ctx.info.totalSamples - ctx.decodePos) / ctx.info.samplesPerFrame)));
     const addr = regs.getGpr(5);
     if (addr !== 0) bus.writeU32(addr, remain);
     regs.setGpr(2, 0);
@@ -599,8 +635,25 @@ export function registerAudioHLE(kernel: HLEKernel): void {
 
   // ── sceAtracGetLoopStatus(id, loopNumPtr, statusPtr) ─────────────────────
   kernel.register(ATRAC.sceAtracGetLoopStatus, (regs, bus) => {
-    const lp = regs.getGpr(5); if (lp !== 0) bus.writeU32(lp, 0);
+    const ctx = atracContexts.get(regs.getGpr(4));
+    const lp = regs.getGpr(5); if (lp !== 0) bus.writeU32(lp, (ctx?.loopNum ?? 0) >>> 0);
     const sp = regs.getGpr(6); if (sp !== 0) bus.writeU32(sp, 0);
+    regs.setGpr(2, 0);
+  });
+
+  // ── sceAtracSetLoopNum(id, loopNum) ──────────────────────────────────────
+  // PPSSPP Atrac::SetLoopNum (AtracCtx.cpp:827): errors with
+  // NO_LOOP_INFORMATION when the track has no loop points, else stores loopNum
+  // (-1 = loop forever, N > 0 = loop N times).
+  kernel.register(ATRAC.sceAtracSetLoopNum, (regs) => {
+    const ctx = atracContexts.get(regs.getGpr(4));
+    if (!ctx) { regs.setGpr(2, SCE_ERROR_ATRAC_BAD_ATRACID); return; }
+    const hasLoop = ctx.info.loopStart >= 0 && ctx.info.loopEnd > ctx.info.loopStart;
+    if (!hasLoop) {
+      regs.setGpr(2, 0x80630021); // SCE_ERROR_ATRAC_NO_LOOP_INFORMATION
+      return;
+    }
+    ctx.loopNum = regs.getGpr(5) | 0;
     regs.setGpr(2, 0);
   });
 
@@ -653,7 +706,7 @@ export function registerAudioHLE(kernel: HLEKernel): void {
         channels: 2, sampleRate: 44100,
         samplesPerFrame: codecType === PSP_CODEC_AT3PLUS ? 2048 : 1024,
       },
-      decodedPcm: null, decodePos: 0, decoding: false, released: false,
+      decodedPcm: null, decodePos: 0, decoding: false, released: false, loopNum: 0,
       bufPtr: 0, bufSize: 0,
       status: AtracStatus.LOW_LEVEL,
       codecType,
@@ -806,7 +859,6 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   kernel.stub(ATRAC.sceAtracReleaseResources);
   kernel.stub(ATRAC.sceAtracSetAA3DataAndGetID);
   kernel.stub(ATRAC.sceAtracSetAA3HalfwayBufferAndGetID);
-  kernel.stub(ATRAC.sceAtracSetLoopNum);
   kernel.stub(ATRAC.sceAtracSetMOutData);
   kernel.stub(ATRAC.sceAtracSetMOutDataAndGetID);
   kernel.stub(ATRAC.sceAtracSetMOutHalfwayBuffer);

@@ -16,6 +16,10 @@ export interface Vertex {
    *  PPSSPP: VertexData::clipw, set during TransformUnit::WorldToScreen (TransformUnit.cpp:417).
    *  Only set for transform-mode vertices; through-mode leaves this as 1.0. */
   clipw: number;
+  /** Per-vertex fog coefficient [0=full fog, 1=no fog].
+   *  PPSSPP SoftwareTransformCommon.cpp:353: fogCoef = (viewZ + fogEnd) * fogSlope.
+   *  Through-mode: always 1.0 (fog disabled). */
+  fogCoef: number;
 }
 
 // Shared reinterpret buffer for float bit-casting (avoids per-call allocations)

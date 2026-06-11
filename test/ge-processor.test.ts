@@ -641,7 +641,7 @@ describe("computeVertexLighting", () => {
 
 describe("tessellateBezier", () => {
   function makeControlPoint(x: number, y: number, z: number): import("../src/gpu/ge-types.js").Vertex {
-    return { x, y, z, u: x / 3, v: y / 3, color: 0xFFFFFFFF, nx: 0, ny: 0, nz: 1, clipw: 1.0 };
+    return { x, y, z, u: x / 3, v: y / 3, color: 0xFFFFFFFF, nx: 0, ny: 0, nz: 1, clipw: 1.0, fogCoef: 1.0 };
   }
 
   it("should return empty for uCount < 4", () => {
@@ -708,7 +708,7 @@ describe("tessellateBezier", () => {
 
 describe("tessellateSpline", () => {
   function makeControlPoint(x: number, y: number, z: number): import("../src/gpu/ge-types.js").Vertex {
-    return { x, y, z, u: x / 3, v: y / 3, color: 0xFFFFFFFF, nx: 0, ny: 0, nz: 1, clipw: 1.0 };
+    return { x, y, z, u: x / 3, v: y / 3, color: 0xFFFFFFFF, nx: 0, ny: 0, nz: 1, clipw: 1.0, fogCoef: 1.0 };
   }
 
   it("should return empty for uCount < 4", () => {

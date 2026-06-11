@@ -37,12 +37,16 @@ export class AllegrexRegisters {
 
   /** FPU registers f0–f31 (single-precision float, stored as raw u32 bits) */
   readonly fpr: Uint32Array = new Uint32Array(32);
+  /** Float view over the same buffer as `fpr` — avoids per-access allocation. */
+  private readonly fprF32: Float32Array = new Float32Array(this.fpr.buffer);
   /** FPU condition code flag (used by C.cond.S and BC1T/BC1F) */
   fcr31: number = 0; // FCSR — FPU control/status register
 
   // ── VFPU registers ──────────────────────────────────────────────────────
   /** VFPU registers: 128 scalars organized as 8 4x4 matrices (float32) */
   readonly vfpr: Float32Array = new Float32Array(128);
+  /** Raw-bits view over the same buffer as `vfpr` — avoids per-access allocation. */
+  private readonly vfprU32: Uint32Array = new Uint32Array(this.vfpr.buffer);
   /** VFPU control registers (VFPU_CTRL) */
   readonly vfpuCtrl: Uint32Array = new Uint32Array(16);
   /** VFPU condition register */
@@ -57,14 +61,12 @@ export class AllegrexRegisters {
 
   /** Read FPR as float */
   getFpr(index: number): number {
-    const buf = new Float32Array(this.fpr.buffer, index * 4, 1);
-    return buf[0]!;
+    return this.fprF32[index]!;
   }
 
   /** Write FPR as float */
   setFpr(index: number, value: number): void {
-    const buf = new Float32Array(this.fpr.buffer, index * 4, 1);
-    buf[0] = value;
+    this.fprF32[index] = value;
   }
 
   /** Read FPR raw bits as u32 */
@@ -79,14 +81,12 @@ export class AllegrexRegisters {
 
   /** Read VFPU scalar raw bits as u32 */
   getVfprBits(index: number): number {
-    const view = new DataView(this.vfpr.buffer, this.vfpr.byteOffset);
-    return view.getUint32(index * 4, true);
+    return this.vfprU32[index]!;
   }
 
   /** Write VFPU scalar raw bits from u32 */
   setVfprBits(index: number, value: number): void {
-    const view = new DataView(this.vfpr.buffer, this.vfpr.byteOffset);
-    view.setUint32(index * 4, value, true);
+    this.vfprU32[index] = value >>> 0;
   }
 
   /** Read VFPU scalar as float */
