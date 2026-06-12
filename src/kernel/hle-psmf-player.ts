@@ -451,45 +451,8 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  // ── sceMpeg real handlers ──────────────────────────────────────────────────
-  // Many games use sceMpeg API for cutscenes. Implement the essentials.
-
+  // sceMpeg handlers live in hle-mpeg.ts (registered after this module).
   const stub0 = (regs: AllegrexRegisters) => { regs.setGpr(2, 0); };
-
-  // sceMpegInit
-  kernel.register(PSMF.sceMpegInit, stub0);
-  // sceMpegFinish
-  kernel.register(PSMF.sceMpegFinish, stub0);
-  // sceMpegQueryMemSize — return small size
-  kernel.register(PSMF.sceMpegQueryMemSize, (regs) => { regs.setGpr(2, 0x10000); });
-  // sceMpegCreate
-  kernel.register(PSMF.sceMpegCreate, stub0);
-  // sceMpegDelete
-  kernel.register(PSMF.sceMpegDelete, stub0);
-  // sceMpegRegistStream
-  kernel.register(PSMF.sceMpegRegistStream, (regs) => { regs.setGpr(2, 1); }); // return stream id
-  // sceMpegUnRegistStream
-  kernel.register(PSMF.sceMpegUnRegistStream, stub0);
-  // sceMpegRingbufferQueryMemSize
-  kernel.register(PSMF.sceMpegRingbufferQueryMemSize, (regs) => { regs.setGpr(2, 0x10000); });
-  // sceMpegRingbufferConstruct
-  kernel.register(PSMF.sceMpegRingbufferConstruct, stub0);
-  // sceMpegRingbufferDestruct
-  kernel.register(PSMF.sceMpegRingbufferDestruct, stub0);
-  // sceMpegMallocAvcEsBuf — return fake pointer
-  kernel.register(PSMF.sceMpegMallocAvcEsBuf, (regs) => { regs.setGpr(2, 1); });
-  // sceMpegFreeAvcEsBuf
-  kernel.register(PSMF.sceMpegFreeAvcEsBuf, stub0);
-  // sceMpegInitAu
-  kernel.register(PSMF.sceMpegInitAu, stub0);
-  // sceMpegQueryStreamOffset
-  kernel.register(PSMF.sceMpegQueryStreamOffset, stub0);
-  // sceMpegQueryStreamSize
-  kernel.register(PSMF.sceMpegQueryStreamSize, (regs) => { regs.setGpr(2, 0); });
-  // sceMpegFlushAllStream
-  kernel.register(PSMF.sceMpegFlushAllStream, stub0);
-  // sceMpegAvcDecodeMode
-  kernel.register(PSMF.sceMpegAvcDecodeMode, stub0);
 
   // ── scePsmf container real handlers ────────────────────────────────────────
   // scePsmfSetPsmf

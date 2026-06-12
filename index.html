@@ -54,6 +54,13 @@
               <label class="debug-toggle" title="Skip all audio decoding and AudioEngine init (for performance testing)">
                 <input type="checkbox" id="disable-audio-chk" checked> Disable audio
               </label>
+              <label class="debug-toggle" title="Renderer used for GE primitives (applies on boot). Software rasterizes into VRAM on the CPU — slower but useful for comparing against WebGL output.">
+                Renderer
+                <select id="renderer-select">
+                  <option value="webgl" selected>WebGL</option>
+                  <option value="software">Software</option>
+                </select>
+              </label>
             </div>
           </div>
         </div>

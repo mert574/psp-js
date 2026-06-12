@@ -39,6 +39,22 @@ document.getElementById("game-library")?.addEventListener("game-select", (e: Eve
   void handleIso(detail.file, detail.parentDir ?? undefined);
 });
 
+// ── Debug: ?iso=/name.iso fetches an ISO served from public/ and boots it ────
+// Lets scripted browser sessions load a game without the folder picker.
+void (async () => {
+  const isoParam = new URLSearchParams(location.search).get("iso");
+  if (!isoParam) return;
+  try {
+    const resp = await fetch(isoParam);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    const name = isoParam.split("/").pop() ?? "game.iso";
+    await handleIso(new File([blob], name));
+  } catch (err) {
+    log.error(`?iso= autoload failed: ${err}`);
+  }
+})();
+
 // Load bundled PPSSPP open-source replacement PGF fonts eagerly
 void (async () => {
   const names = [
@@ -58,6 +74,10 @@ void (async () => {
 
 function isAudioDisabled(): boolean {
   return (document.getElementById("disable-audio-chk") as HTMLInputElement | null)?.checked ?? false;
+}
+
+function isSoftwareRenderer(): boolean {
+  return (document.getElementById("renderer-select") as HTMLSelectElement | null)?.value === "software";
 }
 
 // ── Hash-based router ─────────────────────────────────────────────────────────
@@ -131,8 +151,13 @@ bootBtn.addEventListener("click", () => {
 
   const canvas = document.getElementById("psp-canvas") as HTMLCanvasElement;
 
-  // Create WebGL GE renderer (GPU-accelerated primitives)
-  geRenderer = new WebGLGERenderer(canvas);
+  // Renderer choice applies on boot: WebGL draws GE primitives on the GPU,
+  // software rasterizes into VRAM and we present VRAM bytes each frame.
+  if (isSoftwareRenderer()) {
+    renderer = new FramebufferRenderer(canvas);
+  } else {
+    geRenderer = new WebGLGERenderer(canvas);
+  }
   debugPanel = new DebugPanel();
 
   emulator = new PSPEmulator();

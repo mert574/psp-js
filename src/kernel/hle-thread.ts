@@ -124,16 +124,35 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     exitThread(regs);
   });
 
-  // sceKernelExitDeleteThread
-  kernel.register(THREAD.sceKernelExitDeleteThread, exitThread);
+  // sceKernelExitDeleteThread — also frees the stack (PPSSPP __KernelDeleteThread
+  // → Cleanup() → FreeStack()). The thread entry stays as DEAD so waiters/exit
+  // status queries keep working; a later DeleteThread double-free is a no-op.
+  kernel.register(THREAD.sceKernelExitDeleteThread, (regs) => {
+    const t = kernel.threads.get(kernel.currentThreadId);
+    exitThread(regs);
+    if (t) kernel.userMemory.free(t.stackBase);
+  });
   // sceKernelExitThread
   kernel.register(THREAD.sceKernelExitThread, exitThread);
 
   // ── Sleep / Delay ────────────────────────────────────────────────────
 
   const sleepThread = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
+    // Waiting is illegal in interrupt/GE-callback context — blocking would save
+    // mid-callback CPU state into the thread context and corrupt it on wake.
+    if (kernel.inInterrupt) {
+      regs.setGpr(2, 0x800201a7); // SCE_KERNEL_ERROR_CAN_NOT_WAIT
+      return;
+    }
     const t = kernel.threads.get(kernel.currentThreadId);
     if (t) {
+      // PPSSPP __KernelSleepThread: a wakeup that arrived before we slept is
+      // remembered as wakeupCount — consume it and return without blocking.
+      if (t.wakeupCount > 0) {
+        t.wakeupCount--;
+        regs.setGpr(2, 0);
+        return;
+      }
       t.state    = ThreadState.WAITING;
       t.waitType = WaitType.SLEEP;
       kernel.saveContext(t, regs);
@@ -146,6 +165,11 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
   const delayThread = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
     const usec = regs.getGpr(4);
+    // Waiting is illegal in interrupt/GE-callback context (see sleepThread)
+    if (kernel.inInterrupt) {
+      regs.setGpr(2, 0x800201a7); // SCE_KERNEL_ERROR_CAN_NOT_WAIT
+      return;
+    }
     const t = kernel.threads.get(kernel.currentThreadId);
     if (t) {
       t.state    = ThreadState.WAITING;
@@ -261,6 +285,11 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
   // sceKernelStartThread(thid, arglen, argp)
   kernel.register(THREAD.sceKernelStartThread, (regs) => {
+    // PPSSPP: HLE_NOT_IN_INTERRUPT flag (sceKernel.cpp:772)
+    if (kernel.inInterrupt) {
+      regs.setGpr(2, 0x80020064); // SCE_KERNEL_ERROR_ILLEGAL_CONTEXT
+      return;
+    }
     const thid   = regs.getGpr(4);
     const arglen = regs.getGpr(5);
     const argp   = regs.getGpr(6) >>> 0;
@@ -350,12 +379,19 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.register(THREAD.sceKernelWakeupThread, (regs) => {
     const thid = regs.getGpr(4);
     const t    = kernel.threads.get(thid);
-    if (t && t.state === ThreadState.WAITING && t.waitType === WaitType.SLEEP) {
-      t.state    = ThreadState.READY;
-      t.waitType = WaitType.NONE;
-      t.context.gpr[2] = 0;
+    regs.setGpr(2, 0); // set return value before any reschedule (saves caller regs)
+    if (t) {
+      if (t.state === ThreadState.WAITING && t.waitType === WaitType.SLEEP) {
+        // Thread is sleeping → wake it. Higher-priority wakee preempts via reschedule.
+        t.state    = ThreadState.READY;
+        t.waitType = WaitType.NONE;
+        t.context.gpr[2] = 0;
+        kernel.reschedule(regs);
+      } else {
+        // Not sleeping yet → remember the wakeup (PPSSPP wakeupCount++).
+        t.wakeupCount++;
+      }
     }
-    regs.setGpr(2, 0);
   });
 
   // sceKernelGetThreadExitStatus(thid)
@@ -393,6 +429,8 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
   // sceKernelDeleteThread(thid)
   kernel.register(THREAD.sceKernelDeleteThread, (regs) => {
+    const t = kernel.threads.get(regs.getGpr(4));
+    if (t) kernel.userMemory.free(t.stackBase); // PPSSPP Cleanup() → FreeStack()
     kernel.threads.delete(regs.getGpr(4));
     regs.setGpr(2, 0);
   });
@@ -1100,6 +1138,11 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
   // sceKernelTerminateThread(thid) — force a thread to DORMANT
   kernel.register(KERNEL.sceKernelTerminateThread, (regs) => {
+    // PPSSPP sceKernelThread.cpp:2219-2220 — only an error on newer SDKs
+    if (kernel.inInterrupt && kernel.compiledSdkVersion >= 0x03080000) {
+      regs.setGpr(2, 0x80020064); // SCE_KERNEL_ERROR_ILLEGAL_CONTEXT
+      return;
+    }
     const thid = regs.getGpr(4);
     const t = kernel.threads.get(thid);
     if (!t) { regs.setGpr(2, 0x800201bc >>> 0); return; } // UNKNOWN_THID
@@ -1114,6 +1157,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     const t = kernel.threads.get(thid);
     if (!t) { regs.setGpr(2, 0x800201bc >>> 0); return; }
     t.state = ThreadState.DEAD;
+    kernel.userMemory.free(t.stackBase); // PPSSPP Cleanup() → FreeStack()
     kernel.threads.delete(thid);
     regs.setGpr(2, 0);
   });

@@ -230,8 +230,9 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   };
 
   // BREAK trampoline for VTimer handler callbacks (same pattern as GE callbacks).
-  // Placed at a fixed low-kernel address that doesn't conflict with GE trampoline (0x08000010).
-  const VTIMER_TRAMPOLINE_ADDR = 0x08000020;
+  // Placed at a fixed low-kernel address that doesn't conflict with the GE
+  // trampoline (0x08000010), cb return (0x08000020), or module return (0x08000030).
+  const VTIMER_TRAMPOLINE_ADDR = 0x08000040;
   let vtimerTrampolineWritten = false;
   // PPSSPP VTimerIntrHandler uses 48 bytes of stack for arguments
   const HANDLER_STACK_SPACE = 48;

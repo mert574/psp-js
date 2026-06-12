@@ -25,7 +25,9 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   //  116:  dataBuf (PSP pointer)
   //  120:  dataBufSize (u32)
   //  124:  dataSize (u32)
-  let savedataStatus = 0; // 0=NONE, 2=VISIBLE, 3=QUIT, 4=FINISHED
+  // PPSSPP PSPDialog.h: 0=NONE, 1=INITIALIZE, 2=RUNNING, 3=FINISHED, 4=SHUTDOWN.
+  // Games poll GetStatus for 3 (FINISHED), then call ShutdownStart → 4 → 0.
+  let savedataStatus = 0;
   let savedataParamAddr = 0;
   let savedataResult = 0;
   let savedataIoComplete = false;
@@ -74,7 +76,7 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
 
     log.info(`sceUtilitySavedataInitStart: mode=${mode} game=${gameName} save=${saveName} file=${fileName} buf=0x${dataBuf.toString(16)} bufSize=${dataBufSize} dataSize=${dataSize}`);
 
-    savedataStatus = 2; // VISIBLE
+    savedataStatus = 1; // INITIALIZE — first GetStatus returns 1, then auto-advances to RUNNING
 
     // Notify UI overlay
     kernel.onSavedataEvent?.(action, gameName, saveName, false, false);
@@ -362,17 +364,16 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  // sceUtilitySavedataGetStatus — PPSSPP PSPDialog.cpp:38-47
-  // Returns the CURRENT status, then advances the state machine.
-  kernel.register(UTILITY.sceUtilitySavedataGetStatus, (regs, bus) => {
+  // sceUtilitySavedataGetStatus — PPSSPP PSPDialog::GetStatus (auto-status):
+  // returns the current status, then INITIALIZE→RUNNING and SHUTDOWN→NONE.
+  // FINISHED stays until the game calls ShutdownStart.
+  kernel.register(UTILITY.sceUtilitySavedataGetStatus, (regs) => {
     const prev = savedataStatus;
-    if (savedataStatus === 3) {
-      savedataStatus = 4; // QUIT → FINISHED
-      if (savedataParamAddr !== 0) bus.writeU32(savedataParamAddr + 28, savedataResult);
+    if (savedataStatus === 1) {
+      savedataStatus = 2; // INITIALIZE → RUNNING
     } else if (savedataStatus === 4) {
-      savedataStatus = 0; // FINISHED → NONE
+      savedataStatus = 0; // SHUTDOWN → NONE
     }
-    // Note: VISIBLE(2) → QUIT(3)/FINISHED(4) transition happens in Update, not here
     regs.setGpr(2, prev);
   });
 
@@ -382,7 +383,7 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     if (savedataParamAddr !== 0) {
       bus.writeU32(savedataParamAddr + 28, savedataResult);
     }
-    savedataStatus = 3; // force to QUIT so next GetStatus → FINISHED
+    savedataStatus = 4; // SHUTDOWN — next GetStatus returns 4, then NONE
     // Notify UI that operation completed
     kernel.onSavedataEvent?.("", "", "", true, savedataResult !== 0);
     regs.setGpr(2, 0);
@@ -400,12 +401,12 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
       savedataUpdateCount++;
       if (savedataIoComplete) {
         if (NON_VISIBLE_MODES.has(savedataMode)) {
-          // PPSSPP DS_NONE path: IO done → go directly to FINISHED (skip QUIT)
-          savedataStatus = 4; // FINISHED
+          // PPSSPP DS_NONE path: IO done → FINISHED; game polls 3 then calls ShutdownStart
+          savedataStatus = 3;
           if (savedataParamAddr !== 0) bus.writeU32(savedataParamAddr + 28, savedataResult);
         } else if (savedataUpdateCount >= 3) {
           // Visible dialog: auto-dismiss after a few frames (simulates user pressing X)
-          savedataStatus = 3; // QUIT
+          savedataStatus = 3; // FINISHED
           if (savedataParamAddr !== 0) bus.writeU32(savedataParamAddr + 28, savedataResult);
         }
       }

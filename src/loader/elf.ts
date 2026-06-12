@@ -183,9 +183,12 @@ export function loadElf(data: Uint8Array, bus: MemoryBus, baseAddress?: number, 
     applyRelocations(view, le, shoff, shentsize, shnum, baseAddr, segmentBases, bus);
   }
 
-  // Parse module_info and patch import stubs
+  // Parse module_info and patch import stubs.
+  // PPSSPP does this for BOTH ET_PRX and ET_EXEC (decrypted retail EBOOTs are
+  // often ET_EXEC) — sceKernelModule.cpp uses the same paddr formula for each.
   const nidBySyscall = new Map<number, number>();
-  if (isPrx && phnum > 0) {
+  const pPaddrCheck = phnum > 0 ? view.getUint32(phoff + 0x0c, le) : 0;
+  if (phnum > 0 && pPaddrCheck !== 0) {
     const ph0 = phoff;
     const pPaddr   = view.getUint32(ph0 + 0x0c, le);
     const pVaddr0  = view.getUint32(ph0 + 0x08, le);

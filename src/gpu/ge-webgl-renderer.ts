@@ -798,12 +798,13 @@ export class WebGLGERenderer {
       this.uvOffsetU = 0;
       this.uvOffsetV = 0;
     } else {
-      // Transform mode (texMapMode 0): sampleTexture applies texScaleU + texOffsetU
-      // rawU = u * texScaleU + texOffsetU → texel coord → normalized = rawU / tw
-      this.uvScaleU = ts.texScaleU / tw;
-      this.uvScaleV = ts.texScaleV / th;
-      this.uvOffsetU = ts.texOffsetU / tw;
-      this.uvOffsetV = ts.texOffsetV / th;
+      // Transform mode (texMapMode 0): PPSSPP TransformUnit computes
+      // uv = tc * uvScale + uvOff in NORMALIZED space (the rasterizer then
+      // multiplies by texture size). Normalized GL coords use it directly.
+      this.uvScaleU = ts.texScaleU;
+      this.uvScaleV = ts.texScaleV;
+      this.uvOffsetU = ts.texOffsetU;
+      this.uvOffsetV = ts.texOffsetV;
     }
   }
 

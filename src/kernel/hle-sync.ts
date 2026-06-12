@@ -242,6 +242,15 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       return;
     }
 
+    // Real PSP: waiting inside an interrupt/GE-callback context is illegal.
+    // Blocking here would save mid-callback CPU state into the thread context
+    // (the GE trampoline return address is on the stack) and corrupt execution
+    // when the thread later wakes (Burnout Legends does this every frame).
+    if (kernel.inInterrupt) {
+      regs.setGpr(2, 0x800201a7); // SCE_KERNEL_ERROR_CAN_NOT_WAIT
+      return;
+    }
+
     const t = kernel.threads.get(kernel.currentThreadId);
     if (t) {
       t.state = ThreadState.WAITING;
@@ -900,6 +909,11 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       if (outBitsPtr !== 0) bus.writeU32(outBitsPtr, evf.pattern);
       evfApplyClear(evf, bits, waitMode);
       regs.setGpr(2, 0);
+      return;
+    }
+    // Waiting is illegal in interrupt/GE-callback context (see waitSema)
+    if (kernel.inInterrupt) {
+      regs.setGpr(2, 0x800201a7); // SCE_KERNEL_ERROR_CAN_NOT_WAIT
       return;
     }
     // Block the thread

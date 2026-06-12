@@ -42,6 +42,9 @@ export class GEProcessor {
   /** When set, route PRIM and clear commands to WebGL instead of software rasterization. */
   webglRenderer: WebGLGERenderer | null = null;
 
+  /** Cached u32 view over VRAM for the sprite fill fast path. */
+  private vram32: Uint32Array | null = null;
+
   // GE state registers
   private baseAddr = 0;
   private offsetAddr = 0;
@@ -246,6 +249,17 @@ export class GEProcessor {
   private viewMatIdx  = 0;
   private projMatIdx  = 0;
   private tgenMatIdx  = 0; // texture gen matrix (ignored, but track index)
+
+  /** Matrix readback for sceGeGetMtx — type 0-7 bone, 8 world, 9 view,
+   *  10 proj (16 floats), 11 texgen (PPSSPP GPUCommon::GetMatrix24). */
+  getMatrixFloats(type: number): Float32Array | null {
+    if (type >= 0 && type <= 7) return this.boneMats.subarray(type * 12, type * 12 + 12);
+    if (type === 8) return this.worldMat;
+    if (type === 9) return this.viewMat;
+    if (type === 10) return this.projMat;
+    if (type === 11) return this.tgenMat;
+    return null;
+  }
 
   // Viewport (GE float24 decoded, typically in pixel units)
   private vpScaleX  = 240;
@@ -782,10 +796,10 @@ export class GEProcessor {
         case 0x3E: // PROJMATRIXNUMBER
           this.projMatIdx = param & 0xF;
           break;
-        case 0x3F: // PROJMATRIXDATA
-          if (this.projMatIdx < 16) {
-            this.projMat[this.projMatIdx++] = getFloat24(param);
-          }
+        case 0x3F: // PROJMATRIXDATA — the 16-slot counter wraps on real hardware
+          // (gpu/ge/get expects writes 16-19 to land at slots 0-3)
+          this.projMat[this.projMatIdx] = getFloat24(param);
+          this.projMatIdx = (this.projMatIdx + 1) & 0xF;
           break;
 
         // ── Texture gen matrix ────────────────────────────────────
@@ -1506,14 +1520,14 @@ export class GEProcessor {
 
     if (sx0 >= sx1 || sy0 >= sy1) {
       // Zero-area: log transform-mode sprites that collapsed to a point (helps debug invisible sprites)
-      if (((this.vtypeRaw >>> 23) & 1) === 0) {
+      if (Logger.debugEnabled && ((this.vtypeRaw >>> 23) & 1) === 0) {
         log.debug(`SPRITE zero-area (transform mode): v0=(${v0.x.toFixed(1)},${v0.y.toFixed(1)}) v1=(${v1.x.toFixed(1)},${v1.y.toFixed(1)}) → sx=${sx0}..${sx1} sy=${sy0}..${sy1}`);
       }
       return;
     }
 
     // Diagnostic: log small sprites (1-4px tall) to investigate horizontal-line artifacts
-    if (sy1 - sy0 <= 4) {
+    if (Logger.debugEnabled && sy1 - sy0 <= 4) {
       log.debug(`SPRITE h=${sy1-sy0} x=${sx0}..${sx1} y=${sy0}..${sy1} uv0=(${v0.u.toFixed(1)},${v0.v.toFixed(1)}) uv1=(${v1.u.toFixed(1)},${v1.v.toFixed(1)}) tex=${this.texEnable} fmt=${this.texFormat} swiz=${this.texSwizzle} texW=${this.texWidth0} texH=${this.texHeight0} bw=${this.texBufWidth0} clutFmt=${this.clutFormat} clutShift=${this.clutShift} clutMask=${this.clutMask.toString(16)} through=${(this.vtypeRaw>>>23)&1}`);
     }
 
@@ -1549,13 +1563,16 @@ export class GEProcessor {
     const noBlend = !this.alphaBlendEnable;
     const noAtest = !this.alphaTestEnable;
     if (!useTexture && bpp === 4 && noBlend && noAtest && this.maskRgb === 0 && this.maskAlpha === 0) {
-      // Pack pixel as RGBA for direct u32 write (little-endian: R,G,B,A)
-      const r = (vc >>> 16) & 0xFF;
+      // Vertex color is PSP ABGR (R in the low byte); VRAM bytes are R,G,B,A.
+      const r = (vc >>>  0) & 0xFF;
       const g = (vc >>>  8) & 0xFF;
-      const b = (vc >>>  0) & 0xFF;
+      const b = (vc >>> 16) & 0xFF;
       const a = (vc >>> 24) & 0xFF;
       const pixel = r | (g << 8) | (b << 16) | (a << 24);
-      const vram32 = new Uint32Array(vram.buffer, vram.byteOffset);
+      if (!this.vram32 || this.vram32.buffer !== vram.buffer) {
+        this.vram32 = new Uint32Array(vram.buffer, vram.byteOffset);
+      }
+      const vram32 = this.vram32;
       for (let y = yStart; y < yEnd; y++) {
         const rowOff = (fbOff + y * stride * 4) >>> 2;
         for (let x = xStart; x < xEnd; x++) {
@@ -1564,13 +1581,13 @@ export class GEProcessor {
       }
     } else {
       // General path with texture sampling and fragment processing
+      const pr = (vc >>> 16) & 0xFF;
+      const pg = (vc >>>  8) & 0xFF;
+      const pb = (vc >>>  0) & 0xFF;
+      const pa = (vc >>> 24) & 0xFF;
       for (let y = yStart; y < yEnd; y++) {
         for (let x = xStart; x < xEnd; x++) {
           let r: number, g: number, b: number, a: number;
-          const pr = (vc >>> 16) & 0xFF;
-          const pg = (vc >>>  8) & 0xFF;
-          const pb = (vc >>>  0) & 0xFF;
-          const pa = (vc >>> 24) & 0xFF;
 
           if (useTexture) {
             const tu = u0 + (x - sx0 + 0.5) * du;
@@ -1580,7 +1597,8 @@ export class GEProcessor {
             const tg = (texel >>>  8) & 0xFF;
             const tb = (texel >>>  0) & 0xFF;
             const ta = (texel >>> 24) & 0xFF;
-            [r, g, b, a] = applyTexFunc(fs, tr, tg, tb, ta, pr, pg, pb, pa);
+            const o = applyTexFunc(fs, tr, tg, tb, ta, pr, pg, pb, pa);
+            r = o[0]!; g = o[1]!; b = o[2]!; a = o[3]!;
           } else {
             r = pr; g = pg; b = pb; a = pa;
           }
@@ -1620,10 +1638,17 @@ export class GEProcessor {
     const invArea = 1.0 / area;
 
     let _dbgTriPixels = 0;
+    const edges: [Vertex, Vertex][] = [[a, b], [b, c], [a, c]];
+
+    // Per-vertex color channels (R/B swapped for shader convention), constant per triangle
+    const ca = a.color, cb2 = b.color, cc = c.color;
+    const car = (ca >>> 16) & 0xFF, cag = (ca >>> 8) & 0xFF, cab = ca & 0xFF, caa = (ca >>> 24) & 0xFF;
+    const cbr = (cb2 >>> 16) & 0xFF, cbg = (cb2 >>> 8) & 0xFF, cbb = cb2 & 0xFF, cba = (cb2 >>> 24) & 0xFF;
+    const ccr = (cc >>> 16) & 0xFF, ccg = (cc >>> 8) & 0xFF, ccb = cc & 0xFF, cca = (cc >>> 24) & 0xFF;
+
     for (let y = minY; y <= maxY; y++) {
       // Find x range by edge intersection at this scanline
       let xMin = 480, xMax = -1;
-      const edges: [Vertex, Vertex][] = [[a, b], [b, c], [a, c]];
       for (const [e0, e1] of edges) {
         const ey0 = e0.y, ey1 = e1.y;
         if ((y < ey0 && y < ey1) || (y > ey0 && y > ey1)) continue;
@@ -1650,11 +1675,10 @@ export class GEProcessor {
         let r: number, g: number, b2: number, alpha: number;
 
         // Interpolate vertex prim color (R/B swapped for shader convention)
-        const ca = a.color, cb2 = b.color, cc = c.color;
-        const pr = (((ca >>> 16) & 0xFF) * w1 + ((cb2 >>> 16) & 0xFF) * w2 + ((cc >>> 16) & 0xFF) * w3) | 0;
-        const pg = (((ca >>>  8) & 0xFF) * w1 + ((cb2 >>>  8) & 0xFF) * w2 + ((cc >>>  8) & 0xFF) * w3) | 0;
-        const pb = (((ca >>>  0) & 0xFF) * w1 + ((cb2 >>>  0) & 0xFF) * w2 + ((cc >>>  0) & 0xFF) * w3) | 0;
-        const pa = (((ca >>> 24) & 0xFF) * w1 + ((cb2 >>> 24) & 0xFF) * w2 + ((cc >>> 24) & 0xFF) * w3) | 0;
+        const pr = (car * w1 + cbr * w2 + ccr * w3) | 0;
+        const pg = (cag * w1 + cbg * w2 + ccg * w3) | 0;
+        const pb = (cab * w1 + cbb * w2 + ccb * w3) | 0;
+        const pa = (caa * w1 + cba * w2 + cca * w3) | 0;
 
         if (useTexture) {
           // PPSSPP Rasterizer.cpp:1091 — "Color interpolation is NOT perspective corrected on the PSP."
@@ -1684,7 +1708,8 @@ export class GEProcessor {
           const tg = (texel >>>  8) & 0xFF;
           const tb = (texel >>>  0) & 0xFF;  // R of texel
           const ta = (texel >>> 24) & 0xFF;
-          [r, g, b2, alpha] = applyTexFunc(fs, tr, tg, tb, ta, pr, pg, pb, pa);
+          const o = applyTexFunc(fs, tr, tg, tb, ta, pr, pg, pb, pa);
+          r = o[0]!; g = o[1]!; b2 = o[2]!; alpha = o[3]!;
         } else {
           r = pr; g = pg; b2 = pb; alpha = pa;
         }
@@ -1698,7 +1723,7 @@ export class GEProcessor {
       }
     }
     // Diagnostic: log triangles with valid area but 0 pixels written
-    if (_dbgTriPixels === 0 && Math.abs(area) > 100) {
+    if (Logger.debugEnabled && _dbgTriPixels === 0 && Math.abs(area) > 100) {
       const texel0 = useTexture ? sampleTexture(ts, this.bus, v0.u, v0.v) : 0;
       log.debug(
         `TRI invisible: v0=(${v0.x.toFixed(0)},${v0.y.toFixed(0)}) v1=(${v1.x.toFixed(0)},${v1.y.toFixed(0)}) v2=(${v2.x.toFixed(0)},${v2.y.toFixed(0)}) ` +

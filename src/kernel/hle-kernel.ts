@@ -11,6 +11,7 @@ import { PGF } from "./hle-font.js";
 import { PspFileSystem } from "./psp-filesystem.js";
 import { AudioEngine } from "../audio/audio-engine.js";
 import type { SavedataStore } from "../storage/savedata-store.js";
+import type { FileStore } from "../storage/file-store.js";
 import { registerAudioHLE } from "./hle-audio.js";
 import { registerThreadHLE } from "./hle-thread.js";
 import { registerSyncHLE } from "./hle-sync.js";
@@ -20,6 +21,7 @@ import { registerIoHLE } from "./hle-io.js";
 import { registerPowerHLE } from "./hle-power.js";
 import { registerNetHLE } from "./hle-net.js";
 import { registerMediaHLE } from "./hle-media.js";
+import { registerMpegHLE } from "./hle-mpeg.js";
 import { registerPsmfPlayerHLE } from "./hle-psmf-player.js";
 import { registerUtilityHLE } from "./hle-utility.js";
 import {
@@ -99,6 +101,12 @@ export enum GeSignalBehavior {
   JUMP = 0x10,
   CALL = 0x11,
   RET = 0x12,
+  RJUMP = 0x13,
+  RCALL = 0x14,
+  OJUMP = 0x15,
+  OCALL = 0x16,
+  BREAK1 = 0xF0,
+  BREAK2 = 0xFF,
 }
 
 /** GE call stack entry (for CALL/RET and SIGNAL CALL/RET) */
@@ -106,6 +114,11 @@ interface GeCallStackEntry {
   pc: number;
   offsetAddr: number;
   baseAddr: number;
+  /** Raw BASE (0x10) cmdmem op at SIGNAL CALL time — SIGNAL RET restores it
+   *  (real PSP restores the BASE register; gpu/ge/get checks via sceGeGetCmd). */
+  baseCmd?: number;
+  /** Raw OFFSET_ADDR (0x13) cmdmem op at SIGNAL CALL time */
+  offsetCmd?: number;
 }
 
 export interface GeListEntry {
@@ -133,6 +146,10 @@ export interface GeListEntry {
   stackAddr: number;
   /** Context pointer from PspGeListArgs (PPSSPP DisplayList::context) */
   contextPtr: number;
+  /** True after SIGNAL+END with an unknown behavior — the GE stops at the END
+   *  but the list stays DRAWING (real PSP; gpu/signals/simple "Unknown" cases).
+   *  Only sceGeBreak clears it (entries are recreated on enqueue). */
+  signalHalted: boolean;
 }
 
 export interface ThreadContext {
@@ -219,6 +236,9 @@ export class HLEKernel {
   /** Persistent save data storage (IndexedDB in browser, in-memory fallback in Node.js) */
   savedataStore: SavedataStore | null = null;
 
+  /** Persistent storage for raw file IO writes (sceIoWrite to ms0:). */
+  fileStore: FileStore | null = null;
+
   /** Optional callback for savedata UI overlay: (action, gameName, saveName, done, error) */
   onSavedataEvent: ((action: string, game: string, save: string, done: boolean, error: boolean) => void) | null = null;
 
@@ -295,8 +315,6 @@ export class HLEKernel {
       this.bus.writeU32(i, 0xFFFFFFFF);
     }
 
-    // Reserve top 2KB for trampolines (thread return, GE callbacks, etc.)
-    this.userMemory.allocAt(0x0BFFF800, 0x800, "trampolines");
   }
 
   /** Semaphores: id → { count, maxCount } */
@@ -340,6 +358,10 @@ export class HLEKernel {
 
   /** When non-null, sceIoWrite to fd 1/2 appends raw text here (for pspautotests). */
   public stdoutBuffer: string[] | null = null;
+
+  /** Basename of the most recently opened video-like file (.pmf etc.), used to
+   *  label the fake MPEG decode frame. Null until a video file is opened. */
+  public lastVideoPath: string | null = null;
 
   /** Loaded PGF fonts by index (populated lazily on sceFontNewLib) */
   private pgfFonts: (PGF | null)[] = [];
@@ -445,7 +467,7 @@ export class HLEKernel {
    *  re-enters hasActiveGeLists(). */
   private geScanningActive = false;
   /** Pending signal callback deferred from HANDLER_CONTINUE */
-  private gePendingSignalCb: { token: number; cbId: number } | null = null;
+  private gePendingSignalCb: { token: number; cbId: number; a2: number } | null = null;
   /** Pending GE interrupts to fire during next blocking syscall (matches PPSSPP async delivery) */
   private gePendingInterrupts: Array<{ func: number; a0: number; a1: number; listState?: GeListState }> = [];
 
@@ -545,6 +567,7 @@ export class HLEKernel {
     registerPowerHLE(this);
     registerNetHLE(this);
     registerPsmfPlayerHLE(this);
+    registerMpegHLE(this);
     registerMediaHLE(this);
     registerUtilityHLE(this);
   }
@@ -594,8 +617,14 @@ export class HLEKernel {
       // PAUSED lists wait for sceGeContinue
       if (entry.state === GeListState.PAUSED) break;
 
-      // QUEUED → DRAWING when becoming front
-      if (entry.state === GeListState.QUEUED) {
+      // Lists halted at an unknown SIGNAL stay DRAWING but never run again
+      // (only sceGeBreak clears them)
+      if (entry.signalHalted) break;
+
+      // QUEUED → DRAWING when becoming front. STALLING lists also go through
+      // the scanner: PPSSPP makes a pc==stall list currentList and sets
+      // started=true (GPUCommon.cpp:766-788) before noticing the stall.
+      if (entry.state === GeListState.QUEUED || entry.state === GeListState.STALLING) {
         entry.state = GeListState.DRAWING;
       }
 
@@ -826,6 +855,12 @@ export class HLEKernel {
     }
     return false;
   }
+
+  /** True while a GE callback / interrupt handler runs in the mini CPU loop
+   *  (_invokeGeCb). Blocking waits are illegal in interrupt context on the PSP
+   *  (SCE_KERNEL_ERROR_CAN_NOT_WAIT) — blocking here would save a mid-callback
+   *  CPU state into the thread context and corrupt execution on wake. */
+  get inInterrupt(): boolean { return this.suppressReschedule; }
 
   /** Pick highest-priority READY thread and switch to it. Returns true if a thread was found. */
   reschedule(regs: AllegrexRegisters): boolean {
@@ -1363,12 +1398,15 @@ export class HLEKernel {
         }
       }
 
-      // GPUCommon.cpp:371-388 — SDK > 0x01FFFFFF: duplicate listpc/stackAddr check
+      // GPUCommon.cpp:371-388 — SDK > 0x01FFFFFF: duplicate listpc/stackAddr check.
+      // Real PSP rejects by the list START address — a list halted partway
+      // (pc advanced) still blocks re-enqueueing the same address
+      // (gpu/signals/simple, 6.60 "Unknown" section).
       if (this.compiledSdkVersion > 0x01FFFFFF) {
         const maskedPc = listAddr & 0x0FFFFFFF;
         for (const existing of this.geLists.values()) {
           if (existing.state !== GeListState.NONE && existing.state !== GeListState.COMPLETED) {
-            if (existing.pc === maskedPc) {
+            if ((existing.listAddr & 0x0FFFFFFF) === maskedPc) {
               regs.setGpr(2, 0x80000021); // SCE_KERNEL_ERROR_BUSY
               return;
             }
@@ -1411,16 +1449,24 @@ export class HLEKernel {
         started: false,
         stackAddr,
         contextPtr,
+        signalHalted: false,
       };
       this.geLists.set(listId, entry);
       this.geListQueue.push(listId);
-      if (this.geDispatcher && initialState === GeListState.DRAWING) {
-        // Worker mode: only send to GPU worker when list is at the front (DRAWING)
-        this.geDispatcher.enqueue(listId, listAddr, stallAddr);
-      }
-      // Headless mode: do NOT process during enqueue — defer to sync points.
-      // This matches PPSSPP's async GPU thread model.
+      // Set the caller's return value BEFORE processing — the inline scan can
+      // fire GE callbacks which must not see a stale $v0.
       regs.setGpr(2, GE_LIST_ID_MAGIC ^ listId);
+      if (this.geDispatcher) {
+        // Worker mode: only send to GPU worker when list is at the front (DRAWING)
+        if (initialState === GeListState.DRAWING) {
+          this.geDispatcher.enqueue(listId, listAddr, stallAddr);
+        }
+      } else {
+        // Headless: run the queue now. The real GE executes in parallel and a
+        // short list finishes (firing its interrupts) before the CPU's next
+        // instruction — gpu/signals/simple checks this ordering.
+        this._processGeQueue();
+      }
     });
 
     // sceGeListUpdateStallAddr(listId, stallAddr) — advance stall for ring buffer
@@ -1542,8 +1588,12 @@ export class HLEKernel {
       }
 
       if (syncType === 1) {
-        // Poll mode: return current state WITHOUT processing (GPU runs async)
-        // PPSSPP GPUCommon.cpp:200-215
+        // Poll mode — PPSSPP GPUCommon.cpp:200-215 peeks while the async GPU
+        // thread makes progress in the background. Our GPU "progress" is the
+        // synchronous queue scan, so process pending lists here too; otherwise
+        // a game polling DrawSync in a tight loop (Burnout Legends) spins
+        // forever on a list nothing else will ever run.
+        if (!this.geDispatcher) this._processGeQueue();
         // PSP_GE_LIST_*: COMPLETED=0, QUEUED=1, DRAWING=2, STALLING=3, PAUSED=4
         // Find first non-completed list in queue
         let topEntry: GeListEntry | undefined;
@@ -1719,8 +1769,9 @@ export class HLEKernel {
           this._processGeQueue();
         }
         regs.setGpr(2, 0);
-      } else if (entry.state === GeListState.DRAWING) {
-        // GPUCommon.cpp:528-532 — SDK version check
+      } else if (entry.state === GeListState.DRAWING || entry.state === GeListState.STALLING) {
+        // GPUCommon.cpp:528-532 — SDK version check. A stalled list is state
+        // RUNNING in PPSSPP (the stall lives in gpuState), so same branch.
         regs.setGpr(2, this.compiledSdkVersion >= 0x02000000 ? 0x80000020 : (-1 >>> 0));
       } else {
         // GPUCommon.cpp:534-538 — SDK version check
@@ -1729,14 +1780,31 @@ export class HLEKernel {
     });
 
     // sceGeGetStack(index, stackPtr) — PPSSPP GPUCommon.cpp:270-293
-    // Returns current call stack depth (number of CALL entries on GE stack).
-    this.register(GE.sceGeGetStack, (regs) => {
+    // Returns the GE call stack depth; writes one stack entry if index >= 0.
+    this.register(GE.sceGeGetStack, (regs, bus) => {
       // Process pending lists before checking stack
       if (!this.geDispatcher) this._processGeQueue();
-      // If a list is active, base depth is 1 + call stack entries
+      const index = regs.getGpr(4) | 0;
+      const stackPtr = regs.getGpr(5);
       const currentId = this.geListQueue.length > 0 ? this.geListQueue[0]! : -1;
       const entry = currentId >= 0 ? this.geLists.get(currentId) : undefined;
-      const depth = entry ? 1 + entry.callStack.length : 0;
+      if (!entry) {
+        // GPUCommon.cpp:271-274 — no currentList: 0, not an error
+        regs.setGpr(2, 0);
+        return;
+      }
+      const depth = entry.callStack.length;
+      if (depth <= index) {
+        regs.setGpr(2, 0x80000102); // SCE_KERNEL_ERROR_INVALID_INDEX
+        return;
+      }
+      if (index >= 0 && stackPtr !== 0) {
+        const e = entry.callStack[index]!;
+        bus.writeU32(stackPtr, 0);
+        bus.writeU32(stackPtr + 4, e.pc + 4);
+        bus.writeU32(stackPtr + 8, e.offsetAddr);
+        bus.writeU32(stackPtr + 28, e.baseAddr);
+      }
       regs.setGpr(2, depth);
     });
 
@@ -1791,6 +1859,7 @@ export class HLEKernel {
         started: false,
         stackAddr,
         contextPtr,
+        signalHalted: false,
       };
 
       // If there's a current front list, it must be PAUSED to enqueue at head
@@ -1919,9 +1988,9 @@ export class HLEKernel {
     });
 
     // sceGeGetMtx(type, matrixPtr) — PPSSPP sceGe.cpp:560-573, GPUCommon.cpp:302-330
-    // Reads a matrix (12 or 16 float24 values). Since GE state is in worker, return zeros.
+    // Reads a matrix as raw 24-bit values (float32 bits >> 8, PPSSPP toFloat24).
     this.register(GE.sceGeGetMtx, (regs, bus) => {
-      const type = regs.getGpr(4);
+      const type = regs.getGpr(4) | 0;
       const matrixPtr = regs.getGpr(5);
       // ge_constants.h:349-360:
       // GE_MTX_BONE0..7 = 0..7, GE_MTX_WORLD = 8, GE_MTX_VIEW = 9,
@@ -1934,9 +2003,14 @@ export class HLEKernel {
         regs.setGpr(2, -1);
         return;
       }
+      // Process pending lists so matrix uploads are visible
+      if (!this.geDispatcher) this._processGeQueue();
       const size = type === 10 ? 16 : 12; // GE_MTX_PROJECTION (10) is 4×4, others are 3×4
+      const mtx = this.ensureGeProcessor().getMatrixFloats(type);
+      const conv = new DataView(new ArrayBuffer(4));
       for (let i = 0; i < size; i++) {
-        bus.writeU32(matrixPtr + i * 4, 0);
+        conv.setFloat32(0, mtx ? mtx[i]! : 0, true);
+        bus.writeU32(matrixPtr + i * 4, conv.getUint32(0, true) >>> 8);
       }
       regs.setGpr(2, 0);
     });
@@ -1957,8 +2031,9 @@ export class HLEKernel {
         this.nextGeListSlot = (slot + 1) % MAX;
         return slot;
       }
-      // PPSSPP: COMPLETED with waitUntilTicks < currentTicks → fallback (no break)
-      if (existing.state === GeListState.COMPLETED && fallbackId < 0) {
+      // PPSSPP: COMPLETED with waitUntilTicks < currentTicks → fallback (no
+      // break, so a later candidate in scan order overwrites an earlier one)
+      if (existing.state === GeListState.COMPLETED) {
         fallbackId = slot;
       }
     }
@@ -2036,6 +2111,35 @@ export class HLEKernel {
         offset++;
       }
     }
+    // Reapply the restored state to the GE processor (PPSSPP ReapplyGfxState):
+    // without this the processor keeps state from the finished list (e.g. a
+    // 16bpp FRAMEBUFPIXFMT leaking into the game's 32bpp main rendering).
+    const proc = this.ensureGeProcessor();
+    for (const [start, end] of HLEKernel.CONTEXT_CMD_RANGES) {
+      for (let cmd = start; cmd <= end; cmd++) {
+        const op = this.geCommandMem[cmd]!;
+        proc.executeCommand(op >>> 24, op & 0x00FFFFFF);
+      }
+    }
+  }
+
+  /** Fire a deferred HANDLER_CONTINUE signal callback, if one is pending. */
+  private _fireDeferredGeSignalCb(): void {
+    if (!this.gePendingSignalCb) return;
+    const { token, cbId, a2 } = this.gePendingSignalCb;
+    this.gePendingSignalCb = null;
+    const cb = this.geCallbacks.get(cbId);
+    if (cb && cb.signalFunc !== 0) {
+      this._invokeGeCb(cb.signalFunc, token, cb.signalArg, a2);
+    }
+  }
+
+  /** PPSSPP GPUCommon Execute_End: when a list that saved a context completes,
+   *  the context is restored before the next list runs. */
+  private _restoreListContext(entry: GeListEntry): void {
+    if (!entry.started || entry.contextPtr === 0) return;
+    this._restoreGeContextFrom(entry.contextPtr);
+    entry.started = false; // PPSSPP: don't restore again
   }
 
   /** Compute relative address from offset + base, matching PPSSPP gstate_c.getRelativeAddress */
@@ -2087,6 +2191,9 @@ export class HLEKernel {
       if (entry.stallAddr !== 0 && pc === entry.stallAddr) {
         entry.pc = pc;
         entry.state = GeListState.STALLING;
+        // A deferred HANDLER_CONTINUE callback fires once the GPU stops at the
+        // stall (the handler then observes listsync 3 STALL — gpu/signals/simple)
+        this._fireDeferredGeSignalCb();
         return GeListState.STALLING;
       }
 
@@ -2105,6 +2212,7 @@ export class HLEKernel {
           if (consecutiveNops > 5000) {
             entry.pc = pc;
             entry.state = GeListState.COMPLETED;
+            this._restoreListContext(entry);
             return GeListState.COMPLETED;
           }
           break;
@@ -2208,31 +2316,40 @@ export class HLEKernel {
                 entry.signal = GeSignalBehavior.SYNC;
                 break;
 
-              case GeSignalBehavior.JUMP: {
-                // Absolute jump
+              case GeSignalBehavior.JUMP:
+              case GeSignalBehavior.RJUMP:
+              case GeSignalBehavior.OJUMP: {
+                // Jump (absolute/relative/origin). The -4 counteracts the
+                // loop-bottom pc += 4 (PPSSPP: "pc will be increased after we return").
                 trigger = false;
-                entry.signal = GeSignalBehavior.JUMP;
-                const target = (((signalData << 16) | endData) & 0xFFFFFFFC) - 4;
-                pc = target;
-                count++;
-                continue; // skip normal pc += 4
+                entry.signal = behaviour;
+                let target = (((signalData << 16) | endData) & 0xFFFFFFFC) >>> 0;
+                if (behaviour === GeSignalBehavior.RJUMP) target = (target + pc - 4) >>> 0;
+                else if (behaviour === GeSignalBehavior.OJUMP) target = this._geRelativeAddr(entry, target);
+                pc = (target - 4) >>> 0;
+                break;
               }
 
-              case GeSignalBehavior.CALL: {
-                // Subroutine call (saves offsetAddr + baseAddr)
+              case GeSignalBehavior.CALL:
+              case GeSignalBehavior.RCALL:
+              case GeSignalBehavior.OCALL: {
+                // Subroutine call (saves offsetAddr + baseAddr + raw cmd regs)
                 trigger = false;
-                entry.signal = GeSignalBehavior.CALL;
-                const target = (((signalData << 16) | endData) & 0xFFFFFFFC) - 4;
+                entry.signal = behaviour;
                 if (entry.callStack.length < GE_CALL_STACK_DEPTH) {
                   entry.callStack.push({
                     pc: pc + 4,
                     offsetAddr: entry.offsetAddr,
                     baseAddr: entry.baseAddr,
+                    baseCmd: this.geCommandMem[GE_OPCODE.BASE]!,
+                    offsetCmd: this.geCommandMem[GE_OPCODE.OFFSET_ADDR]!,
                   });
                 }
-                pc = target;
-                count++;
-                continue;
+                let target = (((signalData << 16) | endData) & 0xFFFFFFFC) >>> 0;
+                if (behaviour === GeSignalBehavior.RCALL) target = (target + pc - 4) >>> 0;
+                else if (behaviour === GeSignalBehavior.OCALL) target = this._geRelativeAddr(entry, target);
+                pc = (target - 4) >>> 0;
+                break;
               }
 
               case GeSignalBehavior.RET: {
@@ -2243,24 +2360,40 @@ export class HLEKernel {
                   const stackEntry = entry.callStack.pop()!;
                   entry.offsetAddr = stackEntry.offsetAddr;
                   entry.baseAddr = stackEntry.baseAddr;
-                  pc = (stackEntry.pc & 0x0FFFFFFF) - 4;
-                  count++;
-                  continue;
+                  if (stackEntry.baseCmd !== undefined) this.geCommandMem[GE_OPCODE.BASE] = stackEntry.baseCmd;
+                  if (stackEntry.offsetCmd !== undefined) this.geCommandMem[GE_OPCODE.OFFSET_ADDR] = stackEntry.offsetCmd;
+                  pc = ((stackEntry.pc & 0x0FFFFFFF) - 4) >>> 0;
                 }
                 break;
               }
 
-              default:
-                // PPSSPP: unknown signal types still trigger the callback
-                // (GPUCommon.cpp Execute_End default case → __GeTriggerInterrupt)
+              case GeSignalBehavior.BREAK1:
+              case GeSignalBehavior.BREAK2:
+                // Breakpoint signals: no-ops without a debugger on real PSP —
+                // no handler call, execution continues past the END.
+                trigger = false;
+                entry.signal = behaviour;
                 break;
+
+              default:
+                // Unknown signal behavior (e.g. 0x00, 0xEE): real PSP fires no
+                // handler and the GE stops at the END while the list stays
+                // DRAWING forever (gpu/signals/simple "Unknown" sections).
+                // PPSSPP triggers the callback here instead — one reason it
+                // fails gpu/signals/simple.
+                entry.signal = behaviour;
+                entry.pc = pc + 4;
+                entry.signalHalted = true;
+                return entry.state;
             }
 
-            // HANDLER_SUSPEND: set PAUSED before firing callback, then auto-resume after.
-            // PPSSPP: state=PAUSED during interrupt, handler sees PAUSED via ListSync.
-            // After handler returns, for SDK <= 0x02000010, state = QUEUED → list resumes.
+            // HANDLER_SUSPEND: list pauses for the duration of the handler.
+            // PPSSPP GPUCommon.cpp:1019-1026 — only SDK <= 0x02000010 makes the
+            // pause visible as state PAUSED; newer SDKs keep RUNNING (listsync 2).
             if (behaviour === GeSignalBehavior.HANDLER_SUSPEND) {
-              entry.state = GeListState.PAUSED;
+              if (this.compiledSdkVersion <= 0x02000010) {
+                entry.state = GeListState.PAUSED;
+              }
               entry.pc = pc + 4;
             }
 
@@ -2270,24 +2403,29 @@ export class HLEKernel {
                 // HANDLER_CONTINUE: defer callback — list continues scanning first.
                 // In PPSSPP, the interrupt is async; the GPU continues while interrupt is pending.
                 // Store pending signal info; will be fired after scan completes.
-                this.gePendingSignalCb = { token: entry.subIntrToken & 0xFFFF, cbId: entry.cbId >= 0 ? entry.cbId : this.activeGeCbId };
+                this.gePendingSignalCb = {
+                  token: entry.subIntrToken & 0xFFFF,
+                  cbId: entry.cbId >= 0 ? entry.cbId : this.activeGeCbId,
+                  a2: this.compiledSdkVersion <= 0x02000010 ? 0 : pc + 4,
+                };
               } else {
                 const cbId = entry.cbId >= 0 ? entry.cbId : this.activeGeCbId;
                 const cb = this.geCallbacks.get(cbId);
                 if (cb && cb.signalFunc !== 0) {
-                  this._invokeGeCb(cb.signalFunc, entry.subIntrToken & 0xFFFF, cb.signalArg, 0);
+                  // a2: PPSSPP sceGe.cpp:127 — 0 for SDK <= 0x02000010, else END pc+4
+                  const a2 = this.compiledSdkVersion <= 0x02000010 ? 0 : pc + 4;
+                  this._invokeGeCb(cb.signalFunc, entry.subIntrToken & 0xFFFF, cb.signalArg, a2);
                 }
               }
             }
 
-            // HANDLER_SUSPEND: auto-resume after callback for old SDK
+            // HANDLER_SUSPEND: auto-resume after the handler returns, for ALL SDKs.
+            // PPSSPP sceGe.cpp handleResult → InterruptEnd → ProcessDLQueue: old SDK
+            // sets state QUEUED first; new SDK never left RUNNING. Either way the
+            // list continues right after the interrupt completes.
             if (behaviour === GeSignalBehavior.HANDLER_SUSPEND) {
-              if (this.compiledSdkVersion <= 0x02000010) {
-                entry.state = GeListState.DRAWING;
-                pc = entry.pc - 4; // continue scanning (will be incremented by pc += 4)
-              } else {
-                return GeListState.PAUSED;
-              }
+              entry.state = GeListState.DRAWING;
+              pc = entry.pc - 4; // continue scanning (will be incremented by pc += 4)
             }
             // HANDLER_CONTINUE: keep scanning (list was never paused).
           } else if (prevCmd === GE_OPCODE.FINISH) {
@@ -2303,7 +2441,8 @@ export class HLEKernel {
                   const cbId = entry.cbId >= 0 ? entry.cbId : this.activeGeCbId;
                   const cb = this.geCallbacks.get(cbId);
                   if (cb && cb.signalFunc !== 0) {
-                    this._invokeGeCb(cb.signalFunc, entry.subIntrToken & 0xFFFF, cb.signalArg, 0);
+                    const a2 = this.compiledSdkVersion <= 0x02000010 ? 0 : pc + 4;
+                    this._invokeGeCb(cb.signalFunc, entry.subIntrToken & 0xFFFF, cb.signalArg, a2);
                   }
                 }
                 entry.pc = pc + 4;
@@ -2321,12 +2460,12 @@ export class HLEKernel {
 
                 // Fire deferred HANDLER_CONTINUE signal callback BEFORE finish
                 if (this.gePendingSignalCb) {
-                  const { token, cbId: sCbId } = this.gePendingSignalCb;
+                  const { token, cbId: sCbId, a2: sA2 } = this.gePendingSignalCb;
                   this.gePendingSignalCb = null;
                   entry.state = GeListState.DRAWING; // signal sees DRAWING
                   const sCb = this.geCallbacks.get(sCbId);
                   if (sCb && sCb.signalFunc !== 0) {
-                    this._invokeGeCb(sCb.signalFunc, token, sCb.signalArg, 0);
+                    this._invokeGeCb(sCb.signalFunc, token, sCb.signalArg, sA2);
                   }
                 }
 
@@ -2337,11 +2476,14 @@ export class HLEKernel {
                   const cbId = entry.cbId >= 0 ? entry.cbId : this.activeGeCbId;
                   const cb = this.geCallbacks.get(cbId);
                   if (cb && cb.finishFunc !== 0) {
-                    this._invokeGeCb(cb.finishFunc, entry.subIntrToken & 0xFFFF, cb.finishArg, 0);
+                    // a2: 0 for SDK <= 0x02000010, else END pc+4 (sceGe.cpp:127)
+                    const a2 = this.compiledSdkVersion <= 0x02000010 ? 0 : pc + 4;
+                    this._invokeGeCb(cb.finishFunc, entry.subIntrToken & 0xFFFF, cb.finishArg, a2);
                   }
                 }
 
                 entry.state = GeListState.COMPLETED;
+                this._restoreListContext(entry);
                 return GeListState.COMPLETED;
               }
             }
@@ -2350,6 +2492,7 @@ export class HLEKernel {
             // in well-formed lists, but treat as completion for safety.
             entry.state = GeListState.COMPLETED;
             entry.pc = pc + 4;
+            this._restoreListContext(entry);
             return GeListState.COMPLETED;
           }
           break;
@@ -2377,6 +2520,7 @@ export class HLEKernel {
     // This matches the pre-scanner headless behaviour (instant completion).
     entry.pc = pc;
     entry.state = GeListState.COMPLETED;
+    this._restoreListContext(entry);
     return GeListState.COMPLETED;
   }
 

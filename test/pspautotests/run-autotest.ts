@@ -4,6 +4,7 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
+import { basename } from "node:path";
 import { PSPEmulator } from "../../src/emulator.js";
 
 export interface AutotestResult {
@@ -42,7 +43,9 @@ export async function runAutotest(
   const emu = new PSPEmulator();
   emu.hle.stdoutBuffer = [];
 
-  await emu.loadElfBinary(prxData);
+  // PPSSPP headless boots a bare PRX as "umd0:/<file>" and passes that path
+  // as the root thread args (PSPLoaders.cpp Load_PSP_ELF_PBP)
+  await emu.loadElfBinary(prxData, `umd0:/${basename(prxPath)}`);
 
   // pspautotests run as homebrew on ms0:, set initial CWD accordingly
   emu.hle.pspFs.setStartingDirectory("ms0:/PSP/GAME/__autotest");
