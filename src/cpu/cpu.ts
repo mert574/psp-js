@@ -218,13 +218,17 @@ export class AllegrexCPU {
    */
   run(maxSteps = Infinity): number {
     let steps = 0;
-    while (steps < maxSteps) {
+    // Never stop between a branch and its delay slot: callers treat the end of
+    // a slice as a safe point (thread reschedule, GE callback mini-calls), and
+    // none of those save/restore inDelaySlot/delaySlotTarget. Splitting the
+    // pair leaks a pending jump into whatever context runs next.
+    while (steps < maxSteps || this.inDelaySlot) {
       if (!this.step()) break;
       steps++;
       // Check idle after every syscall dispatch — the flag is only set inside
       // reschedule(), which only runs during syscall handling, so this check
       // is cheap (just a boolean read on the hot path).
-      if (this.hle?.idleBreak) break;
+      if (this.hle?.idleBreak && !this.inDelaySlot) break;
     }
     return steps;
   }

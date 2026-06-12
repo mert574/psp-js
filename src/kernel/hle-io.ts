@@ -28,9 +28,63 @@ export function registerIoHLE(kernel: HLEKernel): void {
     npdrm: boolean;            // PPSSPP FileNode::npdrm — true when PGD decryption active
     pgdOffset: number;         // PPSSPP FileNode::pgd_offset — offset of PGD header within file
     pgdInfo: PgdDesc | null;   // PPSSPP FileNode::pgdInfo — PGD descriptor for decryption
+    writable?: boolean;        // opened with O_WRONLY/O_RDWR
+    dirty?: boolean;           // written to since open — needs persisting on close
+    closePending?: boolean;    // sceIoCloseAsync issued — free the fd once its result is read
+    asyncCbId?: number;        // PPSSPP FileNode::callbackID — fired when async IO completes
+    asyncCbArg?: number;       // PPSSPP FileNode::callbackArg — $a1 passed to that callback
   }
   const openFiles = new Map<number, FileNode>();
   let nextFd = 3; // 0/1/2 reserved for stdin/stdout/stderr
+
+  // PSP open flags — PPSSPP FileSystem.h
+  const PSP_O_RDONLY = 0x0001;
+  const PSP_O_WRONLY = 0x0002;
+  const PSP_O_APPEND = 0x0100;
+  const PSP_O_CREAT  = 0x0200;
+  const PSP_O_TRUNC  = 0x0400;
+
+  /** Paths we persist across sessions: the memory stick (ms0:/fatms0:). Disc is read-only. */
+  function isPersistablePath(path: string): boolean {
+    const p = path.toLowerCase();
+    return p.startsWith("ms0:") || p.startsWith("fatms0:");
+  }
+
+  /** Notify the file's async-completion callback (PPSSPP __IoCompleteAsyncIO →
+   *  __KernelNotifyCallback). The callback fires the next time the owning thread
+   *  runs a callback-processing wait (e.g. sceIoWaitAsyncCB). */
+  function notifyIoCallback(file: FileNode): void {
+    if (!file.asyncCbId) return;
+    const cb = kernel.pspCallbacks.get(file.asyncCbId);
+    if (cb) {
+      cb.notifyCount++;
+      cb.notifyArg = file.asyncCbArg ?? 0;
+    }
+  }
+
+  /** Persist a written file to the file store (fire-and-forget). */
+  function persistFile(file: FileNode): void {
+    if (!file.dirty || !isPersistablePath(file.path)) return;
+    file.dirty = false;
+    kernel.fileStore?.put(file.path, file.data).catch(err => {
+      log.warn(`persistFile failed for ${file.path}: ${err}`);
+    });
+  }
+
+  /** Write `bytes` into a file at `position`, growing the buffer as needed.
+   *  Returns the (possibly new) buffer. Also updates the in-memory filesystem. */
+  function writeIntoFile(file: FileNode, bytes: Uint8Array, position: number): void {
+    const end = position + bytes.length;
+    if (end > file.data.length) {
+      const grown = new Uint8Array(end);
+      grown.set(file.data);
+      file.data = grown;
+    }
+    file.data.set(bytes, position);
+    file.dirty = true;
+    // Keep the filesystem map pointing at the live buffer (it may have been replaced).
+    kernel.pspFs.writeFile(file.path, file.data, kernel.currentThreadId);
+  }
 
   // KIRK crypto engine — initialized once, shared across all DRM operations
   const kirk: KirkState = kirkCreate();
@@ -93,8 +147,22 @@ export function registerIoHLE(kernel: HLEKernel): void {
       const text = new TextDecoder().decode(bytes);
       if (kernel.stdoutBuffer !== null) kernel.stdoutBuffer.push(text);
       pspLog.info(`${text.replace(/\n$/, "")}`);
+      kernel.ioOpsCount++;
+      regs.setGpr(2, size);
+      return;
+    }
+    // Real file write
+    const file = openFiles.get(fd);
+    if (!file) { regs.setGpr(2, 0x80010009); return; } // SCE_KERNEL_ERROR_BADF
+    if ((size | 0) < 0) { regs.setGpr(2, 0x800200d3); return; } // ILLEGAL_ADDR
+    if (size > 0) {
+      const bytes = new Uint8Array(size);
+      for (let i = 0; i < size; i++) bytes[i] = bus.readU8(data + i);
+      writeIntoFile(file, bytes, file.position);
+      file.position += size;
     }
     kernel.ioOpsCount++;
+    log.debug(`sceIoWrite: fd=${fd} size=${size} → pos=${file.position} len=${file.data.length}`);
     regs.setGpr(2, size);
   });
 
@@ -124,22 +192,50 @@ export function registerIoHLE(kernel: HLEKernel): void {
       regs.setGpr(2, 99); // dummy fd
       return;
     }
-    const fileBytes = kernel.pspFs.getFileData(path, kernel.currentThreadId);
+    const flags = regs.getGpr(5);
+    const writable = (flags & (PSP_O_WRONLY | PSP_O_RDONLY)) ? (flags & PSP_O_WRONLY) !== 0 : false;
+    const create   = (flags & PSP_O_CREAT) !== 0;
+    const truncate = (flags & PSP_O_TRUNC) !== 0;
+    const append   = (flags & PSP_O_APPEND) !== 0;
+
+    let fileBytes = kernel.pspFs.getFileData(path, kernel.currentThreadId);
     if (!fileBytes) {
-      const level = path.startsWith("ms0:") || path.startsWith("host0:") ? "debug" : "warn";
-      log[level](`sceIoOpen: file not found: ${path}`);
-      regs.setGpr(2, 0x80010002);
-      return;
+      if (create) {
+        fileBytes = new Uint8Array(0);
+        kernel.pspFs.writeFile(path, fileBytes, kernel.currentThreadId);
+        log.info(`sceIoOpen: created ${path} (flags=0x${flags.toString(16)})`);
+      } else {
+        const level = path.startsWith("ms0:") || path.startsWith("host0:") ? "debug" : "warn";
+        log[level](`sceIoOpen: file not found: ${path}`);
+        regs.setGpr(2, 0x80010002);
+        return;
+      }
+    } else if (truncate && writable) {
+      fileBytes = new Uint8Array(0);
+      kernel.pspFs.writeFile(path, fileBytes, kernel.currentThreadId);
     }
+
     const fd = nextFd++;
-    openFiles.set(fd, { path, data: fileBytes, position: 0, asyncResult: 0, hasAsyncResult: false, npdrm: false, pgdOffset: 0, pgdInfo: null });
-    log.info(`sceIoOpen: fd=${fd} path=${path}`);
+    // Store the resolved path so persistence keys match filesystem lookups
+    // (e.g. fatms0:/x and ms0:/x both resolve to the same key).
+    const resolvedPath = kernel.pspFs.resolvePath(path, kernel.currentThreadId);
+    openFiles.set(fd, {
+      path: resolvedPath, data: fileBytes, position: append ? fileBytes.length : 0,
+      asyncResult: 0, hasAsyncResult: false, npdrm: false, pgdOffset: 0, pgdInfo: null,
+      writable, dirty: false,
+    });
+    log.info(`sceIoOpen: fd=${fd} path=${resolvedPath} flags=0x${flags.toString(16)}`);
+    if (/\.(pmf|pmps|mps|str|pam)$/i.test(resolvedPath)) {
+      kernel.lastVideoPath = resolvedPath.split("/").pop() ?? resolvedPath;
+    }
     regs.setGpr(2, fd);
   });
 
   // sceIoClose(fd)
   kernel.register(IO.sceIoClose, (regs) => {
     const fd = regs.getGpr(4);
+    const file = openFiles.get(fd);
+    if (file) persistFile(file);
     openFiles.delete(fd);
     regs.setGpr(2, 0);
   });
@@ -251,8 +347,10 @@ export function registerIoHLE(kernel: HLEKernel): void {
     // PPSSPP sceIo.cpp:1053-1058: delay = max(100, size/100) microseconds
     // PPSSPP sceIo.cpp:1155-1156: hleDelayResult → __KernelWaitCurThread(WAITTYPE_HLEDELAY)
     // Only delay for disc files (fd > 2) when inside a thread with CoreTiming available.
+    // Never block inside a guest callback mini-loop (e.g. sceMpegRingbufferPut's
+    // fill callback) — the thread can't actually wait there, so return directly.
     const t = kernel.currentThreadId > 0 ? kernel.threads.get(kernel.currentThreadId) : null;
-    if (t && kernel.coreTiming && kernel.wakeThreadEventId >= 0 && fd > 2) {
+    if (!kernel.inInterrupt && t && kernel.coreTiming && kernel.wakeThreadEventId >= 0 && fd > 2) {
       const delayUs = Math.max(100, Math.floor(size / 100));
       log.debug(`sceIoRead: delay ${delayUs}µs tid=${kernel.currentThreadId} v0=${bytesToRead}`);
       t.state = ThreadState.WAITING;
@@ -312,6 +410,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
       file.asyncResult = file.position;
     }
     file.hasAsyncResult = true;
+    notifyIoCallback(file);
     regs.setGpr(2, 0);
   });
 
@@ -406,8 +505,22 @@ export function registerIoHLE(kernel: HLEKernel): void {
   // sceIoDevctl(name, cmd, arg, argLen, out, outLen)
   // PPSSPP: PARAM(4) = $t0, PARAM(5) = $t1
   kernel.register(IO.sceIoDevctl, (regs, bus) => {
-    const cmd    = regs.getGpr(5);
-    const outPtr = regs.getGpr(8); // 5th arg = PARAM(4) = $t0
+    const cmd     = regs.getGpr(5);
+    const argAddr = regs.getGpr(6) >>> 0;
+    const outPtr  = regs.getGpr(8); // 5th arg = PARAM(4) = $t0
+
+    // Notify a memory stick insert/eject callback with state 1 (inserted).
+    // PPSSPP sceIo.cpp 0x02015804/0x02415821: fired immediately when the card
+    // is present — games wait for this before finishing boot (Space Invaders).
+    const notifyMsCallback = (): void => {
+      const cbId = bus.readU32(argAddr);
+      const cb = kernel.pspCallbacks.get(cbId);
+      if (cb) {
+        cb.notifyCount++;
+        cb.notifyArg = 1; // 1 = inserted
+        log.info(`sceIoDevctl: registered MS callback cbId=${cbId}, notified inserted`);
+      }
+    };
 
     switch (cmd) {
       case 0x01F20001:
@@ -422,6 +535,44 @@ export function registerIoHLE(kernel: HLEKernel): void {
         if (outPtr !== 0) bus.writeU32(outPtr, 0x10000);
         regs.setGpr(2, 0);
         break;
+      case 0x02015804: // register MS insert/eject callback (mscmhc0)
+      case 0x02415821: // MScmRegisterMSInsertEjectCallback (fatms0)
+        notifyMsCallback();
+        regs.setGpr(2, 0);
+        break;
+      case 0x02015805: // unregister (mscmhc0)
+      case 0x02415822: // unregister (fatms0)
+        regs.setGpr(2, 0);
+        break;
+      case 0x02025806: // mscmhc0: is device inserted? 1 = yes
+        if (outPtr !== 0) bus.writeU32(outPtr, 1);
+        regs.setGpr(2, 0);
+        break;
+      case 0x02025801: // mscmhc0: get driver status — 4 = ready/inserted
+        if (outPtr !== 0) bus.writeU32(outPtr, 4);
+        regs.setGpr(2, 0);
+        break;
+      case 0x02425818: { // fatms0: get MS capacity — PPSSPP sceIo.cpp:1849
+        // argAddr holds a POINTER to a DeviceSize struct (not outPtr).
+        const pointer = bus.readU32(argAddr) >>> 0;
+        if (pointer !== 0) {
+          const sectorSize = 0x200;
+          const sectorCount = (32 * 1024) / sectorSize;
+          const freeSize = (1024 + 512) * 1024 * 1024; // PPSSPP FAKE_FREE_SPACE (1.5 GB)
+          const maxClusters = Math.floor((freeSize * 95 / 100) / (sectorSize * sectorCount));
+          bus.writeU32(pointer + 0, maxClusters);  // maxClusters
+          bus.writeU32(pointer + 4, maxClusters);  // freeClusters
+          bus.writeU32(pointer + 8, maxClusters);  // maxSectors
+          bus.writeU32(pointer + 12, sectorSize);  // sectorSize
+          bus.writeU32(pointer + 16, sectorCount); // sectorCount
+        }
+        regs.setGpr(2, 0);
+        break;
+      }
+      case 0x02425824: // fatms0: write protected? 0 = no
+        if (outPtr !== 0) bus.writeU32(outPtr, 0);
+        regs.setGpr(2, 0);
+        break;
       default:
         log.debug(`sceIoDevctl: unhandled cmd=0x${cmd.toString(16)}`);
         regs.setGpr(2, 0);
@@ -429,15 +580,34 @@ export function registerIoHLE(kernel: HLEKernel): void {
     }
   });
 
-  // sceIoAssign(alias, physical, filesystem, mode, argPtr, argSize)
-  kernel.register(IO.sceIoAssign, (regs) => {
-    log.debug("sceIoAssign (stub)");
+  // sceIoAssign(alias, physical, filesystem, mode, argPtr, argSize) — PPSSPP sceIo.cpp:839
+  // Record alias → filesystem device so later opens through the alias resolve.
+  kernel.register(IO.sceIoAssign, (regs, bus) => {
+    const alias = kernel.readCString(bus, regs.getGpr(4));
+    const filesystem = kernel.readCString(bus, regs.getGpr(6));
+    if (alias && filesystem) kernel.pspFs.assignDevice(alias, filesystem);
+    log.debug(`sceIoAssign: ${alias} → ${filesystem}`);
     regs.setGpr(2, 0);
   });
 
-  // sceIoOpenAsync(file, flags, mode) → fake fd
-  kernel.register(IO.sceIoOpenAsync, (regs) => {
-    regs.setGpr(2, kernel.nextBlockId++);
+  // sceIoOpenAsync(file, flags, mode) → fd
+  // PPSSPP sceIo.cpp: opens the file immediately, returns the fd, and delivers
+  // the open result (fd on success, error code on failure) as the async result
+  // consumed by sceIoWaitAsync/PollAsync/GetAsyncStat. Even a failed open
+  // allocates an fd so the game can read the error via WaitAsync.
+  kernel.register(IO.sceIoOpenAsync, (regs, bus) => {
+    const path = kernel.readCString(bus, regs.getGpr(4));
+    const fileBytes = path ? kernel.pspFs.getFileData(path, kernel.currentThreadId) : null;
+    const fd = nextFd++;
+    if (fileBytes) {
+      openFiles.set(fd, { path: path!, data: fileBytes, position: 0, asyncResult: fd, hasAsyncResult: true, npdrm: false, pgdOffset: 0, pgdInfo: null });
+      log.info(`sceIoOpenAsync: fd=${fd} path=${path}`);
+    } else {
+      // Failed open: dummy fd whose async result is ENOENT
+      openFiles.set(fd, { path: path ?? "", data: new Uint8Array(0), position: 0, asyncResult: 0x80010002 | 0, hasAsyncResult: true, npdrm: false, pgdOffset: 0, pgdInfo: null });
+      log.warn(`sceIoOpenAsync: file not found: ${path} (fd=${fd}, async result=ENOENT)`);
+    }
+    regs.setGpr(2, fd);
   });
 
   // Helper: write s64 asyncResult to memory (PPSSPP uses Memory::Write_U64)
@@ -457,6 +627,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
     if (file.hasAsyncResult) {
       writeAsyncResult(bus, address, file.asyncResult);
       file.hasAsyncResult = false;
+      if (file.closePending) openFiles.delete(fd);
       regs.setGpr(2, 0);
     } else {
       regs.setGpr(2, 0x8002032a);
@@ -473,6 +644,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
     if (file.hasAsyncResult) {
       writeAsyncResult(bus, address, file.asyncResult);
       file.hasAsyncResult = false;
+      if (file.closePending) openFiles.delete(fd);
       regs.setGpr(2, 0);
     } else {
       regs.setGpr(2, 0x8002032a); // SCE_KERNEL_ERROR_NOASYNC
@@ -489,6 +661,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
     if (file.hasAsyncResult) {
       writeAsyncResult(bus, address, file.asyncResult);
       file.hasAsyncResult = false;
+      if (file.closePending) openFiles.delete(fd);
       regs.setGpr(2, 0);
     } else {
       regs.setGpr(2, 0x8002032a);
@@ -506,6 +679,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
     if (file.hasAsyncResult) {
       writeAsyncResult(bus, address, file.asyncResult);
       file.hasAsyncResult = false;
+      if (file.closePending) openFiles.delete(fd);
       regs.setGpr(2, 0);
     } else {
       // PPSSPP: SCE_KERNEL_ERROR_NOASYNC (no pending or completed result)
@@ -549,6 +723,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
     }
     log.debug(`sceIoReadAsync: fd=${fd} size=${size} result=${file.asyncResult}`);
     file.hasAsyncResult = true;
+    notifyIoCallback(file);
     regs.setGpr(2, 0);
   });
 
@@ -574,9 +749,16 @@ export function registerIoHLE(kernel: HLEKernel): void {
       const text = new TextDecoder().decode(bytes);
       if (kernel.stdoutBuffer !== null) kernel.stdoutBuffer.push(text);
       pspLog.info(`${text.replace(/\n$/, "")}`);
+    } else if (size > 0) {
+      // Real file write into the open file buffer
+      const bytes = new Uint8Array(size);
+      for (let i = 0; i < size; i++) bytes[i] = bus.readU8(data + i);
+      writeIntoFile(file, bytes, file.position);
+      file.position += size;
     }
     file.asyncResult = size;
     file.hasAsyncResult = true;
+    notifyIoCallback(file);
     kernel.ioOpsCount++;
     regs.setGpr(2, 0);
   });
@@ -613,14 +795,55 @@ export function registerIoHLE(kernel: HLEKernel): void {
   kernel.stub(IO.puts);
   kernel.stub(IO.sceIoAddDrv, 1);
   kernel.stub(IO.sceIoCancel);
-  kernel.stub(IO.sceIoChangeThreadCwd);
-  kernel.stub(IO.sceIoChstat);
+  // sceIoChangeThreadCwd(threadId, path) — set another thread's working directory.
+  // PPSSPP leaves this unimplemented; best-effort using our per-thread CWD.
+  kernel.register(IO.sceIoChangeThreadCwd, (regs, bus) => {
+    const threadId = regs.getGpr(4);
+    const path = kernel.readCString(bus, regs.getGpr(5));
+    log.debug(`sceIoChangeThreadCwd: tid=${threadId} → ${path}`);
+    regs.setGpr(2, kernel.pspFs.chDir(path, threadId));
+  });
+  // sceIoChstat(path, statPtr, bits) — PPSSPP sceIo.cpp:973 logs and returns 0.
+  // We don't model real stat, so accept it if the file exists.
+  kernel.register(IO.sceIoChstat, (regs, bus) => {
+    const path = kernel.readCString(bus, regs.getGpr(4));
+    const info = kernel.pspFs.getFileInfo(path, kernel.currentThreadId);
+    if (!info.exists) { regs.setGpr(2, 0x80010002); return; } // ENOENT
+    log.debug(`sceIoChstat: ${path} (accepted, no-op)`);
+    regs.setGpr(2, 0);
+  });
   kernel.stub(IO.sceIoCloseAll);
-  kernel.stub(IO.sceIoCloseAsync);
+  // sceIoCloseAsync(fd) — persist + close, result delivered via WaitAsync/PollAsync
+  kernel.register(IO.sceIoCloseAsync, (regs) => {
+    const fd = regs.getGpr(4);
+    const file = openFiles.get(fd);
+    if (!file) { regs.setGpr(2, 0x80010009); return; } // BADF
+    persistFile(file);
+    // PPSSPP keeps the FileNode alive until WaitAsync consumes the result.
+    file.asyncResult = 0;
+    file.hasAsyncResult = true;
+    notifyIoCallback(file);
+    file.closePending = true;
+    regs.setGpr(2, 0);
+  });
   kernel.stub(IO.sceIoDelDrv);
   kernel.stub(IO.sceIoGetFdList);
   kernel.stub(IO.sceIoGetIobUserLevel);
-  kernel.stub(IO.sceIoGetThreadCwd);
+  // sceIoGetThreadCwd(threadId, buf, length) — write a thread's CWD into buf.
+  // PPSSPP leaves this unimplemented; best-effort using our per-thread CWD.
+  kernel.register(IO.sceIoGetThreadCwd, (regs, bus) => {
+    const threadId = regs.getGpr(4);
+    const buf      = regs.getGpr(5);
+    const length   = regs.getGpr(6);
+    const cwd = kernel.pspFs.getCwd(threadId);
+    if (buf !== 0 && length > 0) {
+      const bytes = new TextEncoder().encode(cwd);
+      const n = Math.min(bytes.length, length - 1);
+      for (let i = 0; i < n; i++) bus.writeU8(buf + i, bytes[i]!);
+      bus.writeU8(buf + n, 0);
+    }
+    regs.setGpr(2, 0);
+  });
   // sceIoIoctl(fd, cmd, indata, inlen, outdata, outlen)
   // PPSSPP sceIo.cpp:2560-2740 — UMD-specific ioctl commands
   kernel.register(IO.sceIoIoctl, (regs, bus) => {
@@ -767,12 +990,59 @@ export function registerIoHLE(kernel: HLEKernel): void {
     log.debug(`sceIoMkdir: ${path}`);
     regs.setGpr(2, kernel.pspFs.mkDir(path, kernel.currentThreadId));
   });
-  kernel.stub(IO.sceIoRemove);
-  kernel.stub(IO.sceIoRename);
+  // sceIoRemove(path) — delete a file and its persisted copy
+  kernel.register(IO.sceIoRemove, (regs, bus) => {
+    const path = kernel.readCString(bus, regs.getGpr(4));
+    const existed = kernel.pspFs.removeFile(path, kernel.currentThreadId);
+    if (existed && isPersistablePath(kernel.pspFs.resolvePath(path, kernel.currentThreadId))) {
+      kernel.fileStore?.remove(kernel.pspFs.resolvePath(path, kernel.currentThreadId)).catch(() => {});
+    }
+    log.info(`sceIoRemove: ${path} (existed=${existed})`);
+    regs.setGpr(2, existed ? 0 : 0x80010002);
+  });
+  // sceIoRename(oldPath, newPath) — used by the atomic save idiom (write temp, rename over real)
+  kernel.register(IO.sceIoRename, (regs, bus) => {
+    const oldPath = kernel.readCString(bus, regs.getGpr(4));
+    const newPath = kernel.readCString(bus, regs.getGpr(5));
+    const moves = kernel.pspFs.rename(oldPath, newPath, kernel.currentThreadId);
+    for (const { from, to } of moves) {
+      if (isPersistablePath(to)) {
+        const data = kernel.pspFs.getFileData(to, kernel.currentThreadId);
+        if (data) kernel.fileStore?.put(to, data).catch(() => {});
+      }
+      if (isPersistablePath(from)) kernel.fileStore?.remove(from).catch(() => {});
+    }
+    log.info(`sceIoRename: ${oldPath} → ${newPath} (${moves.length} moved)`);
+    regs.setGpr(2, moves.length > 0 ? 0 : 0x80010002);
+  });
   kernel.stub(IO.sceIoReopen, 1);
-  kernel.stub(IO.sceIoRmdir);
-  kernel.stub(IO.sceIoSetAsyncCallback);
-  kernel.stub(IO.sceIoSync);
+  // sceIoRmdir(path) — remove an empty directory
+  kernel.register(IO.sceIoRmdir, (regs, bus) => {
+    const path = kernel.readCString(bus, regs.getGpr(4));
+    const ok = kernel.pspFs.rmDir(path, kernel.currentThreadId);
+    log.debug(`sceIoRmdir: ${path} (ok=${ok})`);
+    regs.setGpr(2, ok ? 0 : 0x80010002);
+  });
+  // sceIoSetAsyncCallback(fd, cbId, arg) — PPSSPP sceIo.cpp:2182
+  // Registers a callback fired when the fd's async op completes. We finish async
+  // ops synchronously, so if a result is already waiting, notify right away; the
+  // callback then runs at the next sceIoWaitAsyncCB.
+  kernel.register(IO.sceIoSetAsyncCallback, (regs) => {
+    const fd    = regs.getGpr(4);
+    const cbId  = regs.getGpr(5);
+    const arg   = regs.getGpr(6);
+    const file = openFiles.get(fd);
+    if (!file) { regs.setGpr(2, 0x80010009); return; } // BADF
+    file.asyncCbId = cbId;
+    file.asyncCbArg = arg;
+    if (file.hasAsyncResult) notifyIoCallback(file);
+    regs.setGpr(2, 0);
+  });
+  // sceIoSync(device, flag) — flush pending writes for a device to storage
+  kernel.register(IO.sceIoSync, (regs) => {
+    for (const file of openFiles.values()) persistFile(file);
+    regs.setGpr(2, 0);
+  });
   kernel.stub(IO.sceIoUnassign);
   kernel.stub(IO.sceKernelRegisterStderrPipe, 1);
   kernel.stub(IO.sceKernelRegisterStdoutPipe, 1);

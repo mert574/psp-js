@@ -41,6 +41,12 @@ let warnHook: WarnHook | null = null;
 export class Logger {
   static minLevel: LogLevel = "info";
 
+  /** Cheap check for hot paths: lets callers skip building expensive
+   *  debug message strings when debug logging is off. */
+  static get debugEnabled(): boolean {
+    return LEVEL_ORDER.debug >= LEVEL_ORDER[Logger.minLevel];
+  }
+
   private readonly color: string;
 
   private constructor(readonly namespace: string) {

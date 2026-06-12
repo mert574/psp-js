@@ -16,8 +16,17 @@ export class PspFileSystem {
   private startingDirectory = "disc0:/";
   /** Directories created via sceIoMkdir or registered as existing */
   private readonly knownDirs = new Set<string>();
+  /** Device aliases (lowercase, with trailing ':') set via sceIoAssign, e.g. "fatms0:" → "ms0:" */
+  private readonly deviceAliases = new Map<string, string>([["fatms0:", "ms0:"]]);
 
   constructor(private readonly fileData: Map<string, Uint8Array>) {}
+
+  /** Register a device alias so paths on `alias` resolve onto `target`. */
+  assignDevice(alias: string, target: string): void {
+    const a = alias.toLowerCase().replace(/^([a-z0-9]+:).*/, "$1");
+    const t = target.toLowerCase().replace(/^([a-z0-9]+:).*/, "$1");
+    if (a && t && a !== t) this.deviceAliases.set(a, t);
+  }
 
   /**
    * Set the starting (default) working directory.
@@ -77,6 +86,13 @@ export class PspFileSystem {
     // Normalize device aliases (PPSSPP MetaFileSystem.cpp:89)
     path = path.replace(/^umd0:/i, "disc0:");
     path = path.replace(/^umd1:/i, "disc0:");
+    // Apply assigned device aliases (e.g. fatms0: → ms0:)
+    const aliasColon = path.indexOf(":");
+    if (aliasColon >= 0) {
+      const dev = path.substring(0, aliasColon + 1).toLowerCase();
+      const target = this.deviceAliases.get(dev);
+      if (target) path = target + path.substring(aliasColon + 1);
+    }
 
     let device: string;
     let rest: string;
@@ -126,6 +142,11 @@ export class PspFileSystem {
     return 0;
   }
 
+  /** Current working directory for a thread (falls back to the starting directory). */
+  getCwd(threadId: number): string {
+    return this.currentDir.get(threadId) ?? this.startingDirectory;
+  }
+
   /**
    * Get file info. Checks files first, then infers directories from
    * the fileData keys. Case-insensitive matching.
@@ -171,6 +192,97 @@ export class PspFileSystem {
       if (key.toLowerCase() === resolvedLower) return data;
     }
     return undefined;
+  }
+
+  /**
+   * Write file data by path, replacing any existing file (case-insensitive).
+   * Registers the parent directories as known. Returns the resolved key used.
+   */
+  writeFile(path: string, data: Uint8Array, threadId: number): string {
+    const resolved = this.resolvePath(path, threadId);
+    const resolvedLower = resolved.toLowerCase();
+    // Replace an existing key regardless of its stored case, else add a new one.
+    for (const key of this.fileData.keys()) {
+      if (key.toLowerCase() === resolvedLower) {
+        this.fileData.set(key, data);
+        return key;
+      }
+    }
+    this.fileData.set(resolved, data);
+    const slash = resolved.lastIndexOf("/");
+    if (slash > 0) this._registerDirAndParents(resolved.substring(0, slash));
+    return resolved;
+  }
+
+  /** Remove a file by path (case-insensitive). Returns true if it existed. */
+  removeFile(path: string, threadId: number): boolean {
+    const resolvedLower = this.resolvePath(path, threadId).toLowerCase();
+    for (const key of this.fileData.keys()) {
+      if (key.toLowerCase() === resolvedLower) {
+        this.fileData.delete(key);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Rename a file or directory. For a directory, moves every file underneath it.
+   * Returns the list of {from, to} resolved keys actually moved (empty if the
+   * source didn't exist) so the caller can update persistent storage.
+   */
+  rename(oldPath: string, newPath: string, threadId: number): Array<{ from: string; to: string }> {
+    const oldResolved = this.resolvePath(oldPath, threadId);
+    const oldLower = oldResolved.toLowerCase();
+    const moves: Array<{ from: string; to: string }> = [];
+
+    // PSP rename takes a bare new name when old and new share a directory,
+    // but also accepts a full path. resolvePath handles the full-path case;
+    // for a bare name, keep the source's parent directory.
+    let newResolved = this.resolvePath(newPath, threadId);
+    if (!newPath.includes("/") && !newPath.includes(":")) {
+      const slash = oldResolved.lastIndexOf("/");
+      newResolved = slash >= 0 ? oldResolved.substring(0, slash + 1) + newPath : newResolved;
+    }
+
+    // Exact file match
+    for (const [key, data] of this.fileData) {
+      if (key.toLowerCase() === oldLower) {
+        this.fileData.delete(key);
+        this.fileData.set(newResolved, data);
+        const slash = newResolved.lastIndexOf("/");
+        if (slash > 0) this._registerDirAndParents(newResolved.substring(0, slash));
+        moves.push({ from: key, to: newResolved });
+        return moves;
+      }
+    }
+
+    // Directory move: relocate every file under oldResolved + "/"
+    const dirPrefix = oldLower.endsWith("/") ? oldLower : oldLower + "/";
+    const toMove: Array<[string, Uint8Array]> = [];
+    for (const [key, data] of this.fileData) {
+      if (key.toLowerCase().startsWith(dirPrefix)) toMove.push([key, data]);
+    }
+    for (const [key, data] of toMove) {
+      const suffix = key.substring(dirPrefix.length);
+      const newKey = (newResolved.endsWith("/") ? newResolved : newResolved + "/") + suffix;
+      this.fileData.delete(key);
+      this.fileData.set(newKey, data);
+      moves.push({ from: key, to: newKey });
+    }
+    if (moves.length > 0) this._registerDirAndParents(newResolved);
+    return moves;
+  }
+
+  /** Remove a directory. Fails (returns false) if it still contains files. */
+  rmDir(path: string, threadId: number): boolean {
+    const resolved = this.resolvePath(path, threadId);
+    const resolvedLower = resolved.toLowerCase();
+    const dirPrefix = resolvedLower.endsWith("/") ? resolvedLower : resolvedLower + "/";
+    for (const key of this.fileData.keys()) {
+      if (key.toLowerCase().startsWith(dirPrefix)) return false; // not empty
+    }
+    return this.knownDirs.delete(resolvedLower);
   }
 
   /**

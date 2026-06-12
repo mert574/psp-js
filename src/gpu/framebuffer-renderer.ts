@@ -87,6 +87,17 @@ export class FramebufferRenderer {
     if (addr === 0) return;
 
     const gl = this.gl;
+
+    // The canvas may have been used by WebGLGERenderer in a previous boot
+    // (getContext returns the same context), so reset the state it changes.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, PSP_WIDTH, PSP_HEIGHT);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.disable(gl.STENCIL_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.colorMask(true, true, true, true);
     const offset = (addr & 0x1FFFFFFF) - VRAM_BASE; // physical offset into VRAM
     if (offset < 0 || offset >= vram.length) return;
 

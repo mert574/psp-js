@@ -832,10 +832,12 @@ function execSC(cpu: AllegrexCPU, i: Instruction): void {
 // ── VFPU ────────────────────────────────────────────────────────────────
 
 /**
- * Maps VFPU rt/imm7 field to scalar register index (0-127).
+ * Maps the lv.s/sv.s register field to a flat vfpr index.
+ * PPSSPP Int_SV: vt = ((op >> 16) & 0x1f) | ((op & 3) << 5), accessed as
+ * VI(vt) — i.e. through the voffset[] mapping, same as every ALU operand.
  */
 function vfpuScalarIndex(i: Instruction): number {
-  return i.rt | ((i.raw & 1) << 5); // 6-bit: rt[4:0] | bit0<<5
+  return vfpuOffset(i.rt | ((i.raw & 3) << 5));
 }
 
 /**
@@ -861,14 +863,15 @@ function vfpuQuadIndices(i: Instruction): number[] {
 }
 
 function execLVS(cpu: AllegrexCPU, i: Instruction): void {
-  const addr = ea(cpu, i);
+  // Low 2 bits of the offset are part of the register code (PPSSPP: op & 0xFFFC)
+  const addr = ((cpu.regs.getGpr(i.rs) + (i.imm16s & ~3)) >>> 0);
   const vt = vfpuScalarIndex(i);
   const bits = cpu.bus.readU32(addr);
   cpu.regs.setVfprBits(vt, bits);
 }
 
 function execSVS(cpu: AllegrexCPU, i: Instruction): void {
-  const addr = ea(cpu, i);
+  const addr = ((cpu.regs.getGpr(i.rs) + (i.imm16s & ~3)) >>> 0);
   const vt = vfpuScalarIndex(i);
   const bits = cpu.regs.getVfprBits(vt);
   cpu.bus.writeU32(addr, bits);
@@ -1027,6 +1030,68 @@ function vfpuReadBits(r: AllegrexRegisters, reg: number): number {
   return r.getVfprBits(vfpuOffset(reg));
 }
 
+// ── VFPU operand prefixes (vpfxs/vpfxt/vpfxd) ──────────────────────────────
+// Prefix word layout (PPSSPP GPUState / MIPSIntVFPU ApplySwizzleS/T):
+//   bits 0-7:  swizzle, 2 bits per lane (source lane index)
+//   bits 8-11: abs flag per lane
+//   bits 12-15: constant flag per lane (swizzle+abs then select a constant)
+//   bits 16-19: negate flag per lane
+const VFPU_PFX_CONSTANTS = [0, 1, 2, 0.5, 3, 1 / 3, 0.25, 1 / 6];
+
+/** Apply an S/T prefix to operand lanes (swizzle / abs / constant / negate). */
+function applyPfxST(v: Float32Array, pfx: number): Float32Array {
+  const src = Float32Array.from(v);
+  for (let i = 0; i < v.length; i++) {
+    const swz = (pfx >>> (i * 2)) & 3;
+    const abs = (pfx >>> (8 + i)) & 1;
+    const cst = (pfx >>> (12 + i)) & 1;
+    const neg = (pfx >>> (16 + i)) & 1;
+    let val: number;
+    if (cst) {
+      val = VFPU_PFX_CONSTANTS[swz | (abs << 2)]!;
+    } else {
+      // Swizzling beyond the operand size reads stale lanes on hardware;
+      // approximate by clamping to the available lanes.
+      val = src[swz < src.length ? swz : src.length - 1]!;
+      if (abs) val = Math.abs(val);
+    }
+    if (neg) val = -val;
+    v[i] = val;
+  }
+  return v;
+}
+
+/** Read the S operand, honoring a pending vpfxs prefix. */
+function readVecS(r: AllegrexRegisters, reg: number, size: number): Float32Array {
+  const v = vfpuReadVec(r, reg, size);
+  return r.vpfxsEnabled ? applyPfxST(v, r.vpfxs) : v;
+}
+
+/** Read the T operand, honoring a pending vpfxt prefix. */
+function readVecT(r: AllegrexRegisters, reg: number, size: number): Float32Array {
+  const v = vfpuReadVec(r, reg, size);
+  return r.vpfxtEnabled ? applyPfxST(v, r.vpfxt) : v;
+}
+
+/** Write the D result, honoring a pending vpfxd prefix (saturation + write mask). */
+function writeVecD(r: AllegrexRegisters, reg: number, size: number, data: Float32Array): void {
+  let out = data;
+  if (r.vpfxdEnabled) {
+    const pfx = r.vpfxd;
+    const cur = vfpuReadVec(r, reg, size);
+    out = new Float32Array(size);
+    for (let i = 0; i < size; i++) {
+      const sat = (pfx >>> (i * 2)) & 3;
+      const masked = (pfx >>> (8 + i)) & 1;
+      let v = data[i]!;
+      if (sat === 1) v = Math.min(1, Math.max(0, v));
+      else if (sat === 3) v = Math.min(1, Math.max(-1, v));
+      out[i] = masked ? cur[i]! : v;
+    }
+  }
+  vfpuWriteVec(r, reg, size, out);
+}
+
 /** Read VFPU vector as u32 bits. */
 function vfpuReadVecBits(r: AllegrexRegisters, reg: number, size: number): Uint32Array {
   const out = new Uint32Array(size);
@@ -1093,7 +1158,7 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
 
   // Float-to-int conversions (rs=16..19)
   if (rs >= 16 && rs <= 19) {
-    const src = vfpuReadVec(r, vs, sz);
+    const src = readVecS(r, vs, sz);
     const imm = (raw >>> 16) & 0x1F;
     const mult = (1 << imm);
     const dst = new Uint32Array(sz);
@@ -1124,7 +1189,7 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
     const scale = 1.0 / (1 << imm);
     const dst = new Float32Array(sz);
     for (let j = 0; j < sz; j++) dst[j] = (srcBits[j]! | 0) * scale;
-    vfpuWriteVec(r, vd, sz, dst);
+    writeVecD(r, vd, sz, dst);
     r.vpfxsEnabled = false; r.vpfxtEnabled = false; r.vpfxdEnabled = false;
     return;
   }
@@ -1142,14 +1207,14 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
     const val = constIdx < VFPU_CST.length ? VFPU_CST[constIdx]! : 0;
     const dst = new Float32Array(sz);
     for (let j = 0; j < sz; j++) dst[j] = val;
-    vfpuWriteVec(r, vd, sz, dst);
+    writeVecD(r, vd, sz, dst);
     r.vpfxsEnabled = false; r.vpfxtEnabled = false; r.vpfxdEnabled = false;
     return;
   }
 
   // VFPU4 table (rs=0)
   if (rs === 0) {
-    const src = vfpuReadVec(r, vs, sz);
+    const src = readVecS(r, vs, sz);
     const dst = new Float32Array(sz);
     switch (rt) {
       case 0: for (let j = 0; j < sz; j++) dst[j] = src[j]!; break; // vmov
@@ -1176,7 +1241,7 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
       case 28: for (let j = 0; j < sz; j++) dst[j] = 1.0 / Math.pow(2, src[j]!); break; // vrexp2
       default: break; // unknown — NOP
     }
-    vfpuWriteVec(r, vd, sz, dst);
+    writeVecD(r, vd, sz, dst);
     r.vpfxsEnabled = false; r.vpfxtEnabled = false; r.vpfxdEnabled = false;
     return;
   }
@@ -1272,7 +1337,7 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
         break;
       }
       case 18: { // vf2h — float to half
-        const src = vfpuReadVec(r, vs, sz);
+        const src = readVecS(r, vs, sz);
         const dstSz = Math.max(1, sz >> 1);
         const dst = new Uint32Array(dstSz);
         for (let j = 0; j < dstSz; j++) {
@@ -1303,35 +1368,106 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
   // VFPU9 table (rs=2) — utility operations
   if (rs === 2) {
     switch (rt) {
+      case 0: { // vsrt1 — PPSSPP Int_Vsrt1: pairwise min/max
+        const s = readVecS(r, vs, 4);
+        const d = new Float32Array([
+          Math.min(s[0]!, s[1]!), Math.max(s[0]!, s[1]!),
+          Math.min(s[2]!, s[3]!), Math.max(s[2]!, s[3]!),
+        ]);
+        writeVecD(r, vd, 4, d);
+        break;
+      }
+      case 1: { // vsrt2 — PPSSPP Int_Vsrt2: outer/inner min/max
+        const s = readVecS(r, vs, 4);
+        const d = new Float32Array([
+          Math.min(s[0]!, s[3]!), Math.min(s[1]!, s[2]!),
+          Math.max(s[2]!, s[1]!), Math.max(s[3]!, s[0]!),
+        ]);
+        writeVecD(r, vd, 4, d);
+        break;
+      }
+      case 2: { // vbfy1 — PPSSPP Int_Vbfy: butterfly add/sub on adjacent pairs
+        const s = readVecS(r, vs, sz);
+        const d = new Float32Array(sz);
+        d[0] = s[0]! + s[1]!;
+        d[1] = s[0]! - s[1]!;
+        if (sz === 4) {
+          d[2] = s[2]! + s[3]!;
+          d[3] = s[2]! - s[3]!;
+        }
+        writeVecD(r, vd, sz, d);
+        break;
+      }
+      case 3: { // vbfy2 — butterfly add/sub across halves (quad only)
+        const s = readVecS(r, vs, 4);
+        const d = new Float32Array([
+          s[0]! + s[2]!, s[1]! + s[3]!,
+          s[0]! - s[2]!, s[1]! - s[3]!,
+        ]);
+        writeVecD(r, vd, 4, d);
+        break;
+      }
+      case 5: { // vsocp — PPSSPP Int_Vsocp: [clamp(1-s0), clamp(s0), ...], output size doubles
+        const s = readVecS(r, vs, sz);
+        const outSz = Math.min(4, sz * 2);
+        const clamp01 = (v: number): number => (Number.isNaN(v) ? 0 : Math.min(1, Math.max(0, v)));
+        const d = new Float32Array(outSz);
+        d[0] = clamp01(1 - s[0]!);
+        d[1] = clamp01(s[0]!);
+        if (outSz === 4) {
+          d[2] = clamp01(1 - s[1]!);
+          d[3] = clamp01(s[1]!);
+        }
+        writeVecD(r, vd, outSz, d);
+        break;
+      }
+      case 8: { // vsrt3 — like vsrt1 with max/min swapped
+        const s = readVecS(r, vs, 4);
+        const d = new Float32Array([
+          Math.max(s[0]!, s[1]!), Math.min(s[1]!, s[0]!),
+          Math.max(s[2]!, s[3]!), Math.min(s[3]!, s[2]!),
+        ]);
+        writeVecD(r, vd, 4, d);
+        break;
+      }
+      case 9: { // vsrt4 — like vsrt2 with max/min swapped
+        const s = readVecS(r, vs, 4);
+        const d = new Float32Array([
+          Math.max(s[0]!, s[3]!), Math.max(s[1]!, s[2]!),
+          Math.min(s[2]!, s[1]!), Math.min(s[3]!, s[0]!),
+        ]);
+        writeVecD(r, vd, 4, d);
+        break;
+      }
       case 4: { // vocp — one's complement: 1.0 - x
-        const src = vfpuReadVec(r, vs, sz);
+        const src = readVecS(r, vs, sz);
         const dst = new Float32Array(sz);
         for (let j = 0; j < sz; j++) dst[j] = 1.0 - src[j]!;
-        vfpuWriteVec(r, vd, sz, dst);
+        writeVecD(r, vd, sz, dst);
         break;
       }
       case 6: { // vfad — horizontal add
-        const src = vfpuReadVec(r, vs, sz);
+        const src = readVecS(r, vs, sz);
         let sum = 0;
         for (let j = 0; j < sz; j++) sum += src[j]!;
-        vfpuWriteVec(r, vd, 1, new Float32Array([sum]));
+        writeVecD(r, vd, 1, new Float32Array([sum]));
         break;
       }
       case 7: { // vavg — horizontal average
-        const src = vfpuReadVec(r, vs, sz);
+        const src = readVecS(r, vs, sz);
         let sum = 0;
         for (let j = 0; j < sz; j++) sum += src[j]!;
-        vfpuWriteVec(r, vd, 1, new Float32Array([sum / sz]));
+        writeVecD(r, vd, 1, new Float32Array([sum / sz]));
         break;
       }
       case 10: { // vsgn — sign function
-        const src = vfpuReadVec(r, vs, sz);
+        const src = readVecS(r, vs, sz);
         const dst = new Float32Array(sz);
         for (let j = 0; j < sz; j++) {
           const v = src[j]!;
           dst[j] = v > 0 ? 1 : v < 0 ? -1 : 0;
         }
-        vfpuWriteVec(r, vd, sz, dst);
+        writeVecD(r, vd, sz, dst);
         break;
       }
       case 16: { // vmfvc — move from VFPU control
@@ -1500,41 +1636,35 @@ function execCOP2(cpu: AllegrexCPU, i: Instruction): void {
   const r = cpu.regs;
   const fmt = i.rs; // bits 25-21
 
+  // PPSSPP Int_Mftv: fmt 3 = mfv/mfvc, fmt 7 = mtv/mtvc.
+  // Register code is the LOW BYTE: <128 = VFPU reg (through voffset),
+  // 128..143 = control reg (CC lives at 128+3).
+  const imm = i.raw & 0xFF;
   switch (fmt) {
-    case 0x03: { // MFVC — move from VFPU control reg to GPR
-      const vcreg = (i.raw >>> 8) & 0x7F;
-      if (vcreg < 16) {
-        r.setGpr(i.rt, r.vfpuCtrl[vcreg]!);
-      } else if (vcreg === 128) { // VFPU_CC
-        r.setGpr(i.rt, r.vfpuCc);
-      } else {
-        r.setGpr(i.rt, 0);
+    case 0x03: { // mfv / mfvc
+      // rt=0, imm=255 is used as a CPU interlock by some games — no-op.
+      if (i.rt !== 0) {
+        if (imm < 128) {
+          r.setGpr(i.rt, r.getVfprBits(vfpuOffset(imm)));
+        } else if (imm < 144) {
+          r.setGpr(i.rt, imm === 128 + 3 ? r.vfpuCc : r.vfpuCtrl[imm - 128]!);
+        } else {
+          r.setGpr(i.rt, 0);
+        }
       }
       break;
     }
-    case 0x07: { // MTVC — move from GPR to VFPU control reg
-      const vcreg = (i.raw >>> 8) & 0x7F;
-      if (vcreg < 16) {
-        r.vfpuCtrl[vcreg] = r.getGpr(i.rt);
-      } else if (vcreg === 128) {
-        r.vfpuCc = r.getGpr(i.rt);
+    case 0x07: { // mtv / mtvc
+      if (imm < 128) {
+        r.setVfprBits(vfpuOffset(imm), r.getGpr(i.rt));
+      } else if (imm < 144) {
+        if (imm === 128 + 3) r.vfpuCc = r.getGpr(i.rt);
+        else r.vfpuCtrl[imm - 128] = r.getGpr(i.rt);
       }
-      break;
-    }
-    case 0x00: { // MFV — move from VFPU register to GPR
-      const vs = (i.raw >>> 8) & 0x7F;
-      const view = new DataView(r.vfpr.buffer);
-      r.setGpr(i.rt, view.getUint32(vs * 4, true));
-      break;
-    }
-    case 0x04: { // MTV — move from GPR to VFPU register
-      const vs = (i.raw >>> 8) & 0x7F;
-      const view = new DataView(r.vfpr.buffer);
-      view.setUint32(vs * 4, r.getGpr(i.rt), true);
       break;
     }
     default:
-      // Many VFPU ops — NOP unknown ones for now
+      // fmt 0/4 = mfc2/mtc2 — PPSSPP treats them as generic no-ops.
       break;
   }
 
@@ -1553,8 +1683,8 @@ function execVFPU0(cpu: AllegrexCPU, i: Instruction): void {
   const vs = (raw >>> 8) & 0x7F;
   const vt = (raw >>> 16) & 0x7F;
   const sz = vfpuVecSize(raw);
-  const s = vfpuReadVec(r, vs, sz);
-  const t = vfpuReadVec(r, vt, sz);
+  const s = readVecS(r, vs, sz);
+  const t = readVecT(r, vt, sz);
   const d = new Float32Array(sz);
   switch (sub) {
     case 0: for (let j = 0; j < sz; j++) d[j] = s[j]! + t[j]!; break; // vadd
@@ -1562,7 +1692,7 @@ function execVFPU0(cpu: AllegrexCPU, i: Instruction): void {
     case 7: for (let j = 0; j < sz; j++) d[j] = s[j]! / t[j]!; break; // vdiv
     default: break;
   }
-  vfpuWriteVec(r, vd, sz, d);
+  writeVecD(r, vd, sz, d);
   r.vpfxsEnabled = false; r.vpfxtEnabled = false; r.vpfxdEnabled = false;
 }
 
@@ -1578,53 +1708,53 @@ function execVFPU1(cpu: AllegrexCPU, i: Instruction): void {
 
   switch (sub) {
     case 0: { // vmul — element-wise multiply
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       const d = new Float32Array(sz);
       for (let j = 0; j < sz; j++) d[j] = s[j]! * t[j]!;
-      vfpuWriteVec(r, vd, sz, d);
+      writeVecD(r, vd, sz, d);
       break;
     }
     case 1: { // vdot — dot product → scalar
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       let sum = 0;
       for (let j = 0; j < sz; j++) sum += s[j]! * t[j]!;
-      vfpuWriteVec(r, vd, 1, new Float32Array([sum]));
+      writeVecD(r, vd, 1, new Float32Array([sum]));
       break;
     }
     case 2: { // vscl — scale vector by scalar
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, 1); // read single scalar
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, 1); // read single scalar
       const d = new Float32Array(sz);
       for (let j = 0; j < sz; j++) d[j] = s[j]! * t[0]!;
-      vfpuWriteVec(r, vd, sz, d);
+      writeVecD(r, vd, sz, d);
       break;
     }
     case 4: { // vhdp — homogeneous dot product (last s element = 1.0)
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       let sum = 0;
       for (let j = 0; j < sz - 1; j++) sum += s[j]! * t[j]!;
       sum += 1.0 * t[sz - 1]!; // last s forced to 1.0
-      vfpuWriteVec(r, vd, 1, new Float32Array([sum]));
+      writeVecD(r, vd, 1, new Float32Array([sum]));
       break;
     }
     case 5: { // vcrs — cross product (triple only)
-      const s = vfpuReadVec(r, vs, 3);
-      const t = vfpuReadVec(r, vt, 3);
+      const s = readVecS(r, vs, 3);
+      const t = readVecT(r, vt, 3);
       const d = new Float32Array(3);
       d[0] = s[1]! * t[2]! - s[2]! * t[1]!;
       d[1] = s[2]! * t[0]! - s[0]! * t[2]!;
       d[2] = s[0]! * t[1]! - s[1]! * t[0]!;
-      vfpuWriteVec(r, vd, 3, d);
+      writeVecD(r, vd, 3, d);
       break;
     }
     case 6: { // vdet — 2D determinant
-      const s = vfpuReadVec(r, vs, 2);
-      const t = vfpuReadVec(r, vt, 2);
+      const s = readVecS(r, vs, 2);
+      const t = readVecT(r, vt, 2);
       const det = s[0]! * t[1]! - s[1]! * t[0]!;
-      vfpuWriteVec(r, vd, 1, new Float32Array([det]));
+      writeVecD(r, vd, 1, new Float32Array([det]));
       break;
     }
     default: break;
@@ -1645,8 +1775,8 @@ function execVFPU3(cpu: AllegrexCPU, i: Instruction): void {
   switch (sub) {
     case 0: { // vcmp — set CC bits based on condition
       const cond = raw & 0xF;
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       let cc = 0;
       let orBit = 0, andBit = 1;
       for (let j = 0; j < sz; j++) {
@@ -1678,46 +1808,46 @@ function execVFPU3(cpu: AllegrexCPU, i: Instruction): void {
       break;
     }
     case 2: { // vmin
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       const d = new Float32Array(sz);
       for (let j = 0; j < sz; j++) d[j] = Math.min(s[j]!, t[j]!);
-      vfpuWriteVec(r, vd, sz, d);
+      writeVecD(r, vd, sz, d);
       break;
     }
     case 3: { // vmax
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       const d = new Float32Array(sz);
       for (let j = 0; j < sz; j++) d[j] = Math.max(s[j]!, t[j]!);
-      vfpuWriteVec(r, vd, sz, d);
+      writeVecD(r, vd, sz, d);
       break;
     }
     case 5: { // vscmp — sign of difference
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       const d = new Float32Array(sz);
       for (let j = 0; j < sz; j++) {
         const diff = s[j]! - t[j]!;
         d[j] = diff > 0 ? 1.0 : diff < 0 ? -1.0 : 0.0;
       }
-      vfpuWriteVec(r, vd, sz, d);
+      writeVecD(r, vd, sz, d);
       break;
     }
     case 6: { // vsge — s >= t ? 1.0 : 0.0
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       const d = new Float32Array(sz);
       for (let j = 0; j < sz; j++) d[j] = (s[j]! >= t[j]!) ? 1.0 : 0.0;
-      vfpuWriteVec(r, vd, sz, d);
+      writeVecD(r, vd, sz, d);
       break;
     }
     case 7: { // vslt — s < t ? 1.0 : 0.0
-      const s = vfpuReadVec(r, vs, sz);
-      const t = vfpuReadVec(r, vt, sz);
+      const s = readVecS(r, vs, sz);
+      const t = readVecT(r, vt, sz);
       const d = new Float32Array(sz);
       for (let j = 0; j < sz; j++) d[j] = (s[j]! < t[j]!) ? 1.0 : 0.0;
-      vfpuWriteVec(r, vd, sz, d);
+      writeVecD(r, vd, sz, d);
       break;
     }
     default: break;
@@ -1840,7 +1970,7 @@ function execVFPU6(cpu: AllegrexCPU, i: Instruction): void {
     const tn = Math.min(n, ins + 1); // how many t elements to use
     // Read matrix (as flat array, row-major: s[row*4 + col])
     const sM = vfpuReadMatrix(r, vs, tfmSz);
-    const tVec = vfpuReadVec(r, vt, tn);
+    const tVec = readVecT(r, vt, tn);
     // Build padded t vector with constants for homogeneous transform
     const t2 = new Float32Array(4);
     for (let k = 0; k < 4; k++) {
@@ -1855,11 +1985,11 @@ function execVFPU6(cpu: AllegrexCPU, i: Instruction): void {
       for (let k = 0; k < tfmSz; k++) sum += sM[i * 4 + k]! * t2[k]!;
       d[i] = sum;
     }
-    vfpuWriteVec(r, vd, tfmSz, d);
+    writeVecD(r, vd, tfmSz, d);
   } else if (sub5 <= 19) {
     // vmscl — matrix scale by scalar
     const sM = vfpuReadMatrix(r, vs, n);
-    const t = vfpuReadVec(r, vt, 1);
+    const t = readVecT(r, vt, 1);
     const scalar = t[0]!;
     const dM = new Float32Array(n * 4);
     for (let j = 0; j < n; j++)
@@ -1870,23 +2000,23 @@ function execVFPU6(cpu: AllegrexCPU, i: Instruction): void {
     // vcrsp.t / vqmul.q
     if (sz === 3) {
       // vcrsp — cross product
-      const s = vfpuReadVec(r, vs, 3);
-      const t = vfpuReadVec(r, vt, 3);
+      const s = readVecS(r, vs, 3);
+      const t = readVecT(r, vt, 3);
       const d = new Float32Array(3);
       d[0] = s[1]! * t[2]! - s[2]! * t[1]!;
       d[1] = s[2]! * t[0]! - s[0]! * t[2]!;
       d[2] = s[0]! * t[1]! - s[1]! * t[0]!;
-      vfpuWriteVec(r, vd, 3, d);
+      writeVecD(r, vd, 3, d);
     } else if (sz === 4) {
       // vqmul — quaternion multiply
-      const s = vfpuReadVec(r, vs, 4);
-      const t = vfpuReadVec(r, vt, 4);
+      const s = readVecS(r, vs, 4);
+      const t = readVecT(r, vt, 4);
       const d = new Float32Array(4);
       d[0] = s[0]!*t[3]! + s[1]!*t[2]! - s[2]!*t[1]! + s[3]!*t[0]!;
       d[1] = -s[0]!*t[2]! + s[1]!*t[3]! + s[2]!*t[0]! + s[3]!*t[1]!;
       d[2] = s[0]!*t[1]! - s[1]!*t[0]! + s[2]!*t[3]! + s[3]!*t[2]!;
       d[3] = -s[0]!*t[0]! - s[1]!*t[1]! - s[2]!*t[2]! + s[3]!*t[3]!;
-      vfpuWriteVec(r, vd, 4, d);
+      writeVecD(r, vd, 4, d);
     }
   } else if (sub5 === 28) {
     // VFPUMatrix1: vmidt, vmzero, vmone
@@ -1913,16 +2043,16 @@ function execVFPU6(cpu: AllegrexCPU, i: Instruction): void {
     const negSin = (imm5 >>> 4) & 1;
     const sinLane = (imm5 >>> 2) & 3;
     const cosLane = imm5 & 3;
-    const angle = vfpuReadVec(r, vs, 1)[0]!;
-    const sinV = Math.sin(angle * (Math.PI / 2));
+    const angle = readVecS(r, vs, 1)[0]!;
+    let sinV = Math.sin(angle * (Math.PI / 2));
     const cosV = Math.cos(angle * (Math.PI / 2));
+    if (negSin) sinV = -sinV;
     const d = new Float32Array(sz);
-    for (let j = 0; j < sz; j++) {
-      if (j === cosLane) d[j] = cosV;
-      else if (j === sinLane) d[j] = negSin ? -sinV : sinV;
-      else d[j] = 0;
-    }
-    vfpuWriteVec(r, vd, sz, d);
+    // PPSSPP Int_Vrot: if sin lane == cos lane, sine broadcasts to ALL lanes
+    if (sinLane === cosLane) d.fill(sinV);
+    else d[sinLane] = sinV;
+    d[cosLane] = cosV;
+    writeVecD(r, vd, sz, d);
   }
 
   r.vpfxsEnabled = false; r.vpfxtEnabled = false; r.vpfxdEnabled = false;

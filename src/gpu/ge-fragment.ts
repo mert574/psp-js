@@ -145,10 +145,17 @@ export function applyDither(state: GEFragmentState, value: number, x: number, y:
   return Math.max(0, Math.min(255, value + offset));
 }
 
+// Reused output buffers for the per-pixel helpers below. These functions run
+// once per fragment, so returning a fresh array each call creates heavy GC
+// pressure. Callers must copy the values out before calling the helper again.
+const texFuncOut = new Int32Array(4);
+const blendOut = new Int32Array(4);
+const factorOut = new Int32Array(3);
+
 /**
  * Apply texture function (texFunc) blending between primitive color and texel color.
  * All channels use the internal convention: r=B-channel, g=G-channel, b=R-channel, a=A-channel
- * (R/B swapped for shader swizzle). Returns [r, g, b, a].
+ * (R/B swapped for shader swizzle). Returns a reused [r, g, b, a] buffer.
  *
  * PPSSPP reference: GPU/Software/Sampler.cpp lines ~524-592
  * Rounding: PPSSPP uses (prim+1)*tex / 256 for MODULATE/ADD alpha,
@@ -159,65 +166,68 @@ export function applyTexFunc(
   state: GEFragmentState,
   tr: number, tg: number, tb: number, ta: number,  // texel (r=B, g=G, b=R, a=A)
   pr: number, pg: number, pb: number, pa: number,  // prim vertex color (same convention)
-): [number, number, number, number] {
+): Int32Array {
   const useAlpha = state.texFuncAlpha;
+  const out = texFuncOut;
   switch (state.texFunc) {
     case 0: { // MODULATE: out = (prim+1) * tex / 256  — PPSSPP Sampler.cpp:527
-      const or = (pr + 1) * tr >> 8;
-      const og = (pg + 1) * tg >> 8;
-      const ob = (pb + 1) * tb >> 8;
-      const oa = useAlpha ? ((pa + 1) * ta >> 8) : pa;
-      return [or, og, ob, oa];
+      out[0] = (pr + 1) * tr >> 8;
+      out[1] = (pg + 1) * tg >> 8;
+      out[2] = (pb + 1) * tb >> 8;
+      out[3] = useAlpha ? ((pa + 1) * ta >> 8) : pa;
+      break;
     }
     case 1: { // DECAL — PPSSPP Sampler.cpp:534-545
       // out_rgb = ((prim+1)*(255-tex_a) + (tex+1)*tex_a) / 256
       const invA = 255 - ta;
-      const or = ((pr + 1) * invA + (tr + 1) * ta) >> 8;
-      const og = ((pg + 1) * invA + (tg + 1) * ta) >> 8;
-      const ob = ((pb + 1) * invA + (tb + 1) * ta) >> 8;
-      return [or, og, ob, pa];
+      out[0] = ((pr + 1) * invA + (tr + 1) * ta) >> 8;
+      out[1] = ((pg + 1) * invA + (tg + 1) * ta) >> 8;
+      out[2] = ((pb + 1) * invA + (tb + 1) * ta) >> 8;
+      out[3] = pa;
+      break;
     }
     case 2: { // BLEND — PPSSPP Sampler.cpp:555-569
       // out_rgb = ((255-tex)*prim + tex*texenv + 255) / 256  (rounds UP)
       const er = state.texEnvColor & 0xFF;
       const eg = (state.texEnvColor >>> 8) & 0xFF;
       const eb = (state.texEnvColor >>> 16) & 0xFF;
-      const or = ((255 - tr) * pr + tr * er + 255) >> 8;
-      const og = ((255 - tg) * pg + tg * eg + 255) >> 8;
-      const ob = ((255 - tb) * pb + tb * eb + 255) >> 8;
-      const oa = useAlpha ? ((pa + 1) * ta >> 8) : pa;
-      return [or, og, ob, oa];
+      out[0] = ((255 - tr) * pr + tr * er + 255) >> 8;
+      out[1] = ((255 - tg) * pg + tg * eg + 255) >> 8;
+      out[2] = ((255 - tb) * pb + tb * eb + 255) >> 8;
+      out[3] = useAlpha ? ((pa + 1) * ta >> 8) : pa;
+      break;
     }
     case 3: { // REPLACE — PPSSPP Sampler.cpp:573-579
-      const oa = useAlpha ? ta : pa;
-      return [tr, tg, tb, oa];
+      out[0] = tr; out[1] = tg; out[2] = tb;
+      out[3] = useAlpha ? ta : pa;
+      break;
     }
     case 4: { // ADD — PPSSPP Sampler.cpp:581-592
       // out_rgb = prim + tex (clamped later)
-      const or = pr + tr;
-      const og = pg + tg;
-      const ob = pb + tb;
-      const oa = useAlpha ? ((pa + 1) * ta >> 8) : pa;
-      return [or, og, ob, oa];
+      out[0] = pr + tr;
+      out[1] = pg + tg;
+      out[2] = pb + tb;
+      out[3] = useAlpha ? ((pa + 1) * ta >> 8) : pa;
+      break;
     }
     default:
-      return [tr, tg, tb, ta];
+      out[0] = tr; out[1] = tg; out[2] = tb; out[3] = ta;
   }
+  return out;
 }
 
-/** Alpha blend: combine source (r,g,b,a) with destination. Returns [r,g,b,a]. */
+/** Alpha blend: combine source (r,g,b,a) with destination. Returns a reused [r,g,b,a] buffer. */
 export function blend(
   state: GEFragmentState,
   sr: number, sg: number, sb: number, sa: number, dst: number,
-): [number, number, number, number] {
+): Int32Array {
   const dr = dst & 0xFF, dg = (dst >>> 8) & 0xFF, db = (dst >>> 16) & 0xFF, da = (dst >>> 24) & 0xFF;
 
-  // Get source and dest factors
-  let sfR: number, sfG: number, sfB: number;
-  let dfR: number, dfG: number, dfB: number;
-
-  [sfR, sfG, sfB] = getBlendFactor(state, state.blendSrc, sr, sg, sb, sa, dr, dg, db, da, true);
-  [dfR, dfG, dfB] = getBlendFactor(state, state.blendDst, sr, sg, sb, sa, dr, dg, db, da, false);
+  // Get source and dest factors (copy out — getBlendFactor reuses its buffer)
+  const sf = getBlendFactor(state, state.blendSrc, sr, sg, sb, sa, dr, dg, db, da, true);
+  const sfR = sf[0]!, sfG = sf[1]!, sfB = sf[2]!;
+  const df = getBlendFactor(state, state.blendDst, sr, sg, sb, sa, dr, dg, db, da, false);
+  const dfR = df[0]!, dfG = df[1]!, dfB = df[2]!;
 
   // Apply blend op
   let outR: number, outG: number, outB: number;
@@ -256,12 +266,11 @@ export function blend(
       outR = sr; outG = sg; outB = sb;
   }
 
-  return [
-    Math.max(0, Math.min(255, outR | 0)),
-    Math.max(0, Math.min(255, outG | 0)),
-    Math.max(0, Math.min(255, outB | 0)),
-    sa, // alpha passthrough
-  ];
+  blendOut[0] = Math.max(0, Math.min(255, outR | 0));
+  blendOut[1] = Math.max(0, Math.min(255, outG | 0));
+  blendOut[2] = Math.max(0, Math.min(255, outB | 0));
+  blendOut[3] = sa; // alpha passthrough
+  return blendOut;
 }
 
 /** Get blend factor RGB values (0-255).
@@ -281,38 +290,33 @@ export function getBlendFactor(
   state: GEFragmentState,
   factor: number, sr: number, sg: number, sb: number, sa: number,
   dr: number, dg: number, db: number, da: number, isSrc: boolean,
-): [number, number, number] {
-  if (isSrc) {
-    switch (factor) {
-      case 0:  return [dr, dg, db];                                            // DST_COLOR
-      case 1:  return [255 - dr, 255 - dg, 255 - db];                         // INV_DST_COLOR
-      case 2:  return [sa, sa, sa];                                            // SRC_ALPHA
-      case 3:  return [255 - sa, 255 - sa, 255 - sa];                         // INV_SRC_ALPHA
-      case 4:  return [da, da, da];                                            // DST_ALPHA
-      case 5:  return [255 - da, 255 - da, 255 - da];                         // INV_DST_ALPHA
-      case 6:  return [Math.min(255, 2*sa), Math.min(255, 2*sa), Math.min(255, 2*sa)];    // 2*SRC_ALPHA
-      case 7:  { const v = Math.min(255, 2*(255-sa)); return [v, v, v]; }     // 2*INV_SRC_ALPHA
-      case 8:  return [Math.min(255, 2*da), Math.min(255, 2*da), Math.min(255, 2*da)];    // 2*DST_ALPHA
-      case 9:  { const v = Math.min(255, 2*(255-da)); return [v, v, v]; }     // 2*INV_DST_ALPHA
-      case 10: { const f = state.blendFixedA; return [f & 0xFF, (f >> 8) & 0xFF, (f >> 16) & 0xFF]; } // FIXA
-      default: return [255, 255, 255];
+): Int32Array {
+  const out = factorOut;
+  switch (factor) {
+    case 0:  // src: DST_COLOR / dst: SRC_COLOR
+      if (isSrc) { out[0] = dr; out[1] = dg; out[2] = db; }
+      else       { out[0] = sr; out[1] = sg; out[2] = sb; }
+      break;
+    case 1:  // src: INV_DST_COLOR / dst: INV_SRC_COLOR
+      if (isSrc) { out[0] = 255 - dr; out[1] = 255 - dg; out[2] = 255 - db; }
+      else       { out[0] = 255 - sr; out[1] = 255 - sg; out[2] = 255 - sb; }
+      break;
+    case 2:  out[0] = out[1] = out[2] = sa; break;                            // SRC_ALPHA
+    case 3:  out[0] = out[1] = out[2] = 255 - sa; break;                      // INV_SRC_ALPHA
+    case 4:  out[0] = out[1] = out[2] = da; break;                            // DST_ALPHA
+    case 5:  out[0] = out[1] = out[2] = 255 - da; break;                      // INV_DST_ALPHA
+    case 6:  out[0] = out[1] = out[2] = Math.min(255, 2 * sa); break;         // 2*SRC_ALPHA
+    case 7:  out[0] = out[1] = out[2] = Math.min(255, 2 * (255 - sa)); break; // 2*INV_SRC_ALPHA
+    case 8:  out[0] = out[1] = out[2] = Math.min(255, 2 * da); break;         // 2*DST_ALPHA
+    case 9:  out[0] = out[1] = out[2] = Math.min(255, 2 * (255 - da)); break; // 2*INV_DST_ALPHA
+    case 10: { // FIXA / FIXB
+      const f = isSrc ? state.blendFixedA : state.blendFixedB;
+      out[0] = f & 0xFF; out[1] = (f >> 8) & 0xFF; out[2] = (f >> 16) & 0xFF;
+      break;
     }
-  } else {
-    switch (factor) {
-      case 0:  return [sr, sg, sb];                                            // SRC_COLOR
-      case 1:  return [255 - sr, 255 - sg, 255 - sb];                         // INV_SRC_COLOR
-      case 2:  return [sa, sa, sa];                                            // SRC_ALPHA
-      case 3:  return [255 - sa, 255 - sa, 255 - sa];                         // INV_SRC_ALPHA
-      case 4:  return [da, da, da];                                            // DST_ALPHA
-      case 5:  return [255 - da, 255 - da, 255 - da];                         // INV_DST_ALPHA
-      case 6:  return [Math.min(255, 2*sa), Math.min(255, 2*sa), Math.min(255, 2*sa)];    // 2*SRC_ALPHA
-      case 7:  { const v = Math.min(255, 2*(255-sa)); return [v, v, v]; }     // 2*INV_SRC_ALPHA
-      case 8:  return [Math.min(255, 2*da), Math.min(255, 2*da), Math.min(255, 2*da)];    // 2*DST_ALPHA
-      case 9:  { const v = Math.min(255, 2*(255-da)); return [v, v, v]; }     // 2*INV_DST_ALPHA
-      case 10: { const f = state.blendFixedB; return [f & 0xFF, (f >> 8) & 0xFF, (f >> 16) & 0xFF]; } // FIXB
-      default: return [255, 255, 255];
-    }
+    default: out[0] = out[1] = out[2] = 255;
   }
+  return out;
 }
 
 /** Read a pixel from VRAM as ABGR8888. */
@@ -408,7 +412,8 @@ export function emitFragment(
   // 3. Blend + dither (DrawPixel.cpp:727-748)
   // PPSSPP applies dither AFTER blend but before clamp, or to prim color if no blend.
   if (state.alphaBlendEnable) {
-    [r, g, b, a] = blend(state, r, g, b, a, oldColor);
+    const o = blend(state, r, g, b, a, oldColor);
+    r = o[0]!; g = o[1]!; b = o[2]!; a = o[3]!;
     r = applyDither(state, r, x, y);
     g = applyDither(state, g, x, y);
     b = applyDither(state, b, x, y);

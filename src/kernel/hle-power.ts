@@ -281,27 +281,42 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   kernel.stub(POWER.scePower_A4E93389);
   kernel.stub(POWER.scePower_a85880d0_IsPSPNonFat);
 
-  // sceUmdActivate — PPSSPP sceUmd.cpp: validate mode 1-2
+  // Notify the registered UMD drive callback (PPSSPP __KernelNotifyCallback).
+  // Games pump sceKernelCheckCallback waiting for this after sceUmdActivate —
+  // without the notification their loading state machines hang forever.
+  let umdDriveCBId = 0;
+  function notifyUmdCallback(notifyArg: number): void {
+    if (umdDriveCBId === 0) return;
+    const cb = kernel.pspCallbacks.get(umdDriveCBId);
+    if (!cb) return;
+    cb.notifyCount++;
+    cb.notifyArg = notifyArg;
+  }
+
+  // sceUmdActivate — PPSSPP sceUmd.cpp:284-294 + __KernelUmdActivate:
+  // validates mode 1-2, notifies the drive callback PRESENT|READY|READABLE.
   kernel.register(UMD.sceUmdActivate, (regs) => {
     const mode = regs.getGpr(4);
-    regs.setGpr(2, (mode < 1 || mode > 2) ? 0x80010016 : 0);
+    if (mode < 1 || mode > 2) { regs.setGpr(2, 0x80010016); return; }
+    notifyUmdCallback(0x02 | 0x10 | 0x20); // PSP_UMD_PRESENT | READY | READABLE
+    regs.setGpr(2, 0);
   });
 
-  // sceUmdRegisterUMDCallBack — store cbId
-  let umdDriveCBId = 0;
+  // sceUmdRegisterUMDCallBack — store cbId (PPSSPP sceUmd.cpp:311-323)
   kernel.register(UMD.sceUmdRegisterUMDCallBack, (regs) => {
     umdDriveCBId = regs.getGpr(4);
     regs.setGpr(2, 0);
   });
 
-  // sceUmdDeactivate(mode, name) — PPSSPP sceUmd.cpp:296-307
-  // Validates mode <= 18, deactivates disc access. No-op in HLE (disc always present).
+  // sceUmdDeactivate(mode, name) — PPSSPP sceUmd.cpp:296-307 + __KernelUmdDeactivate:
+  // validates mode <= 18, notifies the drive callback PRESENT|READY.
   kernel.register(UMD.sceUmdDeactivate, (regs) => {
     const mode = regs.getGpr(4);
     if (mode > 18) {
       regs.setGpr(2, 0x80010016); // SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT
       return;
     }
+    notifyUmdCallback(0x02 | 0x10); // PSP_UMD_PRESENT | READY
     regs.setGpr(2, 0);
   });
 

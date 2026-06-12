@@ -6,6 +6,7 @@ import { loadElf } from "./loader/elf.js";
 import { isPbp, parsePbp } from "./loader/pbp.js";
 import { pspDecryptPRX } from "./loader/prx-decrypter.js";
 import { createSavedataStore } from "./storage/savedata-store.js";
+import { createFileStore } from "./storage/file-store.js";
 import { Logger } from "./utils/logger.js";
 
 const log = Logger.get("EMU");
@@ -151,9 +152,23 @@ export class PSPEmulator {
     this.hle.initTiming(this.coreTiming);
   }
 
-  async loadElfBinary(data: Uint8Array): Promise<void> {
+  async loadElfBinary(data: Uint8Array, bootFilename = "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN"): Promise<void> {
     // Initialize persistent save data storage
     this.hle.savedataStore = await createSavedataStore();
+
+    // Load any raw-IO save files persisted from previous sessions into the
+    // in-memory filesystem so the game sees them as existing files. ms0: saves
+    // survive across games like a real memory stick.
+    this.hle.fileStore = await createFileStore();
+    try {
+      const persisted = await this.hle.fileStore.loadAll();
+      for (const [path, data] of persisted) {
+        this.hle.fileData.set(path, data);
+      }
+      if (persisted.size > 0) log.info(`Loaded ${persisted.size} persisted save file(s)`);
+    } catch (err) {
+      log.warn(`Failed to load persisted files: ${err}`);
+    }
 
     // Unwrap PBP container if needed (homebrew format)
     if (isPbp(data)) {
@@ -196,19 +211,44 @@ export class PSPEmulator {
 
     // Allocate module_start stack from userMemory (matching PPSSPP root thread setup)
     const MODULE_START_STACK = 0x40000; // 256KB default — PPSSPP sceKernelModule.cpp:1805
-    const moduleStackBase = this.hle.userMemory.alloc(MODULE_START_STACK, true, "stack/module_start_root");
-    const moduleStackSP = moduleStackBase === -1 ? 0x0BFFF000 : (moduleStackBase + MODULE_START_STACK);
-    this.cpu.regs.setGpr(29, moduleStackSP); // $sp
+    const moduleStackBase = this.hle.userMemory.alloc(MODULE_START_STACK, true, "stack/root");
 
-    // Write a "module return" trampoline at a reserved address.
-    const TRAMPOLINE_ADDR = 0x0BFFF800;
+    // Root thread stack setup matching PPSSPP __KernelResetThread → FillStack
+    // then __KernelSetupRootThread (sceKernelThread.cpp:328-366, 1776-1806):
+    // fill 0xFF, k0 area = top 256 bytes, then the boot args block, then 64 bytes headroom.
+    let sp = moduleStackBase === -1 ? 0x0BFFF000 : (moduleStackBase + MODULE_START_STACK) >>> 0;
+    if (moduleStackBase !== -1) {
+      for (let i = 0; i < MODULE_START_STACK; i += 4) this.bus.writeU32(moduleStackBase + i, 0xFFFFFFFF);
+      const k0 = sp - 0x100;
+      for (let i = 0; i < 0x100; i += 4) this.bus.writeU32(k0 + i, 0);
+      this.bus.writeU32(k0 + 0xC8, moduleStackBase); // initialStack
+      this.bus.writeU32(k0 + 0xF8, 0xFFFFFFFF);
+      this.bus.writeU32(k0 + 0xFC, 0xFFFFFFFF);
+      this.cpu.regs.setGpr(26, k0); // $k0
+      sp = k0;
+    }
+    // Boot args: PPSSPP __KernelLoadExec passes the exec path string (incl. NUL)
+    // as the root thread's args — crt0 forwards these to user_main.
+    const argBytes = new TextEncoder().encode(bootFilename);
+    const argSize = argBytes.length + 1;
+    sp = (sp - ((argSize + 0xf) & ~0xf)) >>> 0;
+    for (let i = 0; i < argBytes.length; i++) this.bus.writeU8(sp + i, argBytes[i]!);
+    this.bus.writeU8(sp + argBytes.length, 0);
+    this.cpu.regs.setGpr(4, argSize); // a0 = args size
+    this.cpu.regs.setGpr(5, sp);      // a1 = args block on root stack
+    sp = (sp - 64) >>> 0;             // kernel headroom, matches __KernelSetupRootThread
+    this.cpu.regs.setGpr(29, sp);     // $sp
+
+    // Write a "module return" trampoline in low kernel memory (outside userMemory,
+    // so freed stacks can't clobber it). 0x08000010 = GE BREAK, 0x08000020 = cb return.
+    const TRAMPOLINE_ADDR = 0x08000030;
     this.hle.threadReturnAddr = TRAMPOLINE_ADDR;
     const SYSCALL_MODULE_RETURN = 0xFFFFF; // reserved syscall code
     const SYSCALL = 0x0000000c | (SYSCALL_MODULE_RETURN << 6);
     this.bus.writeU32(TRAMPOLINE_ADDR,     SYSCALL);
     this.bus.writeU32(TRAMPOLINE_ADDR + 4, 0); // NOP
 
-    log.info(`[EMU] Entry=0x${startAddr.toString(16)} RA=0x${TRAMPOLINE_ADDR.toString(16)} SP=0x0BFFF000`);
+    log.info(`[EMU] Entry=0x${startAddr.toString(16)} RA=0x${TRAMPOLINE_ADDR.toString(16)} SP=0x${sp.toString(16)}`);
 
     // Register the module-return handler
     this.hle.register(SYSCALL_MODULE_RETURN, (regs) => {
@@ -236,6 +276,9 @@ export class PSPEmulator {
         // to pick the best READY thread (created via sceKernelStartThread during
         // module_start).  This properly sets currentThreadId and restores the
         // full thread context so runFrame switches to thread-scheduler mode.
+        // PPSSPP __KernelReturnFromModuleFunc deletes the root thread, freeing
+        // its stack — later thread stacks allocate from the very top of RAM.
+        if (moduleStackBase !== -1) this.hle.userMemory.free(moduleStackBase);
         this.hle.pendingThreadEntry = null;
         if (!this.hle.reschedule(regs)) {
           hleLog.info("No pending threads — halting.");
@@ -249,7 +292,7 @@ export class PSPEmulator {
 
     this.cpu.regs.setGpr(31, TRAMPOLINE_ADDR); // $ra → trampoline
 
-    log.info(`ELF loaded, entry=0x${entryPoint.toString(16)}, module_start=0x${startAddr.toString(16)}, SP=0x0BFFF000, RA=0x${TRAMPOLINE_ADDR.toString(16)}`);
+    log.info(`ELF loaded, entry=0x${entryPoint.toString(16)}, module_start=0x${startAddr.toString(16)}, SP=0x${sp.toString(16)}, RA=0x${TRAMPOLINE_ADDR.toString(16)}`);
 
     // Pre-decrypt all PRX files in the filesystem so sceKernelLoadModule can be synchronous
     await this._preDecryptModules();

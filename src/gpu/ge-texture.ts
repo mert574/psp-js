@@ -66,8 +66,10 @@ export function sampleTexture(state: GETextureState, bus: MemoryBus, u: number, 
     rawU = u * tw;
     rawV = v * th;
   } else {
-    rawU = u * state.texScaleU + state.texOffsetU;
-    rawV = v * state.texScaleV + state.texOffsetV;
+    // PPSSPP TransformUnit: uv = tc * uvScale + uvOff in NORMALIZED space;
+    // the rasterizer then multiplies by texture size to get texel coords.
+    rawU = (u * state.texScaleU + state.texOffsetU) * tw;
+    rawV = (v * state.texScaleV + state.texOffsetV) * th;
   }
 
   // Bilinear filtering: interpolate 2x2 neighborhood

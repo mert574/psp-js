@@ -184,6 +184,10 @@ export async function bootGame(isoPath: string, opts: BootOptions = {}): Promise
     emu.runFrame();
     if (frames % 10 === 0) stepsPerFrame.push(stepsThisFrame);
     if (emu.halted || emu.cpu.stepFaulted) break;
+    // Yield to the microtask queue between frames like the browser's rAF loop
+    // does — async HLE work (savedata store, ATRAC decode) resolves via
+    // promises, and a fully synchronous loop would starve it forever.
+    await Promise.resolve();
   }
   const elapsedMs = Date.now() - start;
 
