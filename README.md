@@ -9,9 +9,12 @@ Work in progress. Several commercial games boot to their menus and render, and t
 ## Quick start
 
 ```bash
+git submodule update --init --recursive   # pulls ppsspp-reference (and its nested pspautotests)
 npm install
 npm run dev
 ```
+
+If you cloned without `--recurse-submodules`, run the submodule line first. The PPSSPP reference and the pspautotests it carries are needed for the test suite, not for running the emulator.
 
 Open the printed localhost URL, pick a game, and load an ISO or PBP. Keyboard controls are in the in-app input settings.
 
