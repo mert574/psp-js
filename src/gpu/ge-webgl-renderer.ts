@@ -88,16 +88,17 @@ function mapBlendFactor(gl: WebGLRenderingContext, factor: number, isSrc: boolea
   }
 }
 
-/** Map PSP blend op to WebGL. */
-function mapBlendOp(gl: WebGLRenderingContext, op: number): number {
+/** Map PSP blend op to WebGL. `minEq`/`maxEq` are the real MIN/MAX equation
+ *  enums when EXT_blend_minmax is available, else FUNC_ADD (PPSSPP keeps the
+ *  same two tables: eqLookup vs eqLookupNoMinMax, GPUStateUtils.cpp:857-875). */
+function mapBlendOp(gl: WebGLRenderingContext, op: number, minEq: number, maxEq: number): number {
   switch (op) {
     case 0: return gl.FUNC_ADD;
     case 1: return gl.FUNC_SUBTRACT;
     case 2: return gl.FUNC_REVERSE_SUBTRACT;
-    // MIN/MAX/ABS: WebGL1 doesn't have these natively — fallback to ADD
-    case 3: return gl.FUNC_ADD; // MIN
-    case 4: return gl.FUNC_ADD; // MAX
-    case 5: return gl.FUNC_ADD; // ABS
+    case 3: return minEq;       // GE_BLENDMODE_MIN
+    case 4: return maxEq;       // GE_BLENDMODE_MAX
+    case 5: return maxEq;       // GE_BLENDMODE_ABSDIFF → MAX (PPSSPP GPUStateUtils.cpp:873)
     default: return gl.FUNC_ADD;
   }
 }
@@ -228,6 +229,15 @@ export class WebGLGERenderer {
   private frameCount = 0;
   private currentRenderAddr = 0; // currently bound VFB address
 
+  // Internal resolution multiplier. VFBs are allocated at scale*512 x scale*272
+  // and the viewport/scissor scale with it, so 3D geometry rasterizes at higher
+  // resolution. Vertex positions stay in PSP screen space (u_resolution is the
+  // logical 512x272) — the bigger viewport stretches NDC to the scaled target.
+  // PPSSPP's "rendering resolution" multiplier (GPUCommon, internal scale).
+  private scale = 1;
+  private get fbW(): number { return FBO_WIDTH * this.scale; }
+  private get fbH(): number { return PSP_HEIGHT * this.scale; }
+
   // Display buffer tracking — PPSSPP FramebufferManagerCommon.h:displayFramebuf_
   private displayFbAddr = 0;
   private displayFbWidth = 512;
@@ -259,6 +269,11 @@ export class WebGLGERenderer {
   private texCache = new Map<string, { tex: WebGLTexture; hash: number }>();
   private dummyTex: WebGLTexture;
 
+  // Real MIN/MAX blend equation enums when EXT_blend_minmax is present, else
+  // FUNC_ADD (matches PPSSPP's eqLookup vs eqLookupNoMinMax fallback).
+  private blendMinEq = 0;
+  private blendMaxEq = 0;
+
   // Track current GL state to minimize state changes
   private currentBlendEnabled = false;
   private currentDepthEnabled = false;
@@ -276,6 +291,12 @@ export class WebGLGERenderer {
     });
     if (!gl) throw new Error("WebGL not supported");
     this.gl = gl;
+
+    // Real MIN/MAX blend equations need EXT_blend_minmax in WebGL1; without it
+    // PPSSPP collapses MIN/MAX/ABSDIFF to ADD, so we do the same.
+    const minMaxExt = gl.getExtension("EXT_blend_minmax");
+    this.blendMinEq = minMaxExt ? minMaxExt.MIN_EXT : gl.FUNC_ADD;
+    this.blendMaxEq = minMaxExt ? minMaxExt.MAX_EXT : gl.FUNC_ADD;
 
     // Compile shaders
     this.geProgram = twgl.createProgramInfo(gl, [VS_GE, FS_GE]);
@@ -322,7 +343,7 @@ export class WebGLGERenderer {
 
     // Bind the VFB for this draw's framebuffer address
     this.bindRenderTarget(state.fbPtr, state.fbFormat, state.fbWidth);
-    gl.viewport(0, 0, 512, PSP_HEIGHT);
+    gl.viewport(0, 0, this.fbW, this.fbH);
 
     // Set up per-draw-call state
     this.setupUVNormalization(state);
@@ -529,6 +550,7 @@ export class WebGLGERenderer {
     fbPtr = 0,
     fbFormat = 3,
     fbStride = 512,
+    clearDepth = 1,
   ): void {
     const gl = this.gl;
     const normAddr = this.normFb(fbPtr);
@@ -537,18 +559,24 @@ export class WebGLGERenderer {
       console.log(`[VFB] Clear 0x${normAddr.toString(16)} rgba(${r},${g},${b},${a})`);
     }
     this.bindRenderTarget(fbPtr, fbFormat, fbStride);
-    gl.viewport(0, 0, 512, PSP_HEIGHT);
+    gl.viewport(0, 0, this.fbW, this.fbH);
 
     // Use scissor to limit the clear to the requested rectangle
     gl.enable(gl.SCISSOR_TEST);
-    // WebGL scissor Y is bottom-up, PSP is top-down
+    // WebGL scissor Y is bottom-up, PSP is top-down. Scale to the render target.
+    const s = this.scale;
     const glY0 = PSP_HEIGHT - y1;
     const glY1 = PSP_HEIGHT - y0;
-    gl.scissor(x0, glY0, x1 - x0, glY1 - glY0);
+    gl.scissor(x0 * s, glY0 * s, (x1 - x0) * s, (glY1 - glY0) * s);
 
     gl.colorMask(colorWrite, colorWrite, colorWrite, alphaWrite);
     gl.depthMask(depthWrite);
     gl.clearColor(r / 255, g / 255, b / 255, a / 255);
+    // PSP clear mode writes the clear rectangle's own z to the depth buffer (it
+    // draws a real quad with depth-test ALWAYS), NOT a fixed far value. Games
+    // clear to 0 and draw with GEQUAL as an always-pass setup — clearing to the
+    // default 1.0 would then reject everything. PPSSPP SoftwareTransformCommon.
+    gl.clearDepth(clearDepth);
 
     let clearBits = 0;
     if (colorWrite || alphaWrite) clearBits |= gl.COLOR_BUFFER_BIT;
@@ -558,6 +586,7 @@ export class WebGLGERenderer {
     // Restore defaults and reset tracking flags (we modified GL state directly)
     gl.colorMask(true, true, true, true);
     gl.depthMask(true);
+    gl.clearDepth(1);
     gl.disable(gl.SCISSOR_TEST);
     this.currentScissorEnabled = false;
     // clearRect may be called between drawPrimitives calls, so mark all tracked
@@ -582,7 +611,7 @@ export class WebGLGERenderer {
     // next draw to the same address early-returns in bindRenderTarget and
     // renders onto the canvas backbuffer (invisible — present overwrites it).
     this.currentRenderAddr = 0;
-    gl.viewport(0, 0, PSP_WIDTH, PSP_HEIGHT);
+    gl.viewport(0, 0, this.gl.canvas.width, this.gl.canvas.height);
 
     // Disable all state for fullscreen blit — and reset tracking flags so
     // the next frame's drawPrimitives re-applies all GE state correctly.
@@ -704,18 +733,18 @@ export class WebGLGERenderer {
     const fbo = gl.createFramebuffer()!;
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 512, PSP_HEIGHT, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.fbW, this.fbH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     const depthRb = gl.createRenderbuffer()!;
     gl.bindRenderbuffer(gl.RENDERBUFFER, depthRb);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_STENCIL, 512, PSP_HEIGHT);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_STENCIL, this.fbW, this.fbH);
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, depthRb);
-    gl.viewport(0, 0, 512, PSP_HEIGHT);
+    gl.viewport(0, 0, this.fbW, this.fbH);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -794,6 +823,36 @@ export class WebGLGERenderer {
       return false;
     }
     const vramBase = base - 0x04000000;
+
+    // At scale > 1 the FBO is bigger than the PSP buffer, so each decoded PSP
+    // pixel is nearest-upscaled into a scale×scale block. Upload row by row.
+    const s = this.scale;
+    if (s !== 1) {
+      const row1x = new Uint8Array(wpx * 4);
+      const rowBytes = wpx * s * 4;
+      const outS = new Uint8Array(rowBytes * s); // s rows tall, wpx*s wide
+      for (let r = 0; r < height; r++) {
+        const pos = rowFb(r);
+        if (pos.py < 0 || pos.py >= PSP_HEIGHT || pos.px + wpx > fbStride) continue;
+        const src = vramBase + (pos.py * fbStride + pos.px) * vfbBpp;
+        if (src < 0 || src + wpx * vfbBpp > vram.length) continue;
+        decodeFbRowToRGBA(vram, src, wpx, vfb.format, row1x, 0);
+        for (let x = 0; x < wpx; x++) {
+          const r0 = row1x[x * 4]!, g0 = row1x[x * 4 + 1]!, b0 = row1x[x * 4 + 2]!, a0 = row1x[x * 4 + 3]!;
+          for (let sx = 0; sx < s; sx++) {
+            const di = (x * s + sx) * 4;
+            outS[di] = r0; outS[di + 1] = g0; outS[di + 2] = b0; outS[di + 3] = a0;
+          }
+        }
+        for (let sy = 1; sy < s; sy++) outS.copyWithin(sy * rowBytes, 0, rowBytes);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.px * s, (PSP_HEIGHT - 1 - pos.py) * s,
+          wpx * s, s, gl.RGBA, gl.UNSIGNED_BYTE, outS);
+      }
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+      vfb.lastFrameUsed = this.frameCount;
+      return true;
+    }
+
     const samePitch = dstStride * bpp === fbStride * vfbBpp;
 
     if (samePitch) {
@@ -833,16 +892,21 @@ export class WebGLGERenderer {
     const stride = vfb.stride;
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, vfb.fbo);
+    // The FBO is scale× bigger; read it all, then nearest-downsample one sample
+    // per PSP pixel (pick the top-left subpixel of each scale×scale block).
+    const s = this.scale;
     const readW = Math.min(stride, 512);
-    const buf = new Uint8Array(readW * PSP_HEIGHT * 4);
-    gl.readPixels(0, 0, readW, PSP_HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const readWs = readW * s;
+    const readHs = PSP_HEIGHT * s;
+    const buf = new Uint8Array(readWs * readHs * 4);
+    gl.readPixels(0, 0, readWs, readHs, gl.RGBA, gl.UNSIGNED_BYTE, buf);
     const phys = key - 0x04000000;
     if (phys < 0) return;
     const bpp = vfb.format === 3 ? 4 : 2;
     for (let y = 0; y < PSP_HEIGHT; y++) {
-      const srcY = PSP_HEIGHT - 1 - y;
+      const srcYs = readHs - 1 - y * s; // top-down logical row → bottom-up scaled row
       for (let x = 0; x < readW; x++) {
-        const si = (srcY * readW + x) * 4;
+        const si = (srcYs * readWs + x * s) * 4;
         const di = phys + (y * stride + x) * bpp;
         if (di + bpp > vram.length) continue;
         packRGBAToFb(buf[si]!, buf[si + 1]!, buf[si + 2]!, buf[si + 3]!,
@@ -883,7 +947,7 @@ export class WebGLGERenderer {
     const gl = this.gl;
     // Draw source FBO texture into destination FBO as a fullscreen quad
     gl.bindFramebuffer(gl.FRAMEBUFFER, dstVfb.fbo);
-    gl.viewport(0, 0, 512, PSP_HEIGHT);
+    gl.viewport(0, 0, this.fbW, this.fbH);
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
     gl.disable(gl.SCISSOR_TEST);
@@ -911,6 +975,28 @@ export class WebGLGERenderer {
   }
 
   setVRAM(vram: Uint8Array): void { this.vramRef = vram; }
+
+  /** Set the internal resolution multiplier (1, 2, 3...). Resizes the canvas
+   *  backing store to scale*480 x scale*272 and drops any existing VFBs so they
+   *  get recreated at the new size. Call before booting (no VFBs exist yet). */
+  setResolutionScale(scale: number): void {
+    const n = Math.max(1, Math.min(4, Math.floor(scale)));
+    const gl = this.gl;
+    // Always size the canvas backing store — the DOM canvas persists across
+    // boots, so a previous 2× run could leave it oversized for a fresh 1× run.
+    const canvas = gl.canvas as HTMLCanvasElement;
+    canvas.width = PSP_WIDTH * n;
+    canvas.height = PSP_HEIGHT * n;
+    if (n === this.scale) return;
+    this.scale = n;
+    for (const vfb of this.vfbs.values()) {
+      gl.deleteFramebuffer(vfb.fbo);
+      gl.deleteTexture(vfb.tex);
+      gl.deleteRenderbuffer(vfb.depthRb);
+    }
+    this.vfbs.clear();
+    this.currentRenderAddr = 0;
+  }
 
   /** Set display buffer. PPSSPP displayFramebufPtr_. */
   setDisplayFramebuf(addr: number, width = 512, format = 3): void {
@@ -1110,8 +1196,12 @@ export class WebGLGERenderer {
     if (frag.alphaBlendEnable) {
       if (!this.currentBlendEnabled) { gl.enable(gl.BLEND); this.currentBlendEnabled = true; }
 
-      const eq = mapBlendOp(gl, frag.blendOp);
-      gl.blendEquation(eq);
+      const eq = mapBlendOp(gl, frag.blendOp, this.blendMinEq, this.blendMaxEq);
+      // Color uses the PSP blend op; alpha stays ADD so the ZERO/ONE alpha
+      // factors below keep destination alpha (stencil). A MIN/MAX color eq must
+      // not bleed into alpha — MIN/MAX ignore factors. Matches PPSSPP, which
+      // sets color and alpha equations separately.
+      gl.blendEquationSeparate(eq, gl.FUNC_ADD);
 
       // Handle FIXA/FIXB: PSP has separate fixed colors, WebGL has one blendColor.
       // PPSSPP GPUStateUtils.cpp:1303-1349 — 3-tier fallback.
@@ -1190,11 +1280,12 @@ export class WebGLGERenderer {
                        state.scissorX2 < 479 || state.scissorY2 < 271;
     if (hasScissor) {
       if (!this.currentScissorEnabled) { gl.enable(gl.SCISSOR_TEST); this.currentScissorEnabled = true; }
-      // PSP Y-down → WebGL Y-up
+      // PSP Y-down → WebGL Y-up, scaled to the render target.
+      const s = this.scale;
       const glY = PSP_HEIGHT - 1 - state.scissorY2;
       const w = state.scissorX2 - state.scissorX1 + 1;
       const h = state.scissorY2 - state.scissorY1 + 1;
-      gl.scissor(state.scissorX1, glY, w, h);
+      gl.scissor(state.scissorX1 * s, glY * s, w * s, h * s);
     } else {
       if (this.currentScissorEnabled) { gl.disable(gl.SCISSOR_TEST); this.currentScissorEnabled = false; }
     }
