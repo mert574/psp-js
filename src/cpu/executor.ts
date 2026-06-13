@@ -1,5 +1,4 @@
 import type { AllegrexCPU } from "./cpu.js";
-import { SyscallException } from "./cpu.js";
 import type { Instruction } from "./instruction.js";
 import type { AllegrexRegisters } from "./registers.js";
 import { Logger } from "../utils/logger.js";
@@ -371,8 +370,9 @@ function execSPECIAL(cpu: AllegrexCPU, i: Instruction): void {
       break;
 
     // Syscall / break
-    case 0x0c: // SYSCALL — dispatch to HLE kernel
-      throw new SyscallException((i.raw >>> 6) & 0xfffff);
+    case 0x0c: // SYSCALL — dispatch to HLE kernel (flag, not throw — see cpu.step)
+      cpu.pendingSyscall = (i.raw >>> 6) & 0xfffff;
+      break;
     case 0x0d: { // BREAK — soft exception
       // If a callback handles it (e.g. GE callback trampoline), skip logging
       if (cpu.onBreak && cpu.onBreak(i.pc)) {
