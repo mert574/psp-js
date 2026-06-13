@@ -70,6 +70,9 @@ export function registerDisplayHLE(kernel: HLEKernel): void {
     if (t) {
       t.state = ThreadState.WAITING;
       t.waitType = WaitType.VBLANK;
+      // Per-wait flag (PPSSPP __KernelWaitCurThread processCallbacks param):
+      // plain waits never run callbacks; the CB wrappers re-enable after this.
+      t.isProcessingCallbacks = false;
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
       if (!kernel.reschedule(regs)) kernel.idleBreak = true;
@@ -78,11 +81,12 @@ export function registerDisplayHLE(kernel: HLEKernel): void {
     }
   };
 
-  // CB wrapper: set isProcessingCallbacks before waiting
+  // CB wrapper: enable callback processing for THIS wait (set after blocking;
+  // the plain helper resets the per-wait flag to false first)
   const waitForVblankCB = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
     const t = kernel.threads.get(kernel.currentThreadId);
-    if (t) t.isProcessingCallbacks = true;
     waitForVblank(regs);
+    if (t) t.isProcessingCallbacks = true;
   };
 
   // sceDisplayWaitVblankStart / sceDisplayWaitVblankStartCB — always wait
@@ -106,8 +110,8 @@ export function registerDisplayHLE(kernel: HLEKernel): void {
   };
   const waitVblankIfNotAlreadyCB = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
     const t = kernel.threads.get(kernel.currentThreadId);
-    if (t) t.isProcessingCallbacks = true;
     waitVblankIfNotAlready(regs);
+    if (t && t.state === ThreadState.WAITING) t.isProcessingCallbacks = true;
   };
   kernel.register(DISPLAY.sceDisplayWaitVblank,   waitVblankIfNotAlready);
   kernel.register(DISPLAY.sceDisplayWaitVblankCB, waitVblankIfNotAlreadyCB);

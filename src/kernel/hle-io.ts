@@ -5,6 +5,7 @@
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel } from "./hle-kernel.js";
 import type { MemoryBus } from "../memory/memory-bus.js";
+import type { AllegrexRegisters } from "../cpu/registers.js";
 import { ThreadState, WaitType } from "./hle-kernel.js";
 import { IO, NP_DRM, USB, USB_ACC, USB_GPS, USB_MIC } from "./nids.js";
 import type { PspFileInfo } from "./psp-filesystem.js";
@@ -33,6 +34,19 @@ export function registerIoHLE(kernel: HLEKernel): void {
     closePending?: boolean;    // sceIoCloseAsync issued — free the fd once its result is read
     asyncCbId?: number;        // PPSSPP FileNode::callbackID — fired when async IO completes
     asyncCbArg?: number;       // PPSSPP FileNode::callbackArg — $a1 passed to that callback
+    // Async ops complete on a delayed timing event (PPSSPP __IoSchedAsync), not
+    // at call time: pendingAsyncResult means "op issued, result not ready yet".
+    // asyncBusy = pendingAsyncResult || hasAsyncResult (PPSSPP FileNode:234).
+    pendingAsyncResult?: boolean;
+    // Threads blocked in sceIoWaitAsync* until the op completes, with the
+    // address each passed for the s64 result (PPSSPP FileNode::waitingThreads).
+    waitingThreads?: { threadId: number; resultAddr: number }[];
+    // Deferred op body, run when the completion event fires. Reads must write
+    // guest memory at COMPLETION, not at issue: PPSSPP runs the read on its
+    // async thread after the caller resumes, and games rely on that (God of War
+    // issues a 256KB read over a region whose old contents it still uses for a
+    // few hundred instructions after sceIoReadAsync returns).
+    pendingOp?: (() => void) | null;
   }
   const openFiles = new Map<number, FileNode>();
   let nextFd = 3; // 0/1/2 reserved for stdin/stdout/stderr
@@ -60,6 +74,65 @@ export function registerIoHLE(kernel: HLEKernel): void {
       cb.notifyCount++;
       cb.notifyArg = file.asyncCbArg ?? 0;
     }
+  }
+
+  // Async ops complete after an emulated delay (PPSSPP __IoSchedAsync →
+  // __IoAsyncNotify). Completing at call time breaks games that set up state
+  // (e.g. completion function pointers) between issuing the op and the result
+  // arriving — God of War jumps through a null pointer if the IO callback
+  // fires inside sceIoReadAsync itself.
+  let ioAsyncEventId = -1;
+
+  /** The IoAsyncNotify timing event: make the result consumable, fire the fd's
+   *  IO callback, and wake the first thread blocked in sceIoWaitAsync*. */
+  function ioAsyncNotify(fd: number): void {
+    const file = openFiles.get(fd);
+    if (!file) return;
+    // Run the deferred op body (e.g. the actual read into guest memory) now.
+    if (file.pendingOp) {
+      const op = file.pendingOp;
+      file.pendingOp = null;
+      op();
+    }
+    // __IoCompleteAsyncIO
+    file.pendingAsyncResult = false;
+    file.hasAsyncResult = true;
+    notifyIoCallback(file);
+    // Wake one waiter; it consumes the result (PPSSPP __IoAsyncNotify:458-478)
+    const w = file.waitingThreads?.shift();
+    if (!w) return;
+    const t = kernel.threads.get(w.threadId);
+    if (t && t.state === ThreadState.WAITING && t.waitType === WaitType.ASYNC_IO) {
+      file.hasAsyncResult = false;
+      if (w.resultAddr !== 0) writeAsyncResult(kernel.bus, w.resultAddr, file.asyncResult);
+      t.state = ThreadState.READY;
+      t.waitType = WaitType.NONE;
+      t.context.gpr[2] = 0;
+      if (file.closePending) openFiles.delete(fd);
+    }
+  }
+
+  /** Schedule async completion `us` microseconds from now (PPSSPP __IoSchedAsync).
+   *  Without CoreTiming (bare unit tests) the op completes immediately. */
+  function scheduleAsync(file: FileNode, fd: number, us: number): void {
+    const ct = kernel.coreTiming;
+    if (!ct) {
+      if (file.pendingOp) { const op = file.pendingOp; file.pendingOp = null; op(); }
+      file.pendingAsyncResult = false;
+      file.hasAsyncResult = true;
+      notifyIoCallback(file);
+      return;
+    }
+    if (ioAsyncEventId < 0) {
+      ioAsyncEventId = ct.registerEventType("IoAsyncNotify", (_cyclesLate, fd2) => ioAsyncNotify(fd2));
+    }
+    file.pendingAsyncResult = true;
+    file.hasAsyncResult = false;
+    ct.scheduleEvent(ct.usToCycles(Math.max(1, us)), ioAsyncEventId, fd);
+  }
+
+  function asyncBusy(file: FileNode): boolean {
+    return !!file.pendingAsyncResult || file.hasAsyncResult;
   }
 
   /** Persist a written file to the file store (fire-and-forget). */
@@ -99,10 +172,14 @@ export function registerIoHLE(kernel: HLEKernel): void {
 
   /** Write SceIoStat (88 bytes) to guest memory at addr. */
   function writeIoStat(bus: MemoryBus, addr: number, info: PspFileInfo): void {
-    // st_mode: directory = 0x1016f, file = 0x2016f (matches PPSSPP defaults)
-    bus.writeU32(addr + 0, info.isDirectory ? 0x1016f : 0x2016f);
-    // st_attr: directory = 0x0010, file = 0x0024 (archive bit)
-    bus.writeU32(addr + 4, info.isDirectory ? 0x0010 : 0x0024);
+    // st_mode: type bits live at 0xF000 — SCE_STM_FDIR=0x1000, SCE_STM_FREG=0x2000
+    // (PPSSPP sceIo.cpp:150-151), plus 0555 access for ISO entries
+    // (ISOFileSystem.cpp:687). Games test (st_mode & 0xf000) == 0x1000 to recurse
+    // into directories; the old 0x10000/0x20000 values made every entry look
+    // like a file and broke disc walkers (Burnout Legends).
+    bus.writeU32(addr + 0, info.isDirectory ? 0x116D : 0x216D);
+    // st_attr: TYPE_DIRECTORY=0x10, TYPE_FILE=0x20 (PPSSPP sceIo.cpp:155-156)
+    bus.writeU32(addr + 4, info.isDirectory ? 0x0010 : 0x0020);
     // st_size (u64 LE)
     bus.writeU32(addr + 8, info.size & 0xFFFFFFFF);
     bus.writeU32(addr + 12, 0); // high 32 bits
@@ -118,8 +195,10 @@ export function registerIoHLE(kernel: HLEKernel): void {
       bus.writeU16(base + 10, 0);    // second
       bus.writeU32(base + 12, 0);    // microsecond
     }
-    // st_private[6]
-    for (let i = 0; i < 6; i++) bus.writeU32(addr + 64 + i * 4, 0);
+    // st_private[6]: PPSSPP __IoGetStat writes st_private[0] = info.startSector
+    // (sceIo.cpp:935). Games (GTA's catalog) read it to build raw sce_lbn opens.
+    bus.writeU32(addr + 64, info.startSector ?? 0);
+    for (let i = 1; i < 6; i++) bus.writeU32(addr + 64 + i * 4, 0);
   }
 
   // PPSSPP sceIo.cpp:871-877: return PSP_STDIN/STDOUT/STDERR (fd 0/1/2)
@@ -166,6 +245,19 @@ export function registerIoHLE(kernel: HLEKernel): void {
     regs.setGpr(2, size);
   });
 
+  // Raw sector access: a game can open "disc0:/sce_lbn0xNN_size0xMM" (or decimal)
+  // to read bytes straight off the UMD by LBN, bypassing the file table. PPSSPP
+  // ISOFileSystem::OpenFile parses this. GTA's catalog reader uses it.
+  // Returns the raw bytes if the path is an sce_lbn path and the mount can read
+  // sectors, else null (caller falls back to normal lookup).
+  function tryResolveLbn(path: string): Uint8Array | null {
+    const m = /sce_lbn(0x[0-9a-f]+|\d+)_size(0x[0-9a-f]+|\d+)/i.exec(path);
+    if (!m) return null;
+    const lbn = m[1]!.toLowerCase().startsWith("0x") ? parseInt(m[1]!, 16) : parseInt(m[1]!, 10);
+    const size = m[2]!.toLowerCase().startsWith("0x") ? parseInt(m[2]!, 16) : parseInt(m[2]!, 10);
+    return kernel.pspFs.readDiscSectors(lbn, size) ?? null;
+  }
+
   // sceIoOpen(filename, flags, mode) → fd or error
   kernel.register(IO.sceIoOpen, (regs, bus) => {
     const pathAddr = regs.getGpr(4);
@@ -198,7 +290,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
     const truncate = (flags & PSP_O_TRUNC) !== 0;
     const append   = (flags & PSP_O_APPEND) !== 0;
 
-    let fileBytes = kernel.pspFs.getFileData(path, kernel.currentThreadId);
+    let fileBytes = kernel.pspFs.getFileData(path, kernel.currentThreadId) ?? tryResolveLbn(path) ?? undefined;
     if (!fileBytes) {
       if (create) {
         fileBytes = new Uint8Array(0);
@@ -355,6 +447,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
       log.debug(`sceIoRead: delay ${delayUs}µs tid=${kernel.currentThreadId} v0=${bytesToRead}`);
       t.state = ThreadState.WAITING;
       t.waitType = WaitType.DELAY;
+      t.isProcessingCallbacks = false; // PPSSPP hleDelayResult: no callbacks
       kernel.saveContext(t, regs);
       t.context.gpr[2] = bytesToRead; // return value when woken
       const cycles = kernel.coreTiming.usToCycles(delayUs);
@@ -409,8 +502,8 @@ export function registerIoHLE(kernel: HLEKernel): void {
       file.position = kernel.computeSeekPosition(file.position, file.data.length, offsetLo, whence);
       file.asyncResult = file.position;
     }
-    file.hasAsyncResult = true;
-    notifyIoCallback(file);
+    // PPSSPP SEEK latency: 100us (sceIo.cpp:2920-2923)
+    scheduleAsync(file, fd, 100);
     regs.setGpr(2, 0);
   });
 
@@ -597,16 +690,20 @@ export function registerIoHLE(kernel: HLEKernel): void {
   // allocates an fd so the game can read the error via WaitAsync.
   kernel.register(IO.sceIoOpenAsync, (regs, bus) => {
     const path = kernel.readCString(bus, regs.getGpr(4));
-    const fileBytes = path ? kernel.pspFs.getFileData(path, kernel.currentThreadId) : null;
+    const fileBytes = path ? (kernel.pspFs.getFileData(path, kernel.currentThreadId) ?? tryResolveLbn(path)) : null;
     const fd = nextFd++;
+    let file: FileNode;
     if (fileBytes) {
-      openFiles.set(fd, { path: path!, data: fileBytes, position: 0, asyncResult: fd, hasAsyncResult: true, npdrm: false, pgdOffset: 0, pgdInfo: null });
+      file = { path: path!, data: fileBytes, position: 0, asyncResult: fd, hasAsyncResult: false, npdrm: false, pgdOffset: 0, pgdInfo: null };
       log.info(`sceIoOpenAsync: fd=${fd} path=${path}`);
     } else {
       // Failed open: dummy fd whose async result is ENOENT
-      openFiles.set(fd, { path: path ?? "", data: new Uint8Array(0), position: 0, asyncResult: 0x80010002 | 0, hasAsyncResult: true, npdrm: false, pgdOffset: 0, pgdInfo: null });
+      file = { path: path ?? "", data: new Uint8Array(0), position: 0, asyncResult: 0x80010002 | 0, hasAsyncResult: false, npdrm: false, pgdOffset: 0, pgdInfo: null };
       log.warn(`sceIoOpenAsync: file not found: ${path} (fd=${fd}, async result=ENOENT)`);
     }
+    openFiles.set(fd, file);
+    // PPSSPP open latency (sceIo.cpp:2940-2950): UMD found=4000us, not-found=6000us
+    scheduleAsync(file, fd, fileBytes ? 4000 : 6000);
     regs.setGpr(2, fd);
   });
 
@@ -617,31 +714,16 @@ export function registerIoHLE(kernel: HLEKernel): void {
     bus.writeU32(addr + 4, result < 0 ? 0xFFFFFFFF : 0); // sign-extend
   }
 
-  // sceIoWaitAsync(fd, resultPtr)
-  // PPSSPP sceIo.cpp:2297-2331
-  kernel.register(IO.sceIoWaitAsync, (regs, bus) => {
-    const fd      = regs.getGpr(4);
-    const address = regs.getGpr(5);
+  /** Shared Wait/WaitCB/GetAsyncStat(poll=0) body — PPSSPP sceIoWaitAsync:
+   *  pending → block until the IoAsyncNotify event; ready → consume; neither
+   *  → NOASYNC. */
+  function waitAsyncBody(regs: AllegrexRegisters, bus: MemoryBus, fd: number, address: number): void {
     const file = openFiles.get(fd);
     if (!file) { regs.setGpr(2, 0x80010009); return; }
-    if (file.hasAsyncResult) {
-      writeAsyncResult(bus, address, file.asyncResult);
-      file.hasAsyncResult = false;
-      if (file.closePending) openFiles.delete(fd);
-      regs.setGpr(2, 0);
-    } else {
-      regs.setGpr(2, 0x8002032a);
-    }
-  });
-
-  // sceIoWaitAsyncCB(fd, resultPtr)
-  // PPSSPP sceIo.cpp:2333-2363
-  kernel.register(IO.sceIoWaitAsyncCB, (regs, bus) => {
-    const fd      = regs.getGpr(4);
-    const address = regs.getGpr(5);
-    const file = openFiles.get(fd);
-    if (!file) { regs.setGpr(2, 0x80010009); return; }
-    if (file.hasAsyncResult) {
+    if (file.pendingAsyncResult) {
+      (file.waitingThreads ??= []).push({ threadId: kernel.currentThreadId, resultAddr: address });
+      kernel.blockCurrentThreadOnAsyncIo(regs);
+    } else if (file.hasAsyncResult) {
       writeAsyncResult(bus, address, file.asyncResult);
       file.hasAsyncResult = false;
       if (file.closePending) openFiles.delete(fd);
@@ -649,16 +731,34 @@ export function registerIoHLE(kernel: HLEKernel): void {
     } else {
       regs.setGpr(2, 0x8002032a); // SCE_KERNEL_ERROR_NOASYNC
     }
+  }
+
+  // sceIoWaitAsync(fd, resultPtr)
+  // PPSSPP sceIo.cpp:2297-2331
+  kernel.register(IO.sceIoWaitAsync, (regs, bus) => {
+    waitAsyncBody(regs, bus, regs.getGpr(4), regs.getGpr(5));
+  });
+
+  // sceIoWaitAsyncCB(fd, resultPtr)
+  // PPSSPP sceIo.cpp:2333-2363 — the CB variant's wait may run callbacks
+  kernel.register(IO.sceIoWaitAsyncCB, (regs, bus) => {
+    const t = kernel.threads.get(kernel.currentThreadId);
+    waitAsyncBody(regs, bus, regs.getGpr(4), regs.getGpr(5));
+    if (t && t.state === ThreadState.WAITING && t.waitType === WaitType.ASYNC_IO) {
+      t.isProcessingCallbacks = true;
+    }
   });
 
   // sceIoPollAsync(fd, resultPtr)
-  // PPSSPP sceIo.cpp:2365-2385
+  // PPSSPP sceIo.cpp:2365-2385: pending → 1 "not ready"; ready → consume → 0.
   kernel.register(IO.sceIoPollAsync, (regs, bus) => {
     const fd      = regs.getGpr(4);
     const address = regs.getGpr(5);
     const file = openFiles.get(fd);
     if (!file) { regs.setGpr(2, 0x80010009); return; }
-    if (file.hasAsyncResult) {
+    if (file.pendingAsyncResult) {
+      regs.setGpr(2, 1);
+    } else if (file.hasAsyncResult) {
       writeAsyncResult(bus, address, file.asyncResult);
       file.hasAsyncResult = false;
       if (file.closePending) openFiles.delete(fd);
@@ -669,14 +769,21 @@ export function registerIoHLE(kernel: HLEKernel): void {
   });
 
   // sceIoGetAsyncStat(fd, poll, resultPtr)
-  // PPSSPP sceIo.cpp:2248-2287
+  // PPSSPP sceIo.cpp:2248-2287: poll → like PollAsync; no poll → like WaitAsync.
   kernel.register(IO.sceIoGetAsyncStat, (regs, bus) => {
     const fd      = regs.getGpr(4);
     const poll    = regs.getGpr(5);
     const address = regs.getGpr(6);
     const file = openFiles.get(fd);
     if (!file) { regs.setGpr(2, 0x80010009); return; }
-    if (file.hasAsyncResult) {
+    if (file.pendingAsyncResult) {
+      if (poll) {
+        regs.setGpr(2, 1); // not ready
+      } else {
+        (file.waitingThreads ??= []).push({ threadId: kernel.currentThreadId, resultAddr: address });
+        kernel.blockCurrentThreadOnAsyncIo(regs);
+      }
+    } else if (file.hasAsyncResult) {
       writeAsyncResult(bus, address, file.asyncResult);
       file.hasAsyncResult = false;
       if (file.closePending) openFiles.delete(fd);
@@ -700,30 +807,34 @@ export function registerIoHLE(kernel: HLEKernel): void {
       return;
     }
     // PPSSPP sceIo.cpp:1166-1168: asyncBusy check
-    if (file.hasAsyncResult) {
+    if (asyncBusy(file)) {
       regs.setGpr(2, 0x80020329); // SCE_KERNEL_ERROR_ASYNC_BUSY
       return;
     }
-    // Perform the read immediately, store result for sceIoPollAsync/WaitAsync
-    if ((size | 0) < 0) {
-      file.asyncResult = 0x800200d3; // SCE_KERNEL_ERROR_ILLEGAL_ADDR
-    } else if (file.npdrm && file.pgdInfo) {
-      file.asyncResult = npdrmRead(file, bus, buf, size);
-      file.position = file.pgdInfo.fileOffset;
-      kernel.ioOpsCount++;
-    } else {
-      const bytesAvailable = file.data.length - file.position;
-      const bytesToRead = Math.min(size, bytesAvailable);
-      for (let i = 0; i < bytesToRead; i++) {
-        bus.writeU8(buf + i, file.data[file.position + i]!);
+    // The read body runs at COMPLETION time (PPSSPP executes it on the async
+    // thread). Writing guest memory at issue time clobbers regions the game
+    // still uses during the in-flight window.
+    file.pendingOp = () => {
+      if ((size | 0) < 0) {
+        file.asyncResult = 0x800200d3; // SCE_KERNEL_ERROR_ILLEGAL_ADDR
+      } else if (file.npdrm && file.pgdInfo) {
+        file.asyncResult = npdrmRead(file, bus, buf, size);
+        file.position = file.pgdInfo.fileOffset;
+        kernel.ioOpsCount++;
+      } else {
+        const bytesAvailable = file.data.length - file.position;
+        const bytesToRead = Math.min(size, bytesAvailable);
+        for (let i = 0; i < bytesToRead; i++) {
+          bus.writeU8(buf + i, file.data[file.position + i]!);
+        }
+        file.position += bytesToRead;
+        file.asyncResult = bytesToRead;
+        kernel.ioOpsCount++;
       }
-      file.position += bytesToRead;
-      file.asyncResult = bytesToRead;
-      kernel.ioOpsCount++;
-    }
-    log.debug(`sceIoReadAsync: fd=${fd} size=${size} result=${file.asyncResult}`);
-    file.hasAsyncResult = true;
-    notifyIoCallback(file);
+      log.debug(`sceIoReadAsync: fd=${fd} size=${size} result=${file.asyncResult}`);
+    };
+    // PPSSPP __IoRead latency: max(100us, size/100 us) (sceIo.cpp:1050-1058)
+    scheduleAsync(file, fd, Math.max(100, size / 100));
     regs.setGpr(2, 0);
   });
 
@@ -738,7 +849,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
       regs.setGpr(2, 0x80010009); // SCE_KERNEL_ERROR_BADF
       return;
     }
-    if (file.hasAsyncResult) {
+    if (asyncBusy(file)) {
       regs.setGpr(2, 0x80020329); // SCE_KERNEL_ERROR_ASYNC_BUSY
       return;
     }
@@ -757,9 +868,9 @@ export function registerIoHLE(kernel: HLEKernel): void {
       file.position += size;
     }
     file.asyncResult = size;
-    file.hasAsyncResult = true;
-    notifyIoCallback(file);
     kernel.ioOpsCount++;
+    // PPSSPP __IoWrite latency: max(100us, size/100 us) (sceIo.cpp:1193-1196)
+    scheduleAsync(file, fd, Math.max(100, size / 100));
     regs.setGpr(2, 0);
   });
 
@@ -821,9 +932,9 @@ export function registerIoHLE(kernel: HLEKernel): void {
     persistFile(file);
     // PPSSPP keeps the FileNode alive until WaitAsync consumes the result.
     file.asyncResult = 0;
-    file.hasAsyncResult = true;
-    notifyIoCallback(file);
     file.closePending = true;
+    // PPSSPP CLOSE latency: 0us, still delivered via the async event (#12549)
+    scheduleAsync(file, fd, 1);
     regs.setGpr(2, 0);
   });
   kernel.stub(IO.sceIoDelDrv);

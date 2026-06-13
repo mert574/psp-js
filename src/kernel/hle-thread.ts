@@ -155,6 +155,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
       }
       t.state    = ThreadState.WAITING;
       t.waitType = WaitType.SLEEP;
+      t.isProcessingCallbacks = false; // per-wait; CB wrapper re-enables
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
       if (!kernel.reschedule(regs)) kernel.idleBreak = true;
@@ -174,6 +175,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     if (t) {
       t.state    = ThreadState.WAITING;
       t.waitType = WaitType.DELAY;
+      t.isProcessingCallbacks = false; // per-wait; CB wrapper re-enables
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
       if (kernel.coreTiming && kernel.wakeThreadEventId >= 0) {
@@ -190,13 +192,13 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   // sceKernelThread.cpp:1641-1642
   const sleepThreadCB = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
     const t = kernel.threads.get(kernel.currentThreadId);
-    if (t) t.isProcessingCallbacks = true;
     sleepThread(regs);
+    if (t && t.state === ThreadState.WAITING) t.isProcessingCallbacks = true;
   };
   const delayThreadCB = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
     const t = kernel.threads.get(kernel.currentThreadId);
-    if (t) t.isProcessingCallbacks = true;
     delayThread(regs);
+    if (t && t.state === ThreadState.WAITING) t.isProcessingCallbacks = true;
   };
 
   kernel.register(THREAD.sceKernelSleepThread,   sleepThread);
@@ -421,6 +423,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
       cur.state = ThreadState.WAITING;
       cur.waitType = WaitType.THREAD_END;
       cur.waitThreadEndId = thid;
+      cur.isProcessingCallbacks = false; // per-wait; CB variant sets true
       kernel.saveContext(cur, regs);
       cur.context.gpr[2] = 0; // v0 = 0 when we wake
       if (!kernel.reschedule(regs)) kernel.idleBreak = true;

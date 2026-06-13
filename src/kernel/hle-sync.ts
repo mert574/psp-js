@@ -257,6 +257,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       t.waitType = WaitType.SEMA;
       t.waitSemaId = semId;
       t.waitSemaCount = signal;
+      t.isProcessingCallbacks = false; // per-wait; the CB wrapper re-enables
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
 
@@ -276,7 +277,12 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     }
   };
   kernel.register(SEMA.sceKernelWaitSema,   waitSema);
-  kernel.register(SEMA.sceKernelWaitSemaCB, waitSema);
+  // CB variant: this wait may run callbacks (PPSSPP processCallbacks=true)
+  kernel.register(SEMA.sceKernelWaitSemaCB, (regs, bus) => {
+    const t = kernel.threads.get(kernel.currentThreadId);
+    waitSema(regs, bus);
+    if (t && t.state === ThreadState.WAITING) t.isProcessingCallbacks = true;
+  });
 
   // sceKernelPollSema(semId, signal) — non-blocking
   kernel.register(SEMA.sceKernelPollSema, (regs) => {
@@ -376,6 +382,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
         t.waitType = WaitType.MUTEX;
         t.waitMutexId = id;
         t.waitMutexCount = count;
+        t.isProcessingCallbacks = false; // plain wait never runs callbacks
         kernel.saveContext(t, regs);
         t.context.gpr[2] = 0;
         if (!kernel.reschedule(regs)) kernel.idleBreak = true;
@@ -687,7 +694,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     t.waitType = WaitType.LWMUTEX;
     t.waitMutexId = uid;
     t.waitMutexCount = count;
-    if (cb) t.isProcessingCallbacks = true;
+    t.isProcessingCallbacks = cb; // per-wait (PPSSPP processCallbacks param)
     kernel.saveContext(t, regs);
     t.context.gpr[2] = 0;
     if (!kernel.reschedule(regs)) kernel.idleBreak = true;
@@ -925,7 +932,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       t.waitEvfBits = bits;
       t.waitEvfMode = waitMode;
       t.waitEvfOutPtr = outBitsPtr;
-      if (cb) t.isProcessingCallbacks = true;
+      t.isProcessingCallbacks = cb; // per-wait (PPSSPP processCallbacks param)
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
       // Schedule timeout via CoreTiming if a timeout pointer is provided
@@ -1034,6 +1041,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
         t.waitType = WaitType.FPL;
         t.waitFplId = fplId;
         t.waitFplDataPtr = dataPtr;
+        t.isProcessingCallbacks = false; // plain wait never runs callbacks
         kernel.saveContext(t, regs);
         t.context.gpr[2] = 0;
         if (!kernel.reschedule(regs)) kernel.idleBreak = true;
@@ -1164,6 +1172,7 @@ export function registerSyncHLE(kernel: HLEKernel): void {
       t.waitVplId = vplId;
       t.waitVplSize = size;
       t.waitVplAddrPtr = addrPtr;
+      t.isProcessingCallbacks = false; // plain wait never runs callbacks
       kernel.saveContext(t, regs);
       t.context.gpr[2] = 0;
       if (!kernel.reschedule(regs)) kernel.idleBreak = true;
