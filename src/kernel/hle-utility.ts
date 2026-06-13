@@ -902,10 +902,17 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   kernel.register(HEAP.sceHeapReallocHeapMemory, (regs) => { regs.setGpr(2, 0); });
   kernel.register(HEAP.sceHeapReallocHeapMemoryWithOption, (regs) => { regs.setGpr(2, 0); });
   // ── HPRM ──────────────────────────────────────────────────────────
+  // sceHprmPeekCurrentKey(keyAddr) — PPSSPP sceHprm.cpp:24 writes 0 to *keyAddr
+  // (no remote key pressed) and returns 0. HPRM = headset remote buttons.
+  kernel.register(HPRM.sceHprmPeekCurrentKey, (regs, bus) => {
+    const keyAddr = regs.getGpr(4);
+    if (keyAddr !== 0) bus.writeU32(keyAddr, 0);
+    regs.setGpr(2, 0);
+  });
+
   kernel.stub(HPRM.sceHprmIsHeadphoneExist);
   kernel.stub(HPRM.sceHprmIsMicrophoneExist);
   kernel.stub(HPRM.sceHprmIsRemoteExist);
-  kernel.stub(HPRM.sceHprmPeekCurrentKey);
   kernel.stub(HPRM.sceHprmPeekLatch);
   kernel.stub(HPRM.sceHprmReadLatch);
   kernel.stub(HPRM.sceHprmRegisterCallback, 1);
