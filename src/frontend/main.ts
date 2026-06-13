@@ -81,6 +81,12 @@ function isSoftwareRenderer(): boolean {
   return (document.getElementById("renderer-select") as HTMLSelectElement | null)?.value === "software";
 }
 
+function resolutionScale(): number {
+  const v = (document.getElementById("resolution-select") as HTMLSelectElement | null)?.value;
+  const n = v ? parseInt(v, 10) : 1;
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
 // ── Hash-based router ─────────────────────────────────────────────────────────
 // Routes: #library (default), #game/<id>, #play/<id>
 // <id> is discId if available, else filename (sanitized).
@@ -185,6 +191,7 @@ bootBtn.addEventListener("click", () => {
     renderer = new FramebufferRenderer(canvas);
   } else {
     geRenderer = new WebGLGERenderer(canvas);
+    geRenderer.setResolutionScale(resolutionScale());
   }
   debugPanel = new DebugPanel();
 
