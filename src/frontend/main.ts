@@ -8,6 +8,7 @@ import { transcodeAt3, transcodePmfAudio } from "./pmf.js";
 import { warmupAtracDecode, getDecodeConcurrency } from "../audio/atrac-decoder.js";
 import { decodePmfNative, type PmfPlayer } from "./pmf-native.js";
 import { PSPEmulator } from "../emulator.js";
+import { isPbp } from "../loader/pbp.js";
 import { FramebufferRenderer } from "../gpu/framebuffer-renderer.js";
 import { WebGLGERenderer } from "../gpu/ge-webgl-renderer.js";
 import { DebugPanel } from "./debug-panel.js";
@@ -295,7 +296,13 @@ bootBtn.addEventListener("click", () => {
     }
 
     try {
-      await emulator!.loadElfBinary(ebootBytes!);
+      // argv[0] = the exec path. Homebrew PBPs sit at disc0:/EBOOT.PBP and the
+      // game derives its base dir by stripping this; passing the ISO default
+      // (PSP_GAME/SYSDIR/EBOOT.BIN) leaves it with a prefix-less "/" base, so it
+      // builds paths like "/duke3d.grp" with no drive — a drive-prefix parse
+      // then returns -1 and the game writes buffer[-1], smashing a saved $ra.
+      const bootPath = isPbp(ebootBytes!) ? "disc0:/EBOOT.PBP" : "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN";
+      await emulator!.loadElfBinary(ebootBytes!, bootPath);
       debugPanel?.markEmulationStarted();
     } catch (err) {
       showError(`Failed to load EBOOT.BIN: ${String(err)}`, err);
