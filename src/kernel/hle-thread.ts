@@ -1024,6 +1024,33 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.register(KERNEL.sceKernelCpuResumeIntr, resumeIntr);
   kernel.register(KERNEL.sceKernelCpuResumeIntrWithSync, resumeIntr);
 
+  // sceKernelIsCpuIntrEnable() → real interrupt state (PPSSPP sceKernelInterrupt.cpp:115
+  // returns __InterruptsEnabled()). Games poll this inside spinlocks/critical
+  // sections; a constant 1 makes those loops misbehave.
+  kernel.register(KERNEL.sceKernelIsCpuIntrEnable, (regs) => {
+    regs.setGpr(2, kernel.interruptsEnabled ? 1 : 0);
+  });
+
+  // sceKernelSuspendDispatchThread() → previous dispatch state (PPSSPP
+  // sceKernelThread.cpp:2108). Disables thread switching so the caller runs a
+  // critical section without being preempted; returns the old dispatch flag the
+  // caller passes back to ResumeDispatchThread. Errors if interrupts are off.
+  kernel.register(KERNEL.sceKernelSuspendDispatchThread, (regs) => {
+    if (!kernel.interruptsEnabled) { regs.setGpr(2, 0x80020066); return; } // SCE_KERNEL_ERROR_CPUDI
+    const prev = kernel.dispatchEnabled ? 1 : 0;
+    kernel.dispatchEnabled = false;
+    regs.setGpr(2, prev);
+  });
+
+  // sceKernelResumeDispatchThread(enabled) (PPSSPP sceKernelThread.cpp:2119) —
+  // restore dispatch to the passed state and reschedule. Errors if interrupts off.
+  kernel.register(KERNEL.sceKernelResumeDispatchThread, (regs) => {
+    if (!kernel.interruptsEnabled) { regs.setGpr(2, 0x80020066); return; }
+    kernel.dispatchEnabled = regs.getGpr(4) !== 0;
+    regs.setGpr(2, 0);
+    if (kernel.dispatchEnabled) kernel.preemptIfHigherPriorityReady(regs);
+  });
+
   // sceKernelReferThreadStatus — PPSSPP sceKernelThread.cpp: fill SceKernelThreadInfo struct
   kernel.register(THREAD.sceKernelReferThreadStatus, (regs, bus) => {
     let thid = regs.getGpr(4);
@@ -1543,7 +1570,6 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelGetVTimerBaseWide);
   kernel.stub(KERNEL.sceKernelGetVTimerTimeWide);
   kernel.stub(KERNEL.sceKernelGzipDecompress);
-  kernel.stub(KERNEL.sceKernelIsCpuIntrEnable, 1);
   kernel.stub(KERNEL.sceKernelIsCpuIntrSuspended);
   kernel.stub(KERNEL.sceKernelIsSubInterruptOccurred);
   kernel.stub(KERNEL.sceKernelLoadExec, 1);
@@ -1580,14 +1606,12 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelReleaseNmiHandler);
   kernel.stub(KERNEL.sceKernelReleaseThreadEventHandler);
   kernel.stub(KERNEL.sceKernelReleaseWaitThread);
-  kernel.stub(KERNEL.sceKernelResumeDispatchThread);
   kernel.stub(KERNEL.sceKernelResumeSubIntr);
   kernel.stub(KERNEL.sceKernelSendMsgPipeCB);
   kernel.stub(KERNEL.sceKernelSetSysClockAlarm);
   kernel.stub(KERNEL.sceKernelSetVTimerTimeWide);
   kernel.stub(KERNEL.sceKernelStopModule);
   kernel.stub(KERNEL.sceKernelStopUnloadSelfModule, 1);
-  kernel.stub(KERNEL.sceKernelSuspendDispatchThread);
   kernel.stub(KERNEL.sceKernelSuspendSubIntr);
   kernel.stub(KERNEL.sceKernelUnloadModule);
   kernel.stub(KERNEL.sceKernelUnregisterSubIntrHandler);

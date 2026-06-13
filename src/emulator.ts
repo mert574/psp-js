@@ -231,8 +231,12 @@ export class PSPEmulator {
     this.cpu.regs.setGpr(28, gp); // $gp = absolute GP address from module_info
     log.info(`[EMU] Initializing GP=0x${gp.toString(16)}`);
 
-    // Allocate module_start stack from userMemory (matching PPSSPP root thread setup)
-    const MODULE_START_STACK = 0x40000; // 256KB default — PPSSPP sceKernelModule.cpp:1805
+    // Allocate module_start stack from userMemory (matching PPSSPP root thread setup).
+    // 0x40000 matches the real-PSP root/main thread stack for a LoadExec'd module
+    // (the sysmem autotest's StackStart 0x3EF7C = 0x40000 - header). PPSSPP frees
+    // this root stack before the game creates its big Fpl pool ("Freeing thread
+    // stack root"); we free it in the module-return handler below.
+    const MODULE_START_STACK = 0x40000;
     const moduleStackBase = this.hle.userMemory.alloc(MODULE_START_STACK, true, "stack/root");
 
     // Root thread stack setup matching PPSSPP __KernelResetThread → FillStack

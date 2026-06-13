@@ -50,13 +50,6 @@ export class PspFileSystem {
     return this.discReader?.(lbn, size) ?? undefined;
   }
 
-  /** Register a device alias so paths on `alias` resolve onto `target`. */
-  assignDevice(alias: string, target: string): void {
-    const a = alias.toLowerCase().replace(/^([a-z0-9]+:).*/, "$1");
-    const t = target.toLowerCase().replace(/^([a-z0-9]+:).*/, "$1");
-    if (a && t && a !== t) this.deviceAliases.set(a, t);
-  }
-
   /**
    * Set the starting (default) working directory.
    * Also registers the directory and all its parents as known directories.
@@ -333,15 +326,19 @@ export class PspFileSystem {
       const slashIdx = relative.indexOf("/");
 
       if (slashIdx === -1) {
-        // Direct child file
-        results.push({ exists: true, isDirectory: false, name: relative, size: data.byteLength });
+        // Direct child file. startSector must be set: games (God of War) read
+        // the directory to build a catalog, then open each file raw via
+        // sce_lbn<startSector>. PPSSPP fills st_private[0] per Dread entry; a 0
+        // here makes the game fall back to named opens and shifts its whole heap.
+        results.push({ exists: true, isDirectory: false, name: relative, size: data.byteLength, startSector: this.sectors.get(keyLower) });
       } else {
         // Subdirectory — extract first component
         const dirName = relative.substring(0, slashIdx);
         const dirNameLower = dirName.toLowerCase();
         if (!seenDirs.has(dirNameLower)) {
           seenDirs.add(dirNameLower);
-          results.push({ exists: true, isDirectory: true, name: dirName, size: 0 });
+          const ext = this.dirExtents.get(dirPrefix + dirNameLower);
+          results.push({ exists: true, isDirectory: true, name: dirName, size: ext?.size ?? 0, startSector: ext?.sector });
         }
       }
     }
