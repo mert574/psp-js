@@ -229,6 +229,12 @@ export class WebGLGERenderer {
   private frameCount = 0;
   private currentRenderAddr = 0; // currently bound VFB address
 
+  // Framebuffer addresses that sceMpeg/PsmfPlayer CPU-wrote a video frame to,
+  // and the frame it happened on. When the display buffer is one of these, the
+  // present shows its raw VRAM (which holds the decoded video) instead of the
+  // stale FBO — the FBO never sees CPU writes, so video would be invisible.
+  private videoFrameAddrs = new Map<number, number>();
+
   // Internal resolution multiplier. VFBs are allocated at scale*512 x scale*272
   // and the viewport/scissor scale with it, so 3D geometry rasterizes at higher
   // resolution. Vertex positions stay in PSP screen space (u_resolution is the
@@ -633,7 +639,11 @@ export class WebGLGERenderer {
     // PPSSPP PrepareCopyDisplayToOutput: find VFB at display address.
     // If found, present FBO texture. If not, fall back to VRAM bytes.
     const displayAddr = this.displayFbAddr;
-    const displayVfb = displayAddr ? this.vfbs.get(displayAddr) : null;
+    // If the game just CPU-wrote a video frame to the display buffer, show its
+    // raw VRAM (the decoded frame) instead of the FBO, which never saw the write.
+    const vidFrame = displayAddr ? this.videoFrameAddrs.get(displayAddr) : undefined;
+    const videoFresh = vidFrame !== undefined && this.frameCount - vidFrame <= 2;
+    const displayVfb = (displayAddr && !videoFresh) ? this.vfbs.get(displayAddr) : null;
     this._dbgDisplayPath = displayVfb ? "vfb" : (displayAddr && this.vramRef ? "vram" : "none");
 
     gl.activeTexture(gl.TEXTURE0);
@@ -709,6 +719,10 @@ export class WebGLGERenderer {
   onFrameStart(): void {
     this.frameCount++;
     this.decimateVFBs(); // PPSSPP BeginFrame → DecimateFBOs
+    // Drop stale video-target marks (kept only a couple frames).
+    for (const [addr, f] of this.videoFrameAddrs) {
+      if (this.frameCount - f > 3) this.videoFrameAddrs.delete(addr);
+    }
   }
 
   /** Normalize a PSP framebuffer address to an absolute VRAM address.
@@ -880,6 +894,29 @@ export class WebGLGERenderer {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
     vfb.lastFrameUsed = this.frameCount;
     return true;
+  }
+
+  /** Mirror a CPU-written sceMpeg video frame into the FBO the present samples.
+   *  The game decodes frames straight into VRAM; the WebGL present reads the FBO,
+   *  which never sees CPU writes, so without this the video is invisible (only the
+   *  software renderer, which reads VRAM directly, shows it). Only acts when a VFB
+   *  already backs this address — otherwise the present's VRAM-fallback path
+   *  already shows the bytes. Sets the VFB format/stride to the video's so the
+   *  bytes decode correctly even if the buffer was last a different GE format. */
+  uploadVideoFrame(
+    vram: Uint8Array, dest: number, stride: number, format: number,
+    x: number, y: number, w: number, h: number,
+  ): boolean {
+    // Remember this address as a video target so present shows its VRAM even if
+    // a VFB shadows it (the FBO upload below only helps framebuffer-as-texture).
+    this.videoFrameAddrs.set(this.normFb(dest), this.frameCount);
+    const base = this.findVFBBaseContaining(dest);
+    if (base < 0) return false;
+    const vfb = this.vfbs.get(base)!;
+    vfb.format = format;            // the buffer now holds a video frame
+    if (stride) vfb.stride = stride;
+    const bpp = format === 3 ? 4 : 2;
+    return this.uploadRectFromVRAM(vram, dest, stride, x, y, w, h, bpp);
   }
 
   /** Read FBO pixels back to VRAM in the VFB's own pixel format and stride.

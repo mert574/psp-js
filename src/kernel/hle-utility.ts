@@ -582,6 +582,13 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
+  // sceUtilityUnloadModule(module) — PPSSPP sceUtility.cpp:637. Mirror of
+  // LoadModule: modules are HLE'd and never really loaded, so unload always
+  // succeeds. Returning the not-loaded error would contradict LoadModule's 0.
+  kernel.register(UTILITY.sceUtilityUnloadModule, (regs) => {
+    regs.setGpr(2, 0);
+  });
+
   // ── Stubs: UTILITY ──────────────────────────────────────────────────────
   kernel.stub(UTILITY.__UtilityFinishDialog);
   kernel.stub(UTILITY.__UtilityInitDialog, 1);
@@ -661,7 +668,6 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   kernel.stub(UTILITY.sceUtilityStoreCheckoutShutdownStart, 1);
   kernel.stub(UTILITY.sceUtilityStoreCheckoutUpdate);
   kernel.stub(UTILITY.sceUtilityUnloadAvModule, 1);
-  kernel.stub(UTILITY.sceUtilityUnloadModule, 1);
   kernel.stub(UTILITY.sceUtilityLoadNetModule);
   kernel.stub(UTILITY.sceUtilityUnloadNetModule);
   kernel.stub(UTILITY.sceUtilityUnloadUsbModule);
