@@ -414,21 +414,97 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  // MsgDialog — same state machine as savedata
+  // MsgDialog — PPSSPP dialog state machine (PSPDialog.cpp / PSPMsgDialog.cpp).
+  // 0=NONE 1=INITIALIZE 2=RUNNING 3=FINISHED 4=SHUTDOWN. InitStart sets INITIALIZE;
+  // GetStatus auto-advances INITIALIZE→RUNNING and SHUTDOWN→NONE (UseAutoStatus);
+  // the RUNNING→FINISHED transition is driven by Update (a real PSP shows the
+  // dialog and waits for a button — we have no UI, so Update confirms it).
   let msgDialogStatus = 0;
-  kernel.register(UTILITY.sceUtilityMsgDialogInitStart, (regs) => {
-    msgDialogStatus = 2;
+  let msgDialogParamAddr = 0;
+  kernel.register(UTILITY.sceUtilityMsgDialogInitStart, (regs, bus) => {
+    msgDialogParamAddr = regs.getGpr(4) >>> 0;
+    msgDialogStatus = 1; // INITIALIZE
+    // string[512] (UTF-8) lives at offset 60 in pspMessageDialog (PSPMsgDialog.h).
+    const msg = msgDialogParamAddr !== 0 ? kernel.readCString(bus, msgDialogParamAddr + 60) : "";
+    log.info(`[dialog] MsgDialog opened: "${msg}"`);
     regs.setGpr(2, 0);
   });
   kernel.register(UTILITY.sceUtilityMsgDialogGetStatus, (regs) => {
     const ret = msgDialogStatus;
-    if (msgDialogStatus === 2) msgDialogStatus = 3;
-    else if (msgDialogStatus === 3) msgDialogStatus = 4;
-    else if (msgDialogStatus === 4) msgDialogStatus = 0;
+    if (msgDialogStatus === 1) msgDialogStatus = 2;      // INITIALIZE → RUNNING
+    else if (msgDialogStatus === 4) msgDialogStatus = 0; // SHUTDOWN → NONE
     regs.setGpr(2, ret);
   });
+  // sceUtilityMsgDialogUpdate(animSpeed) — PPSSPP sceUtility.cpp:717 / PSPMsgDialog::
+  // Update: error unless RUNNING; otherwise advance the dialog. With no UI we
+  // confirm immediately: write common.result=0 and buttonPressed=YES/OK (offset
+  // 576, only on V2+ params where common.size >= 580), then go to FINISHED so the
+  // game's GetStatus poll sees 3 and calls ShutdownStart.
+  kernel.register(UTILITY.sceUtilityMsgDialogUpdate, (regs, bus) => {
+    if (msgDialogStatus !== 2) { regs.setGpr(2, 0x80110001); return; } // SCE_ERROR_UTILITY_INVALID_STATUS
+    if (msgDialogParamAddr !== 0) {
+      bus.writeU32(msgDialogParamAddr + 28, 0); // pspUtilityDialogCommon.result = success
+      const size = bus.readU32(msgDialogParamAddr) >>> 0; // common.size
+      if (size >= 580) bus.writeU32(msgDialogParamAddr + 576, 1); // buttonPressed = YES/OK
+    }
+    msgDialogStatus = 3; // FINISHED
+    log.info(`[dialog] MsgDialog dismissed (button=OK)`);
+    regs.setGpr(2, 0);
+  });
   kernel.register(UTILITY.sceUtilityMsgDialogShutdownStart, (regs) => {
-    if (msgDialogStatus === 3) msgDialogStatus = 4;
+    msgDialogStatus = 4; // SHUTDOWN
+    regs.setGpr(2, 0);
+  });
+
+  // OSK (on-screen keyboard) — same dialog state machine (PSPOskDialog.cpp).
+  // We have no keyboard UI, so Update returns a fixed string ("PSPjs") as the
+  // entered text — written to outtext with field result = CHANGED, like PPSSPP's
+  // finish path (PSPOskDialog.cpp:849-863).
+  // SceUtilityOskParams: base(common,48) result@28, fieldCount@48, fields ptr@52,
+  // state@56. SceUtilityOskData field: intext@32, outtextlength@36, outtext@40,
+  // result@44 (0=UNCHANGED 1=CANCELLED 2=CHANGED). state: 5=FINISHED.
+  const OSK_TEXT = "PSPjs";
+  let oskStatus = 0;
+  let oskParamAddr = 0;
+  kernel.register(UTILITY.sceUtilityOskInitStart, (regs) => {
+    oskParamAddr = regs.getGpr(4) >>> 0;
+    oskStatus = 1; // INITIALIZE
+    log.info(`[dialog] OSK opened`);
+    regs.setGpr(2, 0);
+  });
+  kernel.register(UTILITY.sceUtilityOskGetStatus, (regs) => {
+    const ret = oskStatus;
+    if (oskStatus === 1) oskStatus = 2;      // INITIALIZE → RUNNING
+    else if (oskStatus === 4) oskStatus = 0; // SHUTDOWN → NONE
+    regs.setGpr(2, ret);
+  });
+  kernel.register(UTILITY.sceUtilityOskUpdate, (regs, bus) => {
+    if (oskStatus !== 2) { regs.setGpr(2, 0x80110001); return; } // SCE_ERROR_UTILITY_INVALID_STATUS
+    const inRam = (a: number): boolean => a >= 0x08000000 && a < 0x0c000000;
+    if (inRam(oskParamAddr)) {
+      const fieldsPtr = bus.readU32(oskParamAddr + 52) >>> 0;
+      if (inRam(fieldsPtr)) {
+        const outLen = bus.readU32(fieldsPtr + 36) >>> 0; // u16 count incl. terminator
+        const outtextPtr = bus.readU32(fieldsPtr + 40) >>> 0;
+        if (inRam(outtextPtr) && outLen > 0) {
+          const max = outLen - 1; // leave room for the terminator
+          let i = 0;
+          for (; i < OSK_TEXT.length && i < max; i++) {
+            bus.writeU16(outtextPtr + i * 2, OSK_TEXT.charCodeAt(i));
+          }
+          bus.writeU16(outtextPtr + i * 2, 0); // null terminator
+        }
+        bus.writeU32(fieldsPtr + 44, 2); // field result = CHANGED (text was entered)
+        log.info(`[dialog] OSK confirmed: "${OSK_TEXT}"`);
+      }
+      bus.writeU32(oskParamAddr + 28, 0); // common.result = success
+      bus.writeU32(oskParamAddr + 56, 5); // params.state = FINISHED
+    }
+    oskStatus = 3; // FINISHED
+    regs.setGpr(2, 0);
+  });
+  kernel.register(UTILITY.sceUtilityOskShutdownStart, (regs) => {
+    oskStatus = 4; // SHUTDOWN
     regs.setGpr(2, 0);
   });
 
@@ -451,6 +527,19 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   kernel.register(UTILITY.sceUtilityGetSystemParamString, (regs, bus) => {
     const ptr = regs.getGpr(5);
     if (ptr !== 0) bus.writeU8(ptr, 0);
+    regs.setGpr(2, 0);
+  });
+
+  // sceImposeGetLanguageMode(languagePtr, btnPtr) — PPSSPP sceImpose.cpp:82 writes
+  // the system language and the enter-button assignment to the out pointers (a
+  // no-op stub leaves the game reading garbage, which can flip a language branch —
+  // gow loads DATA/<language>/GAME.BIN). Keep these consistent with
+  // sceUtilityGetSystemParamInt: language English=1, enter button X/Cross=1.
+  kernel.register(IMPOSE.sceImposeGetLanguageMode, (regs, bus) => {
+    const languagePtr = regs.getGpr(4);
+    const btnPtr = regs.getGpr(5);
+    if (languagePtr !== 0) bus.writeU32(languagePtr, 1); // PSP_SYSTEMPARAM_LANGUAGE_ENGLISH
+    if (btnPtr !== 0) bus.writeU32(btnPtr, 1);           // PSP_SYSTEMPARAM_BUTTON_CROSS
     regs.setGpr(2, 0);
   });
 
@@ -535,15 +624,10 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   kernel.stub(UTILITY.sceUtilityInstallUpdate);
   kernel.stub(UTILITY.sceUtilityLoadUsbModule);
   kernel.stub(UTILITY.sceUtilityMsgDialogAbort);
-  kernel.stub(UTILITY.sceUtilityMsgDialogUpdate);
   kernel.stub(UTILITY.sceUtilityNpSigninGetStatus);
   kernel.stub(UTILITY.sceUtilityNpSigninInitStart, 1);
   kernel.stub(UTILITY.sceUtilityNpSigninShutdownStart, 1);
   kernel.stub(UTILITY.sceUtilityNpSigninUpdate);
-  kernel.stub(UTILITY.sceUtilityOskGetStatus);
-  kernel.stub(UTILITY.sceUtilityOskInitStart, 1);
-  kernel.stub(UTILITY.sceUtilityOskShutdownStart, 1);
-  kernel.stub(UTILITY.sceUtilityOskUpdate);
   kernel.stub(UTILITY.sceUtilityPS3ScanGetStatus);
   kernel.stub(UTILITY.sceUtilityPS3ScanInitStart, 1);
   kernel.stub(UTILITY.sceUtilityPS3ScanShutdownStart, 1);
@@ -826,7 +910,6 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   kernel.stub(IMPOSE.sceImposeGetBacklightOffTime);
   kernel.stub(IMPOSE.sceImposeGetBatteryIconStatus);
   kernel.stub(IMPOSE.sceImposeGetHomePopup);
-  kernel.stub(IMPOSE.sceImposeGetLanguageMode);
   kernel.stub(IMPOSE.sceImposeGetUMDPopup);
   kernel.stub(IMPOSE.sceImposeHomeButton);
   kernel.stub(IMPOSE.sceImposeSetBacklightOffTime);

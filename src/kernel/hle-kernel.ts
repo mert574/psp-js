@@ -427,6 +427,12 @@ export class HLEKernel {
    *  Alarm CoreTiming callbacks check this to defer handler invocation. */
   interruptsEnabled: boolean = true;
 
+  /** True when thread dispatch is enabled (false after
+   *  sceKernelSuspendDispatchThread). PPSSPP gates every thread switch on this
+   *  (sceKernelThread.cpp dispatchEnabled) — a thread that suspends dispatch
+   *  holds the CPU until it resumes, even against higher-priority READY threads. */
+  dispatchEnabled: boolean = true;
+
   /** Pending alarm handler invocations queued while interrupts are suspended.
    *  Each entry is (alarmId). Processed when interruptsEnabled becomes true. */
   readonly pendingAlarmFires: number[] = [];
@@ -962,7 +968,7 @@ export class HLEKernel {
     // alarm test relies on this: main suspends interrupts and busy-loops, and
     // neither the alarm handler nor the higher-priority worker may run until it
     // resumes.
-    if (!this.interruptsEnabled) return false;
+    if (!this.interruptsEnabled || !this.dispatchEnabled) return false;
     const cur = this.threads.get(this.currentThreadId);
     if (!cur || cur.state !== ThreadState.RUNNING) return false;
     let best: Thread | null = null;
