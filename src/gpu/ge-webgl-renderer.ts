@@ -229,6 +229,51 @@ export class WebGLGERenderer {
   private frameCount = 0;
   private currentRenderAddr = 0; // currently bound VFB address
 
+  // GE draw pipeline state. The program, vertex buffer, and interleaved attribute
+  // layout never change between GE draws, yet re-binding them per draw cost
+  // ~140ms/frame on draw-heavy scenes (GoW's intro submits ~8k draws/frame). Cache
+  // the attribute locations and bind the pipeline once; present()/blitVFB() switch
+  // program+buffer, so they reset gePipelineBound.
+  private geAttribLocs: { pos: number; uv: number; col: number; fog: number } | null = null;
+  private gePipelineBound = false;
+  // Last texture + sampler-state (filter/wrap) signature applied, so a run of draws
+  // using the same texture and sampler skips the 4 per-draw texParameteri calls
+  // (those were ~82ms/frame on the same scene).
+  private lastTexParamTex: WebGLTexture | null = null;
+  private lastTexParamKey = -1;
+
+  // GE-program uniform locations (cached once) + last-applied source values, so a
+  // run of same-state draws skips the ~17 uniform calls/draw. Uniform values are
+  // per-program GL state and survive present()'s program switch, so this cache
+  // never needs invalidating. -1 = "unset, force apply on first draw".
+  private uLoc: Record<
+    "u_resolution" | "u_texEnable" | "u_texFunc" | "u_texFuncAlpha" | "u_texEnvColor"
+    | "u_alphaTestEnable" | "u_alphaTestFunc" | "u_alphaTestRef" | "u_colorDoubling"
+    | "u_fogEnable" | "u_fogColor" | "u_colorTestEnable" | "u_colorTestFunc"
+    | "u_colorTestRef" | "u_colorTestMask" | "u_stencilReplace" | "u_stencilReplaceValue",
+    WebGLUniformLocation | null
+  > | null = null;
+  private uLast = {
+    resolution: false, texEnable: -1, texFunc: -1, texFuncAlpha: -1, texEnvColor: -1,
+    alphaTestEnable: -1, alphaTestFunc: -1, alphaTestRef: -1, colorDoubling: -1,
+    fogEnable: -1, fogColor: -1, colorTestEnable: -1, colorTestFunc: -1,
+    colorTestRef: -1, colorTestMask: -1, stencilReplace: -1, stencilReplaceValue: -1,
+  };
+
+  // Dirty-tracking for the per-draw GL state that applyBlendState/applyColorMask/
+  // applyCullState issue. A run of same-state draws then skips these GL calls
+  // (blendFunc/blendEquation/colorMask/cullFace were each ~8k calls/frame on GoW's
+  // intro). blendFunc/Eq and cullFace survive present()/clearRect (they only
+  // disable, not re-specify), but those paths call gl.colorMask(true,...) so the
+  // colorMask cache is reset there. -1 = "unknown, force re-apply".
+  private lastBlendOp = -1;
+  private lastBlendSrc = -1;
+  private lastBlendDst = -1;
+  private lastBlendFixA = -1;
+  private lastBlendFixB = -1;
+  private lastCullFace = -1; // gl enum last passed to cullFace, or -1
+  private lastColorMaskBits = -1; // 4-bit R|G|B|A enable mask, or -1 if unknown
+
   // Internal resolution multiplier. VFBs are allocated at scale*512 x scale*272
   // and the viewport/scissor scale with it, so 3D geometry rasterizes at higher
   // resolution. Vertex positions stay in PSP screen space (u_resolution is the
@@ -327,6 +372,102 @@ export class WebGLGERenderer {
       new Uint8Array([255, 255, 255, 255]));
 
     log.info("WebGL GE renderer initialized");
+  }
+
+  /** Bind the GE shader program, vertex buffer, and interleaved attribute layout.
+   *  Idempotent: only does GL work the first time after present()/blitVFB() reset
+   *  gePipelineBound, because none of program/buffer/layout change between GE
+   *  draws. Skips ~140ms/frame of redundant per-draw attribute setup on heavy
+   *  scenes (GoW intro ~8k draws/frame). */
+  private bindGePipeline(): void {
+    if (this.gePipelineBound) return;
+    const gl = this.gl;
+    gl.useProgram(this.geProgram.program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.glBuffer);
+    if (!this.geAttribLocs) {
+      const p = this.geProgram.program;
+      this.geAttribLocs = {
+        pos: gl.getAttribLocation(p, "a_position"),
+        uv: gl.getAttribLocation(p, "a_texcoord"),
+        col: gl.getAttribLocation(p, "a_color"),
+        fog: gl.getAttribLocation(p, "a_fogCoef"),
+      };
+    }
+    const stride = FLOATS_PER_VERT * 4; // 10 floats * 4 bytes = 40 bytes
+    const a = this.geAttribLocs;
+    gl.enableVertexAttribArray(a.pos); gl.vertexAttribPointer(a.pos, 3, gl.FLOAT, false, stride, 0);
+    if (a.uv >= 0)  { gl.enableVertexAttribArray(a.uv);  gl.vertexAttribPointer(a.uv, 2, gl.FLOAT, false, stride, 12); }
+    if (a.col >= 0) { gl.enableVertexAttribArray(a.col); gl.vertexAttribPointer(a.col, 4, gl.FLOAT, false, stride, 20); }
+    if (a.fog >= 0) { gl.enableVertexAttribArray(a.fog); gl.vertexAttribPointer(a.fog, 1, gl.FLOAT, false, stride, 36); }
+    // Sampler always reads texture unit 0 (set once with the rest of the pipeline).
+    gl.uniform1i(gl.getUniformLocation(this.geProgram.program, "u_texture"), 0);
+    this.gePipelineBound = true;
+  }
+
+  /** Apply the fragment/transform uniforms for this draw, setting each only when
+   *  its source value changed since the last draw. twgl.setUniforms previously
+   *  pushed all ~17 uniforms every draw (~140k GL calls/frame on heavy scenes);
+   *  runs of same-state draws now issue almost none. Uniform values are
+   *  per-program GL state, so they persist across present()'s program switch and
+   *  this cache stays valid without invalidation. */
+  private applyGeUniforms(state: GEDrawState): void {
+    const gl = this.gl;
+    if (!this.uLoc) {
+      const p = this.geProgram.program;
+      const g = (n: string) => gl.getUniformLocation(p, n);
+      this.uLoc = {
+        u_resolution: g("u_resolution"), u_texEnable: g("u_texEnable"), u_texFunc: g("u_texFunc"),
+        u_texFuncAlpha: g("u_texFuncAlpha"), u_texEnvColor: g("u_texEnvColor"),
+        u_alphaTestEnable: g("u_alphaTestEnable"), u_alphaTestFunc: g("u_alphaTestFunc"),
+        u_alphaTestRef: g("u_alphaTestRef"), u_colorDoubling: g("u_colorDoubling"),
+        u_fogEnable: g("u_fogEnable"), u_fogColor: g("u_fogColor"),
+        u_colorTestEnable: g("u_colorTestEnable"), u_colorTestFunc: g("u_colorTestFunc"),
+        u_colorTestRef: g("u_colorTestRef"), u_colorTestMask: g("u_colorTestMask"),
+        u_stencilReplace: g("u_stencilReplace"), u_stencilReplaceValue: g("u_stencilReplaceValue"),
+      };
+    }
+    const L = this.uLoc, U = this.uLast, frag = state.fragState;
+
+    // u_resolution is constant (FBO is the 512-wide VRAM stride, not the 480 visible
+    // width, so PSP x maps 1:1 to FBO columns) — set once.
+    if (!U.resolution) { gl.uniform2f(L.u_resolution, FBO_WIDTH, PSP_HEIGHT); U.resolution = true; }
+
+    const texEnable = state.texEnable ? 1 : 0;
+    if (texEnable !== U.texEnable) { gl.uniform1i(L.u_texEnable, texEnable); U.texEnable = texEnable; }
+    if (frag.texFunc !== U.texFunc) { gl.uniform1i(L.u_texFunc, frag.texFunc); U.texFunc = frag.texFunc; }
+    const texFuncAlpha = frag.texFuncAlpha ? 1 : 0;
+    if (texFuncAlpha !== U.texFuncAlpha) { gl.uniform1i(L.u_texFuncAlpha, texFuncAlpha); U.texFuncAlpha = texFuncAlpha; }
+    if (frag.texEnvColor !== U.texEnvColor) {
+      gl.uniform3f(L.u_texEnvColor, (frag.texEnvColor & 0xFF) / 255, ((frag.texEnvColor >>> 8) & 0xFF) / 255, ((frag.texEnvColor >>> 16) & 0xFF) / 255);
+      U.texEnvColor = frag.texEnvColor;
+    }
+    const alphaTestEnable = frag.alphaTestEnable ? 1 : 0;
+    if (alphaTestEnable !== U.alphaTestEnable) { gl.uniform1i(L.u_alphaTestEnable, alphaTestEnable); U.alphaTestEnable = alphaTestEnable; }
+    if (frag.alphaTestFunc !== U.alphaTestFunc) { gl.uniform1i(L.u_alphaTestFunc, frag.alphaTestFunc); U.alphaTestFunc = frag.alphaTestFunc; }
+    if (frag.alphaTestRef !== U.alphaTestRef) { gl.uniform1f(L.u_alphaTestRef, frag.alphaTestRef); U.alphaTestRef = frag.alphaTestRef; }
+    const colorDoubling = state.colorDoubling ? 1 : 0;
+    if (colorDoubling !== U.colorDoubling) { gl.uniform1i(L.u_colorDoubling, colorDoubling); U.colorDoubling = colorDoubling; }
+    const fogEnable = (state.fogEnable && !state.throughMode) ? 1 : 0;
+    if (fogEnable !== U.fogEnable) { gl.uniform1i(L.u_fogEnable, fogEnable); U.fogEnable = fogEnable; }
+    if (state.fogColor !== U.fogColor) {
+      gl.uniform3f(L.u_fogColor, (state.fogColor & 0xFF) / 255, ((state.fogColor >>> 8) & 0xFF) / 255, ((state.fogColor >>> 16) & 0xFF) / 255);
+      U.fogColor = state.fogColor;
+    }
+    const colorTestEnable = frag.colorTestEnable ? 1 : 0;
+    if (colorTestEnable !== U.colorTestEnable) { gl.uniform1i(L.u_colorTestEnable, colorTestEnable); U.colorTestEnable = colorTestEnable; }
+    if (frag.colorTestFunc !== U.colorTestFunc) { gl.uniform1i(L.u_colorTestFunc, frag.colorTestFunc); U.colorTestFunc = frag.colorTestFunc; }
+    if (frag.colorTestRef !== U.colorTestRef) {
+      gl.uniform3f(L.u_colorTestRef, frag.colorTestRef & 0xFF, (frag.colorTestRef >>> 8) & 0xFF, (frag.colorTestRef >>> 16) & 0xFF);
+      U.colorTestRef = frag.colorTestRef;
+    }
+    if (frag.colorTestMask !== U.colorTestMask) {
+      gl.uniform3f(L.u_colorTestMask, frag.colorTestMask & 0xFF, (frag.colorTestMask >>> 8) & 0xFF, (frag.colorTestMask >>> 16) & 0xFF);
+      U.colorTestMask = frag.colorTestMask;
+    }
+    // Stencil-to-alpha: when stencil op is REPLACE (2), output alpha = stencilRef.
+    const stencilReplace = (frag.stencilTestEnable && frag.stencilZPass === 2) ? 1 : 0;
+    if (stencilReplace !== U.stencilReplace) { gl.uniform1i(L.u_stencilReplace, stencilReplace); U.stencilReplace = stencilReplace; }
+    if (frag.stencilRef !== U.stencilReplaceValue) { gl.uniform1f(L.u_stencilReplaceValue, frag.stencilRef / 255); U.stencilReplaceValue = frag.stencilRef; }
   }
 
   /**
@@ -430,96 +571,37 @@ export class WebGLGERenderer {
 
     if (this.vertexCount === 0) return;
 
-    // Upload vertex data
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.glBuffer);
+    // Bind the GE draw pipeline (program + interleaved attribute layout) once and
+    // reuse it across draws — re-binding it per draw was the single biggest cost
+    // on draw-heavy scenes. The vertex buffer stays bound as the ARRAY_BUFFER.
+    this.bindGePipeline();
+
+    // Upload this draw's vertices into the (already bound) GE vertex buffer.
     gl.bufferSubData(gl.ARRAY_BUFFER, 0,
       this.vertexData.subarray(0, this.vertexCount * FLOATS_PER_VERT));
-
-    // Set up shader
-    gl.useProgram(this.geProgram.program);
-
-    // Bind attributes manually (interleaved buffer: x,y,z, u,v, r,g,b,a, fogCoef)
-    const stride = FLOATS_PER_VERT * 4; // 10 floats * 4 bytes = 40 bytes
-    const posLoc = gl.getAttribLocation(this.geProgram.program, "a_position");
-    const uvLoc = gl.getAttribLocation(this.geProgram.program, "a_texcoord");
-    const colLoc = gl.getAttribLocation(this.geProgram.program, "a_color");
-    const fogLoc = gl.getAttribLocation(this.geProgram.program, "a_fogCoef");
-
-    gl.enableVertexAttribArray(posLoc);
-    gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, stride, 0);
-    if (uvLoc >= 0) {
-      gl.enableVertexAttribArray(uvLoc);
-      gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, stride, 12);
-    }
-    if (colLoc >= 0) {
-      gl.enableVertexAttribArray(colLoc);
-      gl.vertexAttribPointer(colLoc, 4, gl.FLOAT, false, stride, 20);
-    }
-    if (fogLoc >= 0) {
-      gl.enableVertexAttribArray(fogLoc);
-      gl.vertexAttribPointer(fogLoc, 1, gl.FLOAT, false, stride, 36);
-    }
 
     // Bind texture to unit 0
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
 
-    // Apply texture filtering from GE state
+    // Apply texture filtering/wrap from GE state, but only when the bound texture
+    // or its sampler state actually changed. A run of draws sharing one texture
+    // (e.g. all glyphs of a font) then skips the 4 texParameteri calls.
     if (state.texEnable) {
-      const magFilter = state.texState.texMagFilter === 1 ? gl.LINEAR : gl.NEAREST;
-      const minFilter = (state.texState.texMinFilter & 1) ? gl.LINEAR : gl.NEAREST;
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, magFilter);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, minFilter);
-      const wrapS = state.texState.texWrapU === 1 ? gl.CLAMP_TO_EDGE : gl.REPEAT;
-      const wrapT = state.texState.texWrapV === 1 ? gl.CLAMP_TO_EDGE : gl.REPEAT;
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapS);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapT);
+      const ts = state.texState;
+      const texParamKey = (ts.texMagFilter === 1 ? 1 : 0) | ((ts.texMinFilter & 1) ? 2 : 0)
+        | (ts.texWrapU === 1 ? 4 : 0) | (ts.texWrapV === 1 ? 8 : 0);
+      if (tex !== this.lastTexParamTex || texParamKey !== this.lastTexParamKey) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, (texParamKey & 1) ? gl.LINEAR : gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, (texParamKey & 2) ? gl.LINEAR : gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, (texParamKey & 4) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, (texParamKey & 8) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
+        this.lastTexParamTex = tex;
+        this.lastTexParamKey = texParamKey;
+      }
     }
 
-    // Set sampler uniform manually (twgl expects WebGLTexture, not unit index)
-    const texLoc = gl.getUniformLocation(this.geProgram.program, "u_texture");
-    gl.uniform1i(texLoc, 0);
-
-    const frag = state.fragState;
-    const envR = (frag.texEnvColor & 0xFF) / 255;
-    const envG = ((frag.texEnvColor >>> 8) & 0xFF) / 255;
-    const envB = ((frag.texEnvColor >>> 16) & 0xFF) / 255;
-
-    // Fog color — PPSSPP stores as BGR, convert to normalized RGB
-    const fogR = (state.fogColor & 0xFF) / 255;
-    const fogG = ((state.fogColor >>> 8) & 0xFF) / 255;
-    const fogB = ((state.fogColor >>> 16) & 0xFF) / 255;
-
-    // Color test ref/mask — convert from 24-bit integer to per-channel floats
-    const ctRef = frag.colorTestRef;
-    const ctMask = frag.colorTestMask;
-
-    // Stencil-to-alpha: when stencil op is REPLACE (2), output alpha = stencilRef
-    const stencilReplace = frag.stencilTestEnable && frag.stencilZPass === 2;
-
-    twgl.setUniforms(this.geProgram, {
-      // Divide screen-space x by the FBO width (512, the VRAM stride), NOT the
-      // 480 visible width: the render target / viewport is 512 wide, so PSP x
-      // must map 1:1 to FBO columns. Using 480 stretched everything ~6.7% wider
-      // and pushed it right (rightmost pixels clipped past column 480 on present).
-      u_resolution: [FBO_WIDTH, PSP_HEIGHT],
-      u_texEnable: state.texEnable,
-      u_texFunc: frag.texFunc,
-      u_texFuncAlpha: frag.texFuncAlpha,
-      u_texEnvColor: [envR, envG, envB],
-      u_alphaTestEnable: frag.alphaTestEnable,
-      u_alphaTestFunc: frag.alphaTestFunc,
-      u_alphaTestRef: frag.alphaTestRef,
-      u_colorDoubling: state.colorDoubling,
-      u_fogEnable: state.fogEnable && !state.throughMode,
-      u_fogColor: [fogR, fogG, fogB],
-      u_colorTestEnable: frag.colorTestEnable,
-      u_colorTestFunc: frag.colorTestFunc,
-      u_colorTestRef: [ctRef & 0xFF, (ctRef >>> 8) & 0xFF, (ctRef >>> 16) & 0xFF],
-      u_colorTestMask: [ctMask & 0xFF, (ctMask >>> 8) & 0xFF, (ctMask >>> 16) & 0xFF],
-      u_stencilReplace: stencilReplace,
-      u_stencilReplaceValue: frag.stencilRef / 255,
-    });
+    this.applyGeUniforms(state);
 
     // Draw
     let glPrimType: number;
@@ -532,12 +614,8 @@ export class WebGLGERenderer {
     }
 
     gl.drawArrays(glPrimType, 0, this.vertexCount);
-
-    // Clean up
-    if (fogLoc >= 0) gl.disableVertexAttribArray(fogLoc);
-    if (uvLoc >= 0) gl.disableVertexAttribArray(uvLoc);
-    if (colLoc >= 0) gl.disableVertexAttribArray(colLoc);
-    gl.disableVertexAttribArray(posLoc);
+    // Attribute arrays stay enabled across GE draws (the pipeline persists).
+    // present()/blitVFB() rebind their own program + attributes via twgl.
   }
 
   /**
@@ -585,6 +663,7 @@ export class WebGLGERenderer {
 
     // Restore defaults and reset tracking flags (we modified GL state directly)
     gl.colorMask(true, true, true, true);
+    this.lastColorMaskBits = 15;
     gl.depthMask(true);
     gl.clearDepth(1);
     gl.disable(gl.SCISSOR_TEST);
@@ -626,6 +705,12 @@ export class WebGLGERenderer {
     this.currentScissorEnabled = false;
     this.currentCullEnabled = false;
     this.currentStencilEnabled = false;
+    // Switching to the present program + buffer invalidates the cached GE draw
+    // pipeline and the texParameteri tracking; the next GE draw rebinds them.
+    // colorMask was just forced to all-true above, so reflect that in the cache.
+    this.gePipelineBound = false;
+    this.lastTexParamTex = null;
+    this.lastColorMaskBits = 15;
 
     gl.useProgram(this.presentProgram.program);
     twgl.setBuffersAndAttributes(gl, this.presentProgram, this.presentBuffer);
@@ -969,6 +1054,11 @@ export class WebGLGERenderer {
     this.currentScissorEnabled = false;
     this.currentCullEnabled = false;
     this.currentStencilEnabled = false;
+    // Present program + buffer were bound above — invalidate the GE pipeline cache.
+    // colorMask was forced to all-true, so reflect that in the cache.
+    this.gePipelineBound = false;
+    this.lastTexParamTex = null;
+    this.lastColorMaskBits = 15;
     this.currentRenderAddr = dstKey;
 
     return true;
@@ -1208,7 +1298,27 @@ export class WebGLGERenderer {
   private applyBlendState(gl: WebGLRenderingContext, frag: GEFragmentState): void {
     if (frag.alphaBlendEnable) {
       if (!this.currentBlendEnabled) { gl.enable(gl.BLEND); this.currentBlendEnabled = true; }
+      // The blend equation/func/constant color are a pure function of these five
+      // fields; re-specify them only when one changes. gl.disable(BLEND) in
+      // present()/clearRect() does not clear the func/eq, so the cache survives.
+      if (frag.blendOp !== this.lastBlendOp || frag.blendSrc !== this.lastBlendSrc
+        || frag.blendDst !== this.lastBlendDst || frag.blendFixedA !== this.lastBlendFixA
+        || frag.blendFixedB !== this.lastBlendFixB) {
+        this.applyBlendFuncEq(gl, frag);
+        this.lastBlendOp = frag.blendOp;
+        this.lastBlendSrc = frag.blendSrc;
+        this.lastBlendDst = frag.blendDst;
+        this.lastBlendFixA = frag.blendFixedA;
+        this.lastBlendFixB = frag.blendFixedB;
+      }
+    } else {
+      if (this.currentBlendEnabled) { gl.disable(gl.BLEND); this.currentBlendEnabled = false; }
+    }
+  }
 
+  /** Set the GL blend equation + factors + constant color from PSP blend state.
+   *  Called by applyBlendState only when the blend parameters actually change. */
+  private applyBlendFuncEq(gl: WebGLRenderingContext, frag: GEFragmentState): void {
       const eq = mapBlendOp(gl, frag.blendOp, this.blendMinEq, this.blendMaxEq);
       // Color uses the PSP blend op; alpha stays ADD so the ZERO/ONE alpha
       // factors below keep destination alpha (stencil). A MIN/MAX color eq must
@@ -1273,9 +1383,6 @@ export class WebGLGERenderer {
           gl.ZERO, gl.ONE,
         );
       }
-    } else {
-      if (this.currentBlendEnabled) { gl.disable(gl.BLEND); this.currentBlendEnabled = false; }
-    }
   }
 
   private applyDepthState(gl: WebGLRenderingContext, state: GEDrawState): void {
@@ -1318,7 +1425,8 @@ export class WebGLGERenderer {
       // non-buffered (Y-flipped) path, so we take the XOR-inverted branch:
       // cullCW(0) -> GL_BACK, cullCW(1) -> GL_FRONT. Without this every culled
       // triangle is the wrong face (e.g. GoW's intro text fans got culled away).
-      gl.cullFace(state.cullCW ? gl.FRONT : gl.BACK);
+      const face = state.cullCW ? gl.FRONT : gl.BACK;
+      if (face !== this.lastCullFace) { gl.cullFace(face); this.lastCullFace = face; }
     } else {
       if (this.currentCullEnabled) { gl.disable(gl.CULL_FACE); this.currentCullEnabled = false; }
     }
@@ -1346,6 +1454,10 @@ export class WebGLGERenderer {
     const invG = (~frag.maskRgb >>> 8) & 0xFF;
     const invB = (~frag.maskRgb >>> 16) & 0xFF;
     const invA = (~frag.maskAlpha) & 0xFF;
-    gl.colorMask(invR >= 128, invG >= 128, invB >= 128, invA >= 128);
+    const bits = (invR >= 128 ? 1 : 0) | (invG >= 128 ? 2 : 0) | (invB >= 128 ? 4 : 0) | (invA >= 128 ? 8 : 0);
+    if (bits !== this.lastColorMaskBits) {
+      gl.colorMask((bits & 1) !== 0, (bits & 2) !== 0, (bits & 4) !== 0, (bits & 8) !== 0);
+      this.lastColorMaskBits = bits;
+    }
   }
 }
