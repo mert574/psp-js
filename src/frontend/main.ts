@@ -114,6 +114,33 @@ let lastIsoFile: File | null = null;
 let pendingDirFiles: Map<string, Uint8Array> | null = null;
 let pendingStartDir: string | null = null;
 
+// ── Debug: ?homebrew=<dir> loads a served directory-homebrew from public/ ────
+// Mirrors the library flow (loadCompanionFiles → disc0:/ + start dir) without
+// the native directory picker, so scripted sessions can boot homebrew like Duke3D.
+void (async () => {
+  const hb = new URLSearchParams(location.search).get("homebrew");
+  if (!hb) return;
+  try {
+    const manifest = await (await fetch(`/${hb}/_manifest.json`)).json() as string[];
+    const dirFiles = new Map<string, Uint8Array>();
+    let ebootBuf: Uint8Array<ArrayBuffer> | null = null;
+    for (const rel of manifest) {
+      const resp = await fetch(`/${hb}/${rel}`);
+      if (!resp.ok) { log.warn(`?homebrew: skip ${rel} (HTTP ${resp.status})`); continue; }
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      dirFiles.set(`disc0:/${rel}`, bytes);
+      if (/(^|\/)EBOOT\.PBP$/i.test(rel)) ebootBuf = bytes;
+    }
+    if (!ebootBuf) throw new Error("no EBOOT.PBP in manifest");
+    pendingDirFiles = dirFiles;
+    pendingStartDir = "disc0:/";
+    await handleEboot(new File([ebootBuf], "EBOOT.PBP"));
+    document.getElementById("boot-btn")?.click();
+  } catch (err) {
+    log.error(`?homebrew= autoload failed: ${err}`);
+  }
+})();
+
 
 fileInputIso?.addEventListener("change", () => {
   const file = fileInputIso?.files?.[0];
@@ -190,12 +217,20 @@ bootBtn.addEventListener("click", () => {
       await registerIsoFileSystem(emulator!.hle.pspFs, emulator!.hle.fileData, lastIsoFile);
     }
 
-    // Register directory files loaded via "Open Directory" or PBP companion files
+    // Register directory files loaded via "Open Directory" or PBP companion files.
+    // "Open Directory" gives bare relative keys ("DUKE3D.GRP", "mini/x.pat"); the
+    // game opens them as "disc0:/duke3d.grp", so register under disc0:/ or they
+    // won't be found and the game jumps through uninitialized pointers (Duke3D
+    // crashed this way). Keys that already carry a device prefix pass through.
     if (pendingDirFiles) {
+      const sample: string[] = [];
       for (const [key, val] of pendingDirFiles) {
-        emulator!.hle.fileData.set(key, val);
+        const hasDevice = /^[a-z0-9_]+:/i.test(key);
+        const finalKey = hasDevice ? key : `disc0:/${key}`;
+        emulator!.hle.fileData.set(finalKey, val);
+        if (sample.length < 8) sample.push(finalKey);
       }
-      log.info(`Registered ${pendingDirFiles.size} directory files for HLE`);
+      log.info(`Registered ${pendingDirFiles.size} directory files for HLE; sample keys: ${sample.join(", ")}`);
     }
 
     // Set starting directory for homebrew PBP (ms0:/PSP/GAME/<dir>)
@@ -215,6 +250,7 @@ bootBtn.addEventListener("click", () => {
       // We are inside a click handler so AudioContext creation is allowed.
       try {
         await emulator!.hle.audioEngine.init();
+        emulator!.hle.audioEngine.setSpeed(_speed); // apply any pre-set speed
       } catch (err: unknown) {
         log.warn(`AudioEngine init failed: ${err}`);
       }
@@ -296,6 +332,28 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-scale]")) 
     const primary = document.querySelector<HTMLElement>(".gameplay-primary");
     if (primary) primary.style.setProperty("--psp-scale", String(scale));
     for (const b of document.querySelectorAll<HTMLButtonElement>("[data-scale]")) {
+      b.classList.toggle("perf-bar__btn--active", b === btn);
+    }
+  });
+}
+
+// ── Fullscreen button ─────────────────────────────────────────────────────────
+// Fullscreens the game screen (canvas scales to fit with letterboxing via CSS).
+document.getElementById("fullscreen-btn")?.addEventListener("click", () => {
+  const screen = document.querySelector<HTMLElement>(".gameplay-screen");
+  if (!document.fullscreenElement) void screen?.requestFullscreen?.();
+  else void document.exitFullscreen?.();
+});
+
+// ── Emulation speed buttons ───────────────────────────────────────────────────
+// Run N PSP frames per displayed frame (presenting once). Only helps games with
+// CPU headroom; audio plays in real time so it distorts above 1×.
+let _speed = 1;
+for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-speed]")) {
+  btn.addEventListener("click", () => {
+    _speed = Number(btn.dataset.speed) || 1;
+    emulator?.hle.audioEngine.setSpeed(_speed); // fast-forward audio in step
+    for (const b of document.querySelectorAll<HTMLButtonElement>("[data-speed]")) {
       b.classList.toggle("perf-bar__btn--active", b === btn);
     }
   });
@@ -393,7 +451,12 @@ function runOneFrame(): void {
   let cpuMs = 0;
   try {
     const cpuStart = performance.now();
-    emulator.runFrame();
+    // Run _speed PSP frames per displayed frame for 2×/4× emulation speed;
+    // we present only the last one. Stop early if the game halts mid-batch.
+    for (let i = 0; i < _speed; i++) {
+      emulator.runFrame();
+      if (emulator.halted) break;
+    }
     cpuMs = performance.now() - cpuStart;
   } catch (err) {
     stopRafLoop();
@@ -788,6 +851,8 @@ async function handleDirectory(files: FileList): Promise<void> {
     }
   }
   pendingDirFiles = dirMap;
+  // Homebrew opens files relative to disc0:/ (where we register the dir below).
+  pendingStartDir = "disc0:/";
 
   // Determine EBOOT.BIN
   ebootBytes = null;

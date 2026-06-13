@@ -96,6 +96,12 @@ export class AudioEngine {
     this.workletNode = null;
   }
 
+  /** Set the fast-forward multiplier so audio plays in step with 2×/4× game
+   *  speed (the worklet consumes this many input frames per output frame). */
+  setSpeed(speed: number): void {
+    this.workletNode?.port.postMessage({ speed });
+  }
+
   // ── PCM output ─────────────────────────────────────────────────────────────
 
   /**

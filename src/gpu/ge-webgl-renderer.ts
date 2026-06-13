@@ -21,6 +21,9 @@ const log = Logger.get("GE-GL");
 
 const PSP_WIDTH = 480;
 const PSP_HEIGHT = 272;
+// FBO / render-target width = the VRAM framebuffer stride (512), not the 480
+// visible width. Screen-space x maps 1:1 to FBO columns at this width.
+const FBO_WIDTH = 512;
 
 // Max vertices per batch before flush
 const MAX_VERTS = 65536;
@@ -474,7 +477,11 @@ export class WebGLGERenderer {
     const stencilReplace = frag.stencilTestEnable && frag.stencilZPass === 2;
 
     twgl.setUniforms(this.geProgram, {
-      u_resolution: [PSP_WIDTH, PSP_HEIGHT],
+      // Divide screen-space x by the FBO width (512, the VRAM stride), NOT the
+      // 480 visible width: the render target / viewport is 512 wide, so PSP x
+      // must map 1:1 to FBO columns. Using 480 stretched everything ~6.7% wider
+      // and pushed it right (rightmost pixels clipped past column 480 on present).
+      u_resolution: [FBO_WIDTH, PSP_HEIGHT],
       u_texEnable: state.texEnable,
       u_texFunc: frag.texFunc,
       u_texFuncAlpha: frag.texFuncAlpha,

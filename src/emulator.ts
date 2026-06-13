@@ -3,6 +3,7 @@ import { AllegrexCPU } from "./cpu/cpu.js";
 import { HLEKernel, ThreadState } from "./kernel/hle-kernel.js";
 import { CoreTiming } from "./timing/core-timing.js";
 import { loadElf } from "./loader/elf.js";
+import { parseSfo } from "./iso/sfo.js";
 import { isPbp, parsePbp } from "./loader/pbp.js";
 import { pspDecryptPRX } from "./loader/prx-decrypter.js";
 import { createSavedataStore } from "./storage/savedata-store.js";
@@ -152,6 +153,27 @@ export class PSPEmulator {
     this.hle.initTiming(this.coreTiming);
   }
 
+  /**
+   * Decide whether the game runs in the full PSP-2000 64MB layout (true) or the
+   * default PSP-1000 32MB layout (false). PPSSPP InitMemorySizeForGame: a game
+   * gets 64MB only if its PARAM.SFO sets MEMSIZE=1 (or it's an HD remaster).
+   * This matters because games compute their heap layout from the reported free
+   * memory — a 64MB layout given to a 32MB game makes its own sub-allocations
+   * collide (God of War: a streaming read landed on a live vtable). The ISO is
+   * already mounted into fileData by the time loadElfBinary runs.
+   */
+  private detectLargeMemory(): boolean {
+    for (const [key, data] of this.hle.fileData) {
+      if (key.toLowerCase().endsWith("psp_game/param.sfo")) {
+        try {
+          const sfo = parseSfo(data.slice().buffer as ArrayBuffer);
+          return sfo.MEMSIZE === 1;
+        } catch { return false; }
+      }
+    }
+    return false;
+  }
+
   async loadElfBinary(data: Uint8Array, bootFilename = "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN"): Promise<void> {
     // Initialize persistent save data storage
     this.hle.savedataStore = await createSavedataStore();
@@ -195,7 +217,7 @@ export class PSPEmulator {
     }
 
     const { entryPoint, moduleStartFunc, gp, nidBySyscall, loadedEnd, nextSyscallCode } = loadElf(data, this.bus);
-    this.hle.setHeapBase(loadedEnd);
+    this.hle.setHeapBase(loadedEnd, this.detectLargeMemory());
     this.hle.nextSyscallCode = nextSyscallCode;
     // Use module_start_func from export table if available, otherwise ELF entry
     const startAddr = moduleStartFunc ?? entryPoint;

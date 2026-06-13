@@ -119,16 +119,21 @@ export class AllegrexCPU {
         const sp = this.regs.getGpr(29);
         const spPhys = sp & 0x1FFFFFFF;
         if (spPhys >= MemoryRegion.RAM_START && spPhys < MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE) {
-          const stackDump: string[] = [];
-          // Dump from sp-0x60 to sp+0x60 to catch both the pre-epilogue and post-epilogue frames
+          // Dump from sp-0x60 to sp+0x60 to catch both the pre-epilogue and
+          // post-epilogue frames. The ASCII column makes stack-string corruption
+          // (e.g. a path overrunning a local buffer onto the saved $ra) obvious.
+          const rows: Record<string, { hex: string; ascii: string }> = {};
           for (let off = -0x60; off <= 0x60; off += 4) {
             try {
-              const val = this.bus.readU32(sp + off);
+              const val = this.bus.readU32(sp + off) >>> 0;
               const label = off >= 0 ? `sp+${off.toString(16).padStart(2,'0')}` : `sp-${(-off).toString(16).padStart(2,'0')}`;
-              stackDump.push(`[${label}]=0x${val.toString(16).padStart(8,'0')}`);
+              const ascii = [val & 0xff, (val >>> 8) & 0xff, (val >>> 16) & 0xff, (val >>> 24) & 0xff]
+                .map((b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : ".")).join("");
+              rows[label] = { hex: `0x${val.toString(16).padStart(8, "0")}`, ascii };
             } catch { /* skip invalid */ }
           }
-          log.error(`Stack dump: ${stackDump.join(' ')}`);
+          log.error(`Stack dump (sp=0x${sp.toString(16)}):`);
+          console.table(rows);
         }
 
         // Try to recover by killing the current thread and rescheduling.

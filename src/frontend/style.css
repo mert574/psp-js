@@ -383,6 +383,22 @@ details[open] .iso-tree__summary::before { content: "▼  "; }
   image-rendering: pixelated;
 }
 
+/* Fullscreen: fill the viewport, scale the canvas to fit with letterboxing. */
+.gameplay-screen:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  border: none;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.gameplay-screen:fullscreen #psp-canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
 /* ── Gameplay HUD overlay ─────────────────────────────────────────────────── */
 .gameplay-hud {
   position: absolute;

@@ -74,6 +74,11 @@ interface MpegContext {
   isAnalyzed: boolean;
   // Real decode (browser only); null when running the placeholder path.
   decoder: MpegMediaDecoder | null;
+  // YCbCr decode path (sceMpegAvcDecodeYCbCr): the decoded frame is held here
+  // between the decode call and the sceMpegAvcCsc call that writes it to the
+  // framebuffer. `null` means "decoded but no real frame, draw placeholder".
+  pendingFrame?: { rgba: Uint8Array | Uint8ClampedArray; width: number; height: number } | null;
+  hasPendingFrame?: boolean;
 }
 
 /** SceMpegAu: pts/dts stored high-word-first (PPSSPP SceMpegAu::read/write). */
@@ -411,6 +416,65 @@ export function registerMpegHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
+  // Write a decoded frame (or the black+label placeholder) into the framebuffer
+  // at `dest`, optionally offset to (rx,ry) within a `frameWidth`-stride buffer.
+  function drawVideoFrame(
+    bus: MemoryBus, ctx: MpegContext, dest: number, frameWidth: number,
+    realFrame: { rgba: Uint8Array | Uint8ClampedArray; width: number; height: number } | null,
+    rx = 0, ry = 0,
+  ): void {
+    if (dest === 0) return;
+    const h = ctx.frameHeight || 272;
+    const w = Math.min(frameWidth, ctx.frameWidth || frameWidth);
+    const bpp = ctx.videoPixelMode === 3 ? 4 : 2;
+    const base = (dest + (ry * frameWidth + rx) * bpp) >>> 0;
+    if (realFrame) {
+      packRgbaToFrame(bus, base, frameWidth, h, ctx.videoPixelMode,
+        realFrame.rgba, realFrame.width, realFrame.height);
+      return;
+    }
+    // Placeholder: black fill + the video name/frame counter overlay.
+    if (ctx.videoPixelMode === 3) {
+      for (let y = 0; y < h; y++) {
+        const row = base + y * frameWidth * 4;
+        for (let x = 0; x < w; x++) bus.writeU32(row + x * 4, 0xff000000);
+      }
+    } else {
+      const black = ctx.videoPixelMode === 1 ? 0x8000 : ctx.videoPixelMode === 2 ? 0xf000 : 0x0000;
+      for (let y = 0; y < h; y++) {
+        const row = base + y * frameWidth * 2;
+        for (let x = 0; x < w; x++) bus.writeU16(row + x * 2, black);
+      }
+    }
+    const name = kernel.lastVideoPath ?? "MPEG VIDEO";
+    const total = Math.max(1, Math.round((ctx.mpegLastTimestamp - ctx.mpegFirstTimestamp) / VIDEO_TIMESTAMP_STEP));
+    const info = `${ctx.frameWidth}X${ctx.frameHeight}  ${ctx.videoFrameCount}/${total}`;
+    const scale = 2;
+    const ty = Math.max(0, (h >> 1) - GLYPH_H * scale);
+    drawText(bus, base, frameWidth, h, ctx.videoPixelMode,
+      Math.max(0, (w - textWidth(name, scale)) >> 1), ty, name, scale);
+    drawText(bus, base, frameWidth, h, ctx.videoPixelMode,
+      Math.max(0, (w - textWidth(info, scale)) >> 1), ty + GLYPH_H * scale + scale * 2, info, scale, [160, 160, 160, 255]);
+  }
+
+  // Advance one video frame: consume packets, pull a decoded frame from the
+  // real decoder (browser) or null (headless), advance count + AU pts. Returns
+  // the frame to draw, or false if there's no data (caller returns FATAL).
+  function stepVideo(bus: MemoryBus, ctx: MpegContext, auAddr: number):
+    { rgba: Uint8Array | Uint8ClampedArray; width: number; height: number } | null | false {
+    const rbAddr = ctx.ringbufferAddr;
+    const packetsRead = bus.readU32(rbAddr + RB_PACKETS_READ) | 0;
+    if (packetsRead === 0 || ctx.endOfVideoReached) return false;
+    const avail = bus.readU32(rbAddr + RB_PACKETS_AVAIL) | 0;
+    bus.writeU32(rbAddr + RB_PACKETS_AVAIL, Math.max(0, avail - ctx.packetsPerVideoFrame));
+    const frame = ctx.decoder?.takeVideoFrame() ?? null;
+    ctx.videoFrameCount++;
+    const { esBuffer } = readAuEs(bus, auAddr);
+    const pts = ctx.mpegFirstTimestamp + (ctx.videoFrameCount - 1) * VIDEO_TIMESTAMP_STEP;
+    writeAu(bus, auAddr, pts, pts - VIDEO_TIMESTAMP_STEP, esBuffer, MPEG_AVC_ES_SIZE);
+    return frame;
+  }
+
   // sceMpegAvcDecode(mpeg, auAddr, frameWidth, bufferAddr, initAddr)
   kernel.register(PSMF.sceMpegAvcDecode, (regs, bus) => {
     const ctx = getCtx(regs.getGpr(4));
@@ -420,61 +484,68 @@ export function registerMpegHLE(kernel: HLEKernel): void {
     const initAddr = regs.getGpr(8) >>> 0;  // 5th arg in $t0
     if (!ctx) { regs.setGpr(2, -1 >>> 0); return; }
     if (frameWidth === 0) frameWidth = ctx.defaultFrameWidth || ctx.frameWidth;
-    const rbAddr = ctx.ringbufferAddr;
-    const packetsRead = bus.readU32(rbAddr + RB_PACKETS_READ) | 0;
-    if (packetsRead === 0 || ctx.endOfVideoReached) {
-      regs.setGpr(2, SCE_MPEG_ERROR_AVC_DECODE_FATAL);
-      return;
-    }
 
-    // Consume packets (no demuxer: average rate computed from the PSMF header)
-    const avail = bus.readU32(rbAddr + RB_PACKETS_AVAIL) | 0;
-    bus.writeU32(rbAddr + RB_PACKETS_AVAIL, Math.max(0, avail - ctx.packetsPerVideoFrame));
+    const frame = stepVideo(bus, ctx, auAddr);
+    if (frame === false) { regs.setGpr(2, SCE_MPEG_ERROR_AVC_DECODE_FATAL); return; }
 
-    // Real decoded frame if libav has one ready, else the placeholder
-    // black-frame-with-label so the user still sees which video is "playing".
-    const dest = bus.readU32(bufferAddr) >>> 0;
-    if (dest !== 0) {
-      const h = ctx.frameHeight || 272;
-      const w = Math.min(frameWidth, ctx.frameWidth || frameWidth);
-      const realFrame = ctx.decoder?.takeVideoFrame() ?? null;
-      if (realFrame) {
-        packRgbaToFrame(bus, dest, frameWidth, h, ctx.videoPixelMode,
-          realFrame.rgba, realFrame.width, realFrame.height);
-      } else {
-        if (ctx.videoPixelMode === 3) {
-          for (let y = 0; y < h; y++) {
-            const row = dest + y * frameWidth * 4;
-            for (let x = 0; x < w; x++) bus.writeU32(row + x * 4, 0xff000000);
-          }
-        } else {
-          const bpp = 2;
-          const black = ctx.videoPixelMode === 1 ? 0x8000 : ctx.videoPixelMode === 2 ? 0xf000 : 0x0000;
-          for (let y = 0; y < h; y++) {
-            const row = dest + y * frameWidth * bpp;
-            for (let x = 0; x < w; x++) bus.writeU16(row + x * 2, black);
-          }
-        }
-
-        const name = kernel.lastVideoPath ?? "MPEG VIDEO";
-        const total = Math.max(1, Math.round((ctx.mpegLastTimestamp - ctx.mpegFirstTimestamp) / VIDEO_TIMESTAMP_STEP));
-        const info = `${ctx.frameWidth}X${ctx.frameHeight}  ${ctx.videoFrameCount + 1}/${total}`;
-        const scale = 2;
-        const ty = Math.max(0, (h >> 1) - GLYPH_H * scale);
-        drawText(bus, dest, frameWidth, h, ctx.videoPixelMode,
-          Math.max(0, (w - textWidth(name, scale)) >> 1), ty, name, scale);
-        drawText(bus, dest, frameWidth, h, ctx.videoPixelMode,
-          Math.max(0, (w - textWidth(info, scale)) >> 1), ty + GLYPH_H * scale + scale * 2, info, scale, [160, 160, 160, 255]);
-      }
-    }
-
-    ctx.videoFrameCount++;
-    const { esBuffer } = readAuEs(bus, auAddr);
-    const pts = ctx.mpegFirstTimestamp + (ctx.videoFrameCount - 1) * VIDEO_TIMESTAMP_STEP;
-    writeAu(bus, auAddr, pts, pts - VIDEO_TIMESTAMP_STEP, esBuffer, MPEG_AVC_ES_SIZE);
+    drawVideoFrame(bus, ctx, bus.readU32(bufferAddr) >>> 0, frameWidth, frame);
     if (initAddr) bus.writeU32(initAddr, 1); // avcDecodeResult = MPEG_AVC_DECODE_SUCCESS
     regs.setGpr(2, 0);
   });
+
+  // sceMpegAvcDecodeYCbCr(mpeg, auAddr, bufferAddr, initAddr) — PPSSPP sceMpeg.cpp:1240
+  // Decodes one frame but does NOT draw; the frame is written to the framebuffer
+  // later by sceMpegAvcCsc. Burnout Legends uses this path instead of AvcDecode.
+  kernel.register(PSMF.sceMpegAvcDecodeYCbCr, (regs, bus) => {
+    const ctx = getCtx(regs.getGpr(4));
+    const auAddr = regs.getGpr(5) >>> 0;
+    const initAddr = regs.getGpr(7) >>> 0;
+    if (!ctx) { regs.setGpr(2, -1 >>> 0); return; }
+
+    const frame = stepVideo(bus, ctx, auAddr);
+    if (frame === false) { regs.setGpr(2, SCE_MPEG_ERROR_AVC_DECODE_FATAL); return; }
+
+    ctx.pendingFrame = frame;
+    ctx.hasPendingFrame = true;
+    if (initAddr) bus.writeU32(initAddr, 1); // avcFrameStatus = 1 (frame ready)
+    regs.setGpr(2, 0);
+  });
+
+  // sceMpegAvcCsc(mpeg, sourceAddr, rangeAddr, frameWidth, destAddr) — sceMpeg.cpp:1884
+  // Color-space-converts the frame decoded by sceMpegAvcDecodeYCbCr into destAddr
+  // at the (x,y,w,h) rectangle from rangeAddr.
+  kernel.register(PSMF.sceMpegAvcCsc, (regs, bus) => {
+    const ctx = getCtx(regs.getGpr(4));
+    const rangeAddr = regs.getGpr(6) >>> 0;
+    let frameWidth = regs.getGpr(7) | 0;
+    const destAddr = regs.getGpr(8) >>> 0; // 5th arg in $t0
+    if (!ctx) { regs.setGpr(2, -1 >>> 0); return; }
+    if (frameWidth === 0) frameWidth = ctx.defaultFrameWidth || ctx.frameWidth;
+    const rx = rangeAddr ? bus.readU32(rangeAddr) | 0 : 0;
+    const ry = rangeAddr ? bus.readU32(rangeAddr + 4) | 0 : 0;
+    if (rx < 0 || ry < 0) { regs.setGpr(2, SCE_MPEG_ERROR_INVALID_VALUE); return; }
+    drawVideoFrame(bus, ctx, destAddr, frameWidth, ctx.pendingFrame ?? null, rx, ry);
+    ctx.hasPendingFrame = false;
+    regs.setGpr(2, 0);
+  });
+
+  // sceMpegAvcQueryYCbCrSize(mpeg, mode, width, height, resultAddr) — sceMpeg.cpp
+  // Returns the YCbCr work-buffer size the game must allocate.
+  kernel.register(PSMF.sceMpegAvcQueryYCbCrSize, (regs, bus) => {
+    const width = regs.getGpr(6) | 0;
+    const height = regs.getGpr(7) | 0;
+    const resultAddr = regs.getGpr(8) >>> 0; // 5th arg in $t0
+    if ((width & 15) !== 0 || (height & 15) !== 0 || height > 272 || width > 480) {
+      regs.setGpr(2, SCE_MPEG_ERROR_INVALID_VALUE);
+      return;
+    }
+    const size = (width / 2) * (height / 2) * 6 + 128;
+    if (resultAddr) bus.writeU32(resultAddr, size);
+    regs.setGpr(2, 0);
+  });
+
+  // sceMpegAvcInitYCbCr(mpeg, mode, width, height, ycbcr_addr) — returns 0
+  kernel.register(PSMF.sceMpegAvcInitYCbCr, (regs) => { regs.setGpr(2, 0); });
 
   // sceMpegAvcDecodeStop(mpeg, frameWidth, bufferAddr, statusAddr)
   kernel.register(PSMF.sceMpegAvcDecodeStop, (regs, bus) => {
