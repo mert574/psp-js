@@ -935,6 +935,41 @@ export class HLEKernel {
    * is marked READY and will resume when the other thread blocks or yields.
    * Returns true if another thread was scheduled.
    */
+  /**
+   * Preempt the running thread if a READY thread outranks it (lower priority
+   * number = higher priority). PSP scheduling is preemptive, but ours is
+   * otherwise cooperative (only reschedules at block/yield), so a compute-bound
+   * low-priority thread can starve higher-priority READY threads. God of War
+   * hit this: its main thread (prio 76) ran a long per-frame loop and never
+   * yielded, so its loader threads (prio 46/56) sat READY and got 0% CPU.
+   * Returns true if a switch happened.
+   */
+  preemptIfHigherPriorityReady(regs: AllegrexRegisters): boolean {
+    // Never switch threads while interrupts/dispatch are suspended
+    // (sceKernelCpuSuspendIntr) — the running thread holds the CPU until it
+    // resumes, even against a higher-priority READY thread. The pspautotests
+    // alarm test relies on this: main suspends interrupts and busy-loops, and
+    // neither the alarm handler nor the higher-priority worker may run until it
+    // resumes.
+    if (!this.interruptsEnabled) return false;
+    const cur = this.threads.get(this.currentThreadId);
+    if (!cur || cur.state !== ThreadState.RUNNING) return false;
+    let best: Thread | null = null;
+    for (const t of this.threads.values()) {
+      if (t.state === ThreadState.READY && t.priority < cur.priority) {
+        if (!best || t.priority < best.priority) best = t;
+      }
+    }
+    if (!best) return false;
+    cur.state = ThreadState.READY;
+    this.saveContext(cur, regs);
+    best.state = ThreadState.RUNNING;
+    this.currentThreadId = best.id;
+    this.restoreContext(best, regs);
+    regs.setGpr(26, best.k0);
+    return true;
+  }
+
   yieldToOtherThread(regs: AllegrexRegisters): boolean {
     const current = this.threads.get(this.currentThreadId);
     if (!current) return false;

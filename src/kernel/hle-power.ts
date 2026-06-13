@@ -204,7 +204,16 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   // sceUmdWaitDriveStat — disc always ready, stat always met
   kernel.register(UMD.sceUmdWaitDriveStat, (regs) => { regs.setGpr(2, 0); });
   kernel.register(UMD.sceUmdWaitDriveStatCB, (regs) => { regs.setGpr(2, 0); });
-  kernel.register(UMD.sceUmdWaitDriveStatWithTimer, (regs) => { regs.setGpr(2, 0); });
+  // sceUmdWaitDriveStatWithTimer — PPSSPP sceUmd.cpp:404-426: when the stat is
+  // already met (always, in our HLE: disc present/ready/readable) it calls
+  // hleReSchedule rather than returning straight away. A game that busy-polls
+  // this (God of War's loader does, ~372x/frame) otherwise never yields, so its
+  // worker threads sit READY and starve. Set v0 before yielding (the yielding
+  // thread resumes with this return value).
+  kernel.register(UMD.sceUmdWaitDriveStatWithTimer, (regs) => {
+    regs.setGpr(2, 0);
+    kernel.yieldToOtherThread(regs);
+  });
 
   // sceKernelPowerTick(tickType) — PPSSPP scePower.cpp: just returns 0
   kernel.register(POWER.sceKernelPowerTick, (regs) => {

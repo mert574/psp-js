@@ -482,6 +482,10 @@ export class PSPEmulator {
       }
 
       this.hle.idleBreak = false;
+      // PSP is preemptive: before running the slice, make sure the highest-
+      // priority READY thread is the one executing (a compute-bound low-prio
+      // thread otherwise starves higher-prio READY threads — see God of War).
+      this.hle.preemptIfHigherPriorityReady(this.cpu.regs);
       const delta = this.coreTiming.nextEventDelta();
       const slice = isFinite(delta) && delta > 0
         ? Math.min(delta, PSPEmulator.MAX_SLICE)

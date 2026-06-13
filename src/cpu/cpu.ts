@@ -9,6 +9,12 @@ import { Logger } from "../utils/logger.js";
 
 const log = Logger.get("CPU");
 
+// Hoisted physical-address bounds for the per-step PC check (hot path).
+const CPU_RAM_START = MemoryRegion.RAM_START;
+const CPU_RAM_END = MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE;
+const CPU_SCRATCH_START = MemoryRegion.SCRATCHPAD_START;
+const CPU_SCRATCH_END = MemoryRegion.SCRATCHPAD_START + MemoryRegion.SCRATCHPAD_SIZE;
+
 /**
  * AllegrexCPU
  *
@@ -42,6 +48,11 @@ export class AllegrexCPU {
   /** When true, the *next* instruction is in a branch-delay slot. */
   inDelaySlot: boolean = false;
   delaySlotTarget: number = 0;
+
+  /** Syscall code set by the SYSCALL instruction, or -1 if none this step.
+   *  Flag-based instead of a thrown exception: ~2000 syscalls/frame as JS
+   *  throws was a real hot-path cost (stack unwinding + deopt). */
+  pendingSyscall: number = -1;
 
   /** Set to true when step() encounters an unrecoverable fault. */
   stepFaulted: boolean = false;
@@ -87,13 +98,13 @@ export class AllegrexCPU {
 
     // Catch execution outside valid code regions.
     // PPSSPP: PSP_GetKernelMemoryBase()=RAM_START, PSP_GetUserMemoryEnd()=RAM_START+g_MemorySize.
+    // Bounds are module-level consts (CPU_RAM_*/CPU_SCRATCH_*) so this stays a
+    // few comparisons per step; scratchpad is only checked off the common path.
     const phys = pc & 0x1FFFFFFF;
-    const RAM_END = MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE;
-    const inRAM = phys >= MemoryRegion.RAM_START && phys < RAM_END;
-    {
-      const inScratch = phys >= MemoryRegion.SCRATCHPAD_START &&
-                        phys <  MemoryRegion.SCRATCHPAD_START + MemoryRegion.SCRATCHPAD_SIZE;
-      if (!inRAM && !inScratch) {
+    const inRAM = phys >= CPU_RAM_START && phys < CPU_RAM_END;
+    if (!inRAM) {
+      const inScratch = phys >= CPU_SCRATCH_START && phys < CPU_SCRATCH_END;
+      if (!inScratch) {
         const ra = this.regs.getGpr(31);
         const trace = [];
         for (let i = Math.max(0, this.traceIdx - 64); i < this.traceIdx; i++) {
@@ -141,65 +152,68 @@ export class AllegrexCPU {
     const delayTarget = this.delaySlotTarget;
     this.inDelaySlot = false;
 
-    let syscallHandled = false;
+    this.pendingSyscall = -1;
     try {
       executeInstruction(this, instr);
     } catch (e) {
-      if (e instanceof SyscallException) {
-        syscallHandled = true;
-        // SYSCALL is typically in a branch delay slot (JR $RA; SYSCALL).
-        // Resolve the branch *before* dispatching so the HLE handler sees
-        // the correct return PC when it saves thread context.
-        if (inDelaySlot) {
-          this.regs.pc = delayTarget;
-        }
-        if (this.hle) {
-          const callerThreadId = this.hle.currentThreadId;
-          this.hle.dispatch(e.code, this.regs);
-          if (this.stepFaulted) return false;
-          // Clobber caller-saved registers to 0xDEADBEEF after syscall,
-          // matching PPSSPP's hleFinishSyscall behavior.
-          // Skip $v0/$v1 (return values), $s0-$s7 (callee-saved), $k0-$k1/$gp/$sp/$fp/$ra.
-          // Don't clobber when a MipsCall is active — the syscall handler set up
-          // $a0-$a2 for the callback, and clobbering would destroy them.
-          const DEADBEEF = 0xDEADBEEF;
-          const callerRegs = [1, 4,5,6,7, 8,9,10,11,12,13,14,15, 24,25];
-          if (this.hle.hasMipsCall) {
-            // MipsCall dispatched — callback args are live, don't clobber
-          } else if (this.hle.currentThreadId === callerThreadId) {
-            // No thread switch — clobber live registers directly
-            for (const r of callerRegs) this.regs.setGpr(r, DEADBEEF);
-            this.regs.hi = DEADBEEF;
-            this.regs.lo = DEADBEEF;
-          } else {
-            // Thread switch occurred — clobber the saved context of the calling thread
-            const callerThread = this.hle.threads.get(callerThreadId);
-            if (callerThread) {
-              for (const r of callerRegs) callerThread.context.gpr[r] = DEADBEEF;
-              callerThread.context.hi = DEADBEEF;
-              callerThread.context.lo = DEADBEEF;
-            }
-          }
+      // Only real faults reach here now — SYSCALL uses cpu.pendingSyscall, not a
+      // throw, so the common case never pays exception-unwinding cost.
+      const trace = [];
+      for (let i = Math.max(0, this.traceIdx - 128); i < this.traceIdx; i++) {
+        trace.push('0x' + this.traceBuffer[i & 127]!.toString(16));
+      }
+      log.error(`Execute fault at PC=0x${pc.toString(16)}: ${e}`);
+      log.error(`Recent PCs: ${trace.join(' → ')}`);
+      this.stepFaulted = true;
+      return false;
+    }
+
+    if (this.pendingSyscall >= 0) {
+      const code = this.pendingSyscall;
+      this.pendingSyscall = -1;
+      // SYSCALL is typically in a branch delay slot (JR $RA; SYSCALL).
+      // Resolve the branch *before* dispatching so the HLE handler sees
+      // the correct return PC when it saves thread context.
+      if (inDelaySlot) {
+        this.regs.pc = delayTarget;
+      }
+      if (this.hle) {
+        const callerThreadId = this.hle.currentThreadId;
+        this.hle.dispatch(code, this.regs);
+        if (this.stepFaulted) return false;
+        // Clobber caller-saved registers to 0xDEADBEEF after syscall,
+        // matching PPSSPP's hleFinishSyscall behavior.
+        // Skip $v0/$v1 (return values), $s0-$s7 (callee-saved), $k0-$k1/$gp/$sp/$fp/$ra.
+        // Don't clobber when a MipsCall is active — the syscall handler set up
+        // $a0-$a2 for the callback, and clobbering would destroy them.
+        const DEADBEEF = 0xDEADBEEF;
+        const callerRegs = [1, 4,5,6,7, 8,9,10,11,12,13,14,15, 24,25];
+        if (this.hle.hasMipsCall) {
+          // MipsCall dispatched — callback args are live, don't clobber
+        } else if (this.hle.currentThreadId === callerThreadId) {
+          // No thread switch — clobber live registers directly
+          for (const r of callerRegs) this.regs.setGpr(r, DEADBEEF);
+          this.regs.hi = DEADBEEF;
+          this.regs.lo = DEADBEEF;
         } else {
-          log.warn(`SYSCALL 0x${e.code.toString(16)} with no HLE kernel attached`);
-          this.regs.setGpr(2, 0x80020001);
+          // Thread switch occurred — clobber the saved context of the calling thread
+          const callerThread = this.hle.threads.get(callerThreadId);
+          if (callerThread) {
+            for (const r of callerRegs) callerThread.context.gpr[r] = DEADBEEF;
+            callerThread.context.hi = DEADBEEF;
+            callerThread.context.lo = DEADBEEF;
+          }
         }
       } else {
-        const trace = [];
-        for (let i = Math.max(0, this.traceIdx - 128); i < this.traceIdx; i++) {
-          trace.push('0x' + this.traceBuffer[i & 127]!.toString(16));
-        }
-        log.error(`Execute fault at PC=0x${pc.toString(16)}: ${e}`);
-        log.error(`Recent PCs: ${trace.join(' → ')}`);
-        this.stepFaulted = true;
-        return false;
+        log.warn(`SYSCALL 0x${code.toString(16)} with no HLE kernel attached`);
+        this.regs.setGpr(2, 0x80020001);
       }
+      // A syscall resolved the delay slot above; don't re-jump below.
+      return true;
     }
 
     // After a delay-slot instruction, jump to the branch target.
-    // Skip if a syscall already resolved the delay slot and the HLE handler
-    // may have changed PC (e.g. thread switch via restoreContext).
-    if (inDelaySlot && !syscallHandled) {
+    if (inDelaySlot) {
       this.regs.pc = delayTarget;
     }
 
