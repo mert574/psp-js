@@ -15,6 +15,16 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   let busFreqMhz = 111;
   let pllFreqMhz = 222;
 
+  // PPSSPP scePower.cpp:96 PowerPllMhzToHz — the PLL only snaps to these steps,
+  // so a requested MHz rounds up to the next supported frequency.
+  const powerPllMhzToHz = (mhz: number): number => {
+    if (mhz <= 190) return 190285721;
+    if (mhz <= 222) return 222000000;
+    if (mhz <= 266) return 266399994;
+    if (mhz <= 333) return 333000000;
+    return mhz * 1000000;
+  };
+
   // Volatile RAM lock state (PPSSPP scePower.cpp: KernelVolatileMemLock)
   // Base: 0x08400000, size: 0x00400000 (4 MB) — always available in HLE
   let volatileMemLocked = false;
@@ -81,6 +91,13 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   // scePowerGetBusClockFrequencyInt
   kernel.register(POWER.scePowerGetBusClockFrequencyInt, (regs) => {
     regs.setGpr(2, busFreqMhz);
+  });
+
+  // scePowerGetPllClockFrequencyInt — PPSSPP scePower.cpp:520 returns
+  // pllFreq/1000000, where pllFreq is the requested MHz snapped to the PLL's
+  // fixed steps then truncated back to MHz (190/222/266/333).
+  kernel.register(POWER.scePowerGetPllClockFrequencyInt, (regs) => {
+    regs.setGpr(2, Math.floor(powerPllMhzToHz(pllFreqMhz) / 1_000_000));
   });
 
   // scePowerSetClockFrequency(pllfreq, cpufreq, busfreq)
@@ -272,7 +289,6 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   kernel.stub(POWER.scePowerGetInnerTemp);
   kernel.stub(POWER.scePowerGetLowBatteryCapacity);
   kernel.stub(POWER.scePowerGetPllClockFrequencyFloat);
-  kernel.stub(POWER.scePowerGetPllClockFrequencyInt);
   kernel.stub(POWER.scePowerGetPowerSwMode);
   kernel.stub(POWER.scePowerGetResumeCount);
   kernel.stub(POWER.scePowerIdleTimerDisable);

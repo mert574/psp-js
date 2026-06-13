@@ -39,8 +39,11 @@ const SCE_ERROR_ATRAC_NO_ATRACID           = 0x80630003;
 const SCE_ERROR_ATRAC_INVALID_CODECTYPE    = 0x80630004;
 const SCE_ERROR_ATRAC_BAD_ATRACID          = 0x80630005;
 const SCE_ERROR_ATRAC_ALL_DATA_LOADED      = 0x80630009;
+const SCE_ERROR_ATRAC_NO_DATA              = 0x80630010;
 const SCE_ERROR_ATRAC_INCORRECT_READ_SIZE  = 0x80630013;
 const SCE_ERROR_ATRAC_BAD_ALIGNMENT        = 0x80630014;
+const SCE_ERROR_ATRAC_IS_LOW_LEVEL         = 0x80630031;
+const SCE_ERROR_ATRAC_IS_FOR_SCESAS        = 0x80630040;
 
 const PSP_CODEC_AT3PLUS = 0x00001000;
 const PSP_CODEC_AT3     = 0x00001001;
@@ -851,9 +854,23 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
+  // ── sceAtracIsSecondBufferNeeded(id) ─────────────────────────────────────
+  // PPSSPP sceAtrac.cpp:851 — AtracValidateManaged first, then returns 1 only
+  // when the buffer state is STREAMED_LOOP_WITH_TRAILER (a second buffer holds
+  // the loop tail). Our HLE buffers the whole stream (ALL_DATA_LOADED), so this
+  // is normally 0. Returns true whether or not a second buffer is already set.
+  kernel.register(ATRAC.sceAtracIsSecondBufferNeeded, (regs) => {
+    const ctx = atracContexts.get(regs.getGpr(4));
+    // AtracValidateManaged (sceAtrac.cpp:280)
+    if (!ctx) { regs.setGpr(2, SCE_ERROR_ATRAC_BAD_ATRACID); return; }
+    if (ctx.status === AtracStatus.NO_DATA)   { regs.setGpr(2, SCE_ERROR_ATRAC_NO_DATA); return; }
+    if (ctx.status === AtracStatus.LOW_LEVEL) { regs.setGpr(2, SCE_ERROR_ATRAC_IS_LOW_LEVEL); return; }
+    if (ctx.status === AtracStatus.FOR_SCESAS){ regs.setGpr(2, SCE_ERROR_ATRAC_IS_FOR_SCESAS); return; }
+    regs.setGpr(2, ctx.status === AtracStatus.STREAMED_LOOP_WITH_TRAILER ? 1 : 0);
+  });
+
   // ── Stubs: ATRAC ──────────────────────────────────────────────────────────
   kernel.stub(ATRAC._sceAtracGetContextAddress, 1);
-  kernel.stub(ATRAC.sceAtracIsSecondBufferNeeded);
   kernel.stub(ATRAC.sceAtracLowLevelDecode);
   kernel.stub(ATRAC.sceAtracLowLevelInitDecoder);
   kernel.stub(ATRAC.sceAtracReleaseResources);
