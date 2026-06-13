@@ -284,14 +284,6 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
     const bufWidth = frameWidth > 0 ? frameWidth : 512;
     writeFrameToMemory(frame, bus, displayBuf, bufWidth, player);
 
-    // WebGL: the write above only touched VRAM, not the FBO the present samples,
-    // so without this the video is invisible (only the software renderer, which
-    // reads VRAM directly, shows it). Mirror the frame into the covering FBO.
-    // PsmfPlayer frames are ABGR8888 (format 3).
-    const gl = kernel.geProcessor?.webglRenderer;
-    if (gl) gl.uploadVideoFrame(bus.vramBuffer, displayBuf, bufWidth, 3, 0, 0,
-      frame.bitmap.width, frame.bitmap.height);
-
     // Write PTS back to struct
     const pts = frame.pts;
     bus.writeU32(videoDataAddr + 8, Math.floor(pts / 0x100000000)); // high
