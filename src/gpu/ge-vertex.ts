@@ -173,21 +173,38 @@ export function readVertices(
       v.nz = readFloat(bus, vAddr + off); off += 4;
     }
 
-    // Position
+    // Position. Through-mode (raster) coords are NOT the same as transform-mode
+    // model coords: PPSSPP Step_Pos*Through + ReadPosThrough keep x,y as signed
+    // screen pixels but treat z as an UNSIGNED 0..65535 screen depth normalized
+    // to [0,1]. We used to sign-extend z like a model coord, turning a far-plane
+    // 0xFFFF into -1; the renderer's z*2-1 then sent it to clip-space -3 and the
+    // whole quad got clipped away (black in WebGL, fine in software which ignores
+    // through-mode z). Match PPSSPP so through z lands in [0,1] like transform z.
     if (posFmt === 1) { // s8
-      v.x = (bus.readU8(vAddr + off) << 24) >> 24; off++;
-      v.y = (bus.readU8(vAddr + off) << 24) >> 24; off++;
-      v.z = (bus.readU8(vAddr + off) << 24) >> 24; off++;
+      if (through) {
+        // PPSSPP Step_PosS8Through: 8-bit through positions always decode to 0.
+        v.x = 0; v.y = 0; v.z = 0; off += 3;
+      } else {
+        v.x = (bus.readU8(vAddr + off) << 24) >> 24; off++;
+        v.y = (bus.readU8(vAddr + off) << 24) >> 24; off++;
+        v.z = (bus.readU8(vAddr + off) << 24) >> 24; off++;
+      }
     } else if (posFmt === 2) { // s16
       align2();
       v.x = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
       v.y = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
-      v.z = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
+      if (through) {
+        v.z = bus.readU16(vAddr + off) / 65535.0; off += 2; // unsigned u16 → [0,1]
+      } else {
+        v.z = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
+      }
     } else if (posFmt === 3) { // float
       align4();
       v.x = readFloat(bus, vAddr + off); off += 4;
       v.y = readFloat(bus, vAddr + off); off += 4;
-      v.z = readFloat(bus, vAddr + off); off += 4;
+      const fz = readFloat(bus, vAddr + off); off += 4;
+      // PPSSPP Step_PosFloatThrough clamps z to [0,65535]; ReadPosThrough → [0,1].
+      v.z = through ? Math.max(0, Math.min(65535, fz)) / 65535.0 : fz;
     }
 
     vertices.push(v);
