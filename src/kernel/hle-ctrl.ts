@@ -145,10 +145,37 @@ export function registerCtrlHLE(kernel: HLEKernel): void {
     regs.setGpr(2, bufs);
   });
 
+  // Idle-cancel thresholds (analog-stick movement that resets/cancels the auto-
+  // suspend idle timer). We don't run an idle timer, but store + return the values
+  // faithfully. PPSSPP sceCtrl.cpp:476 / :486. Default -1 = disabled.
+  let ctrlIdleReset = -1;
+  let ctrlIdleBack = -1;
+
+  // sceCtrlSetIdleCancelThreshold(idleReset, idleBack) — both in [-1, 128].
+  kernel.register(CTRL.sceCtrlSetIdleCancelThreshold, (regs) => {
+    const idleReset = regs.getGpr(4) | 0; // signed
+    const idleBack = regs.getGpr(5) | 0;
+    if (idleReset < -1 || idleBack < -1 || idleReset > 128 || idleBack > 128) {
+      regs.setGpr(2, 0x800001fe); // SCE_KERNEL_ERROR_INVALID_VALUE
+      return;
+    }
+    ctrlIdleReset = idleReset;
+    ctrlIdleBack = idleBack;
+    regs.setGpr(2, 0);
+  });
+
+  // sceCtrlGetIdleCancelThreshold(idleResetPtr, idleBackPtr) — write back the stored
+  // thresholds (PPSSPP sceCtrl.cpp:486).
+  kernel.register(CTRL.sceCtrlGetIdleCancelThreshold, (regs, bus) => {
+    const idleResetPtr = regs.getGpr(4) >>> 0;
+    const idleBackPtr = regs.getGpr(5) >>> 0;
+    if (idleResetPtr !== 0) bus.writeU32(idleResetPtr, ctrlIdleReset);
+    if (idleBackPtr !== 0) bus.writeU32(idleBackPtr, ctrlIdleBack);
+    regs.setGpr(2, 0);
+  });
+
   // ── Stubs: CTRL ──────────────────────────────────────────────────────────
-  kernel.stub(CTRL.sceCtrlSetIdleCancelThreshold);
   kernel.stub(CTRL.sceCtrlClearRapidFire);
-  kernel.stub(CTRL.sceCtrlGetIdleCancelThreshold);
   kernel.stub(CTRL.sceCtrlGetSuspendingExtraSamples);
   kernel.stub(CTRL.sceCtrlInit, 1);
   kernel.stub(CTRL.sceCtrlSetRapidFire);

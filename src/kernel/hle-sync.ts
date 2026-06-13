@@ -1437,6 +1437,14 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   // sceKernelSetCompiledSdkVersion380_390 — NID missing from nids.ts, keep as-is
   // kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion380_390, ...);
 
+  // sceKernelSetCompiledSdkVersion500_505 — PPSSPP sceKernelMemory.cpp:1125 just
+  // records the SDK version (with a range warning we skip), same as the family above.
+  kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion500_505, (regs) => {
+    kernel.compiledSdkVersion = regs.getGpr(4);
+    log.debug(`sceKernelSetCompiledSdkVersion500_505(0x${kernel.compiledSdkVersion.toString(16)})`);
+    regs.setGpr(2, 0);
+  });
+
   // sceKernelGetCompiledSdkVersion
   kernel.register(SYSMEM.sceKernelGetCompiledSdkVersion, (regs) => {
     regs.setGpr(2, kernel.compiledSdkVersion);

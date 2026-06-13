@@ -418,6 +418,18 @@ export function registerMpegHLE(kernel: HLEKernel): void {
 
   // Write a decoded frame (or the black+label placeholder) into the framebuffer
   // at `dest`, optionally offset to (rx,ry) within a `frameWidth`-stride buffer.
+  // The video frame above is CPU-written into VRAM. In WebGL the present samples
+  // the FBO for that framebuffer address, which never sees CPU writes, so the
+  // video would be invisible. Mirror the written rect into the covering FBO.
+  // No-op without a WebGL renderer (headless / software path).
+  function mirrorVideoToFbo(
+    bus: MemoryBus, ctx: MpegContext, dest: number, frameWidth: number,
+    rx: number, ry: number, w: number, h: number,
+  ): void {
+    const gl = kernel.geProcessor?.webglRenderer;
+    if (gl) gl.uploadVideoFrame(bus.vramBuffer, dest, frameWidth, ctx.videoPixelMode, rx, ry, w, h);
+  }
+
   function drawVideoFrame(
     bus: MemoryBus, ctx: MpegContext, dest: number, frameWidth: number,
     realFrame: { rgba: Uint8Array | Uint8ClampedArray; width: number; height: number } | null,
@@ -431,6 +443,7 @@ export function registerMpegHLE(kernel: HLEKernel): void {
     if (realFrame) {
       packRgbaToFrame(bus, base, frameWidth, h, ctx.videoPixelMode,
         realFrame.rgba, realFrame.width, realFrame.height);
+      mirrorVideoToFbo(bus, ctx, dest, frameWidth, rx, ry, w, h);
       return;
     }
     // Placeholder: black fill + the video name/frame counter overlay.
@@ -455,6 +468,7 @@ export function registerMpegHLE(kernel: HLEKernel): void {
       Math.max(0, (w - textWidth(name, scale)) >> 1), ty, name, scale);
     drawText(bus, base, frameWidth, h, ctx.videoPixelMode,
       Math.max(0, (w - textWidth(info, scale)) >> 1), ty + GLYPH_H * scale + scale * 2, info, scale, [160, 160, 160, 255]);
+    mirrorVideoToFbo(bus, ctx, dest, frameWidth, rx, ry, w, h);
   }
 
   // Advance one video frame: consume packets, pull a decoded frame from the

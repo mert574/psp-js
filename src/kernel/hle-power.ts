@@ -95,6 +95,12 @@ export function registerPowerHLE(kernel: HLEKernel): void {
     setClock(regs.getGpr(4), regs.getGpr(5), regs.getGpr(6));
     regs.setGpr(2, 0);
   });
+  // scePowerSetClockFrequency350 — PPSSPP scePower.cpp:602 maps this NID to the
+  // same scePowerSetClockFrequency implementation.
+  kernel.register(POWER.scePowerSetClockFrequency350, (regs) => {
+    setClock(regs.getGpr(4), regs.getGpr(5), regs.getGpr(6));
+    regs.setGpr(2, 0);
+  });
   kernel.register(POWER.scePowerSetClockFrequencyAlt2, (regs) => {
     setClock(regs.getGpr(4), regs.getGpr(5), regs.getGpr(6));
     regs.setGpr(2, 0);
@@ -278,7 +284,6 @@ export function registerPowerHLE(kernel: HLEKernel): void {
   kernel.stub(POWER.scePowerRequestSuspend);
   kernel.stub(POWER.scePowerSetBusClockFrequency);
   kernel.stub(POWER.scePowerSetCallbackMode);
-  kernel.stub(POWER.scePowerSetClockFrequency350);
   kernel.stub(POWER.scePowerSetCpuClockFrequency);
   kernel.stub(POWER.scePowerSetPowerSwMode);
   kernel.stub(POWER.scePowerTick);

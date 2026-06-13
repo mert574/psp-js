@@ -245,16 +245,25 @@ export function registerIoHLE(kernel: HLEKernel): void {
     regs.setGpr(2, size);
   });
 
-  // Raw sector access: a game can open "disc0:/sce_lbn0xNN_size0xMM" (or decimal)
-  // to read bytes straight off the UMD by LBN, bypassing the file table. PPSSPP
-  // ISOFileSystem::OpenFile parses this. GTA's catalog reader uses it.
+  // Raw sector access: a game can open "disc0:/sce_lbn0x10_size0x100" to read
+  // bytes straight off the UMD by LBN, bypassing the file table. Burnout Legends
+  // uses bare hex with no 0x prefix ("sce_lbn7080_sizeee850"). PPSSPP parseLBN
+  // (ISOFileSystem.cpp:33) parses both values as hex via sscanf("%x"), 0x prefix
+  // optional — they are ALWAYS hex, never decimal. GTA's catalog reader uses it.
   // Returns the raw bytes if the path is an sce_lbn path and the mount can read
   // sectors, else null (caller falls back to normal lookup).
   function tryResolveLbn(path: string): Uint8Array | null {
-    const m = /sce_lbn(0x[0-9a-f]+|\d+)_size(0x[0-9a-f]+|\d+)/i.exec(path);
-    if (!m) return null;
-    const lbn = m[1]!.toLowerCase().startsWith("0x") ? parseInt(m[1]!, 16) : parseInt(m[1]!, 10);
-    const size = m[2]!.toLowerCase().startsWith("0x") ? parseInt(m[2]!, 16) : parseInt(m[2]!, 10);
+    const lbnPos = path.indexOf("sce_lbn");
+    if (lbnPos < 0) return null;
+    const sizePos = path.indexOf("_size", lbnPos);
+    if (sizePos < 0) return null;
+    // Leading hex run after each marker (optional 0x prefix), like sscanf("%x").
+    const hexAt = (s: string): number => {
+      const m = /^(?:0x)?([0-9a-f]+)/i.exec(s);
+      return m ? parseInt(m[1]!, 16) : 0;
+    };
+    const lbn = hexAt(path.slice(lbnPos + 7));        // after "sce_lbn"
+    const size = hexAt(path.slice(sizePos + 5));       // after "_size"
     return kernel.pspFs.readDiscSectors(lbn, size) ?? null;
   }
 
@@ -674,12 +683,14 @@ export function registerIoHLE(kernel: HLEKernel): void {
   });
 
   // sceIoAssign(alias, physical, filesystem, mode, argPtr, argSize) — PPSSPP sceIo.cpp:839
-  // Record alias → filesystem device so later opens through the alias resolve.
+  // PPSSPP does nothing here but log and return 0; it never re-points the device.
+  // Games call sceIoAssign("disc0:", "umd0:", "isofs0:", ...) as a formality, but
+  // disc0: is already mounted. Honoring the alias (disc0: → isofs0:) sent every
+  // later open to an unmounted device, so all game file reads returned ENOENT.
   kernel.register(IO.sceIoAssign, (regs, bus) => {
     const alias = kernel.readCString(bus, regs.getGpr(4));
     const filesystem = kernel.readCString(bus, regs.getGpr(6));
-    if (alias && filesystem) kernel.pspFs.assignDevice(alias, filesystem);
-    log.debug(`sceIoAssign: ${alias} → ${filesystem}`);
+    log.debug(`sceIoAssign: ${alias} → ${filesystem} (ignored, matches PPSSPP)`);
     regs.setGpr(2, 0);
   });
 

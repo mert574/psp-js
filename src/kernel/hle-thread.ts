@@ -1051,6 +1051,49 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     if (kernel.dispatchEnabled) kernel.preemptIfHigherPriorityReady(regs);
   });
 
+  // sceKernelGetThreadmanIdList(type, readBufPtr, readBufSize, idCountPtr) — PPSSPP
+  // sceKernelThread.cpp:1258. Lists the UIDs of kernel objects of `type` into the
+  // buffer (readBufSize = max id COUNT, not bytes), writes the full total to
+  // idCountPtr, returns min(total, readBufSize). Types 1-14 are object kinds;
+  // 64-67 filter threads by run state. We only track some object kinds — valid but
+  // untracked kinds list as empty; an out-of-range type is ILLEGAL_TYPE.
+  kernel.register(KERNEL.sceKernelGetThreadmanIdList, (regs, bus) => {
+    const type = regs.getGpr(4) >>> 0;
+    const readBufPtr = regs.getGpr(5) >>> 0;
+    const readBufSize = regs.getGpr(6) >>> 0;
+    const idCountPtr = regs.getGpr(7) >>> 0;
+    if (readBufSize >= 0x8000000) { regs.setGpr(2, 0x800200d3); return; } // ILLEGAL_ADDR
+
+    const threadsWith = (pred: (t: { state: ThreadState; waitType: WaitType }) => boolean): number[] => {
+      const out: number[] = [];
+      for (const [id, t] of kernel.threads) if (pred(t)) out.push(id);
+      return out;
+    };
+    let ids: number[];
+    switch (type) {
+      case 1:  ids = [...kernel.threads.keys()]; break;      // TMID_Thread
+      case 2:  ids = [...kernel.semaphores.keys()]; break;   // TMID_Semaphore
+      case 3:  ids = [...kernel.eventFlags.keys()]; break;   // TMID_EventFlag
+      case 6:  ids = [...kernel.fplPools.keys()]; break;     // TMID_Fpl
+      case 8:  ids = [...kernel.pspCallbacks.keys()]; break; // TMID_Callback
+      case 64: ids = threadsWith(t => t.state === ThreadState.WAITING && t.waitType === WaitType.SLEEP); break;
+      case 65: ids = threadsWith(t => t.state === ThreadState.WAITING && t.waitType === WaitType.DELAY); break;
+      case 66: ids = []; break; // TMID_SuspendThread — suspension isn't modeled
+      case 67: ids = threadsWith(t => t.state === ThreadState.DORMANT); break;
+      // Valid object kinds we don't track separately → empty list.
+      case 4: case 5: case 7: case 9: case 10: case 11: case 12: case 13: case 14:
+        ids = []; break;
+      default: regs.setGpr(2, 0x800201bb); return; // ILLEGAL_TYPE
+    }
+
+    const writeCount = Math.min(ids.length, readBufSize);
+    if (readBufPtr !== 0) {
+      for (let i = 0; i < writeCount; i++) bus.writeU32(readBufPtr + i * 4, ids[i]!);
+    }
+    if (idCountPtr !== 0) bus.writeU32(idCountPtr, ids.length);
+    regs.setGpr(2, writeCount);
+  });
+
   // sceKernelReferThreadStatus — PPSSPP sceKernelThread.cpp: fill SceKernelThreadInfo struct
   kernel.register(THREAD.sceKernelReferThreadStatus, (regs, bus) => {
     let thid = regs.getGpr(4);
@@ -1564,7 +1607,6 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelGetActiveDefaultExceptionHandler);
   kernel.stub(KERNEL.sceKernelGetModuleIdList);
   kernel.stub(KERNEL.sceKernelGetThreadStackFreeSize);
-  kernel.stub(KERNEL.sceKernelGetThreadmanIdList);
   kernel.stub(KERNEL.sceKernelGetThreadmanIdType);
   kernel.stub(KERNEL.sceKernelGetTlsAddr, 1);
   kernel.stub(KERNEL.sceKernelGetVTimerBaseWide);
@@ -1637,7 +1679,6 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(SYSMEM.sceKernelQueryMemoryInfo);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion395);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion401_402);
-  kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion500_505);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion507);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion600_602);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion606);

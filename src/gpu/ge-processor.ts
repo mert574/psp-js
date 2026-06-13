@@ -1795,6 +1795,8 @@ export class GEProcessor {
         x0, y0, x1, y1, colR, colG, colB, colA,
         this.clearColorWrite, this.clearAlphaWrite, this.clearDepthWrite,
         this.fbPtr, this.fbFormat, this.fbWidth || 512,
+        // PSP clear mode writes the rect's own z to depth (here already in [0,1]).
+        Math.max(0, Math.min(1, v1.z)),
       );
       return;
     }
