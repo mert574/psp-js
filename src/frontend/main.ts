@@ -1,6 +1,7 @@
 import "./style.css";
 import { Logger } from "../utils/logger.js";
-import { parseIsoFromFile, readFileFromIso, type IsoVolume, type IsoFile } from "../iso/iso9660.js";
+import { parseIso, parseIsoFromFile, readFile, readFileFromIso, type IsoVolume, type IsoFile } from "../iso/iso9660.js";
+import type { PspFileSystem } from "../kernel/psp-filesystem.js";
 import { setStatus, showError, clearError, showGameView, showFilePicker, showFileTree, clearGameVideo, clearGameAudio, playGameAudio, showAudioLoading, showAudioError, setMediaLoading, setGameCanvas, unlockAudio, showGameplayView, exitGameplayView, toggleGameplayHud, showAt3Loading, hideAt3Loading } from "./ui.js";
 import { InputHandler } from "./input.js";
 import { transcodeAt3, transcodePmfAudio } from "./pmf.js";
@@ -186,7 +187,7 @@ bootBtn.addEventListener("click", () => {
   void (async () => {
     // Register ISO filesystem for lazy file access by HLE
     if (lastIsoVolume && lastIsoFile) {
-      await registerIsoFileSystem(emulator!.hle.fileData, lastIsoVolume.root, lastIsoFile);
+      await registerIsoFileSystem(emulator!.hle.pspFs, emulator!.hle.fileData, lastIsoFile);
     }
 
     // Register directory files loaded via "Open Directory" or PBP companion files
@@ -485,34 +486,42 @@ function stopRafLoop(): void {
 /** Walk the ISO tree and register lazy file readers for disc0:/ paths.
  *  Files are read on-demand from the ISO File using slice(), avoiding loading the entire ISO into memory. */
 async function registerIsoFileSystem(
+  pspFs: PspFileSystem,
   fileData: Map<string, Uint8Array>,
-  root: IsoFile,
   isoFile: File,
 ): Promise<void> {
   fileData.clear();
-  const entries: Array<{ path: string; entry: IsoFile }> = [];
+  // Load the whole image once and serve files as views into it. This is
+  // actually less memory than slicing each file out, and it lets raw
+  // "sce_lbn<N>_size<M>" opens (GTA's disc catalog reader) work — those need
+  // synchronous sector access that a File can't provide.
+  const buffer = await isoFile.arrayBuffer();
+  const volume = parseIso(buffer);
   function walk(entry: IsoFile, prefix: string): void {
     if (entry.isDirectory) {
+      pspFs.setDirExtent(`disc0:${prefix}/${entry.name}`, entry.lba, entry.size);
       for (const child of entry.children ?? []) {
         walk(child, `${prefix}/${entry.name}`);
       }
     } else {
-      entries.push({ path: `disc0:${prefix}/${entry.name}`, entry });
+      const path = `disc0:${prefix}/${entry.name}`;
+      try {
+        fileData.set(path, readFile(buffer, entry));
+        pspFs.setFileSector(path, entry.lba);
+      } catch {
+        // Skip files that can't be read (may be beyond file bounds)
+      }
     }
   }
-  for (const child of root.children ?? []) {
+  for (const child of volume.root.children ?? []) {
     walk(child, "");
   }
-  // Read all files from ISO on demand. For the boot phase, read them eagerly
-  // but using slice() so we never hold the entire ISO buffer in memory at once.
-  for (const { path, entry } of entries) {
-    try {
-      const data = await readFileFromIso(isoFile, entry);
-      fileData.set(path, data);
-    } catch {
-      // Skip files that can't be read (may be beyond file bounds)
-    }
-  }
+  const bytes = new Uint8Array(buffer);
+  pspFs.setDiscReader((lbn, size) => {
+    const start = lbn * 2048;
+    if (start < 0 || start >= bytes.length) return null;
+    return bytes.subarray(start, Math.min(start + size, bytes.length));
+  });
   log.info(`Registered ${fileData.size} ISO files for HLE`);
 }
 

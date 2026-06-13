@@ -71,7 +71,7 @@ export interface InputSnapshot {
 }
 
 export enum ThreadState { RUNNING, READY, WAITING, DORMANT, DEAD }
-export enum WaitType { NONE, DELAY, VBLANK, SLEEP, SEMA, EVENT_FLAG, AUDIO, ATRAC_DECODE, GE_DRAW_SYNC, GE_LIST_SYNC, THREAD_END, MUTEX, FPL, VPL, MODULE, LWMUTEX, CTRL }
+export enum WaitType { NONE, DELAY, VBLANK, SLEEP, SEMA, EVENT_FLAG, AUDIO, ATRAC_DECODE, GE_DRAW_SYNC, GE_LIST_SYNC, THREAD_END, MUTEX, FPL, VPL, MODULE, LWMUTEX, CTRL, ASYNC_IO }
 
 export interface LoadedModule {
   id: number;
@@ -424,6 +424,9 @@ export class HLEKernel {
   processAlarmFire: ((alarmId: number) => void) | null = null;
 
   inputSnapshot: (() => InputSnapshot) | null = null;
+  /** Installed by hle-ctrl.ts: per-vblank controller sampling (updates the
+   *  latch like PPSSPP __CtrlUpdateLatch, which runs on the ctrl sample event). */
+  onCtrlVblankSample: (() => void) | null = null;
   framebufAddr:   number = 0;
   framebufWidth:  number = 512;
   framebufFormat: number = 3;
@@ -986,6 +989,26 @@ export class HLEKernel {
     if (t) {
       t.state    = ThreadState.WAITING;
       t.waitType = WaitType.VBLANK;
+      t.isProcessingCallbacks = false; // per-wait (PPSSPP processCallbacks param)
+      this.saveContext(t, regs);
+      t.context.gpr[2] = 0;
+      if (!this.reschedule(regs)) this.idleBreak = true;
+    } else {
+      regs.setGpr(2, 0);
+    }
+  }
+
+  /**
+   * Block the current thread until an async IO op completes (sceIoWaitAsync*).
+   * hle-io.ts wakes it from the IoAsyncNotify timing event (PPSSPP
+   * __IoAsyncNotify), writing the result and setting $v0 = 0 there.
+   */
+  blockCurrentThreadOnAsyncIo(regs: AllegrexRegisters): void {
+    const t = this.threads.get(this.currentThreadId);
+    if (t) {
+      t.state    = ThreadState.WAITING;
+      t.waitType = WaitType.ASYNC_IO;
+      t.isProcessingCallbacks = false; // per-wait; sceIoWaitAsyncCB re-enables
       this.saveContext(t, regs);
       t.context.gpr[2] = 0;
       if (!this.reschedule(regs)) this.idleBreak = true;
@@ -1004,6 +1027,7 @@ export class HLEKernel {
     if (t) {
       t.state    = ThreadState.WAITING;
       t.waitType = WaitType.CTRL;
+      t.isProcessingCallbacks = false; // per-wait (PPSSPP processCallbacks param)
       this.saveContext(t, regs);
       t.context.gpr[2] = returnValue;
       if (!this.reschedule(regs)) this.idleBreak = true;
@@ -1029,6 +1053,7 @@ export class HLEKernel {
     if (t) {
       t.state            = ThreadState.WAITING;
       t.waitType         = WaitType.AUDIO;
+      t.isProcessingCallbacks = false; // per-wait (PPSSPP processCallbacks param)
       if (this.coreTiming) {
         // Block for the EMULATED-time duration of the samples (PPSSPP
         // __AudioOutSampleQueue model). Wall-clock deadlines wake the game's
@@ -1062,6 +1087,7 @@ export class HLEKernel {
     if (t) {
       t.state               = ThreadState.WAITING;
       t.waitType            = WaitType.ATRAC_DECODE;
+      t.isProcessingCallbacks = false; // per-wait (PPSSPP processCallbacks param)
       t.pendingWakeCallback = wakeCallback;
       this.saveContext(t, regs);
       t.context.gpr[2] = 0; // v0 = 0 (success, written to saved context)
@@ -1147,6 +1173,8 @@ export class HLEKernel {
         woke = true;
       }
     }
+    // Sample the controller once per vblank (PPSSPP __CtrlUpdateLatch timing)
+    this.onCtrlVblankSample?.();
     // Wake threads waiting on controller data (sceCtrlReadBuffer*)
     for (const t of this.threads.values()) {
       if (t.state === ThreadState.WAITING && t.waitType === WaitType.CTRL) {
@@ -1566,6 +1594,7 @@ export class HLEKernel {
         t.state = ThreadState.WAITING;
         t.waitType = WaitType.GE_LIST_SYNC;
         t.waitGeListId = listId;
+        t.isProcessingCallbacks = false; // per-wait (PPSSPP processCallbacks param)
         this.saveContext(t, regs);
         t.context.gpr[2] = 0;
         if (!this.reschedule(regs)) {
@@ -1635,6 +1664,7 @@ export class HLEKernel {
       if (t) {
         t.state = ThreadState.WAITING;
         t.waitType = WaitType.GE_DRAW_SYNC;
+        t.isProcessingCallbacks = false; // per-wait (PPSSPP processCallbacks param)
         this.saveContext(t, regs);
         t.context.gpr[2] = 0;
         if (!this.reschedule(regs)) {

@@ -1794,7 +1794,7 @@ export class GEProcessor {
       this.webglRenderer.clearRect(
         x0, y0, x1, y1, colR, colG, colB, colA,
         this.clearColorWrite, this.clearAlphaWrite, this.clearDepthWrite,
-        this.fbPtr,
+        this.fbPtr, this.fbFormat, this.fbWidth || 512,
       );
       return;
     }
@@ -1860,9 +1860,11 @@ export class GEProcessor {
         return;
       }
 
-      if (srcIsVFB && !dstIsVFB) {
-        // Source is VFB, dest is plain VRAM — readback source to VRAM first.
-        this.webglRenderer.readbackToVRAM(this.bus.vramBuffer, srcAddr, srcStride);
+      // Source overlaps a VFB (possibly at an offset) — its VRAM bytes are
+      // stale, so read the FBO back before the CPU copy below reads them.
+      const srcVfbBase = this.webglRenderer.findVFBBaseContaining(srcAddr);
+      if (srcVfbBase >= 0) {
+        this.webglRenderer.readbackToVRAM(this.bus.vramBuffer, srcVfbBase);
       }
     }
 
@@ -1879,8 +1881,16 @@ export class GEProcessor {
       }
     }
 
-    // Invalidate texture cache (textures may have been overwritten)
     if (this.webglRenderer) {
+      // Transfer INTO a framebuffer: the FBO never sees CPU memory, so upload
+      // the transferred rect into the VFB texture or it stays invisible.
+      // PPSSPP NotifyBlockTransferAfter -> DrawPixels (dstBuffer && !srcBuffer,
+      // FramebufferManagerCommon.cpp:2823). Offset-tolerant like
+      // FindTransferFramebuffer (dstAddr may point inside the VFB).
+      this.webglRenderer.uploadRectFromVRAM(
+        this.bus.vramBuffer, dstAddr, dstStride, dstX, dstY, width, height, bpp,
+      );
+      // Invalidate texture cache (textures may have been overwritten)
       this.webglRenderer.invalidateTextures();
     }
   }

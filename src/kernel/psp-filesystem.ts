@@ -8,6 +8,10 @@ export interface PspFileInfo {
   isDirectory: boolean;
   name: string;       // basename only
   size: number;
+  /** ISO start sector (LBN). Games read it from SceIoStat st_private[0]
+   *  (PPSSPP __IoGetStat: stat->st_private[0] = info.startSector) and open
+   *  raw "disc0:/sce_lbnN_sizeM" paths computed from it. */
+  startSector?: number | undefined;
 }
 
 export class PspFileSystem {
@@ -20,6 +24,31 @@ export class PspFileSystem {
   private readonly deviceAliases = new Map<string, string>([["fatms0:", "ms0:"]]);
 
   constructor(private readonly fileData: Map<string, Uint8Array>) {}
+
+  /** Start sectors by lowercase path, recorded when an ISO is mounted. */
+  private readonly sectors = new Map<string, number>();
+  /** Directory extent {sector,size} by lowercase path (for catalog walkers). */
+  private readonly dirExtents = new Map<string, { sector: number; size: number }>();
+  /** Raw disc reader for sce_lbn opens (lbn, byte size) → bytes, when the
+   *  mount has the full image available (node harness or in-memory ISO). */
+  private discReader: ((lbn: number, size: number) => Uint8Array | null) | null = null;
+
+  setFileSector(path: string, lbn: number): void {
+    this.sectors.set(path.toLowerCase(), lbn);
+  }
+
+  setDirExtent(path: string, sector: number, size: number): void {
+    this.dirExtents.set(path.toLowerCase(), { sector, size });
+  }
+
+  setDiscReader(reader: (lbn: number, size: number) => Uint8Array | null): void {
+    this.discReader = reader;
+  }
+
+  /** Read raw disc bytes for a sce_lbn open, or undefined if no reader. */
+  readDiscSectors(lbn: number, size: number): Uint8Array | undefined {
+    return this.discReader?.(lbn, size) ?? undefined;
+  }
 
   /** Register a device alias so paths on `alias` resolve onto `target`. */
   assignDevice(alias: string, target: string): void {
@@ -159,7 +188,7 @@ export class PspFileSystem {
     for (const [key, data] of this.fileData) {
       if (key.toLowerCase() === resolvedLower) {
         const parts = key.split("/");
-        return { exists: true, isDirectory: false, name: parts[parts.length - 1]!, size: data.byteLength };
+        return { exists: true, isDirectory: false, name: parts[parts.length - 1]!, size: data.byteLength, startSector: this.sectors.get(resolvedLower) };
       }
     }
 
@@ -168,7 +197,8 @@ export class PspFileSystem {
     for (const key of this.fileData.keys()) {
       if (key.toLowerCase().startsWith(dirPrefix)) {
         const parts = resolved.split("/");
-        return { exists: true, isDirectory: true, name: parts[parts.length - 1]! || "", size: 0 };
+        const ext = this.dirExtents.get(resolvedLower.replace(/\/$/, ""));
+        return { exists: true, isDirectory: true, name: parts[parts.length - 1]! || "", size: ext?.size ?? 0, startSector: ext?.sector };
       }
     }
 

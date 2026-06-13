@@ -153,6 +153,59 @@ function mapStencilOp(gl: WebGLRenderingContext, op: number): number {
   }
 }
 
+/** Decode one row of PSP framebuffer pixels (PSP layout, R in low bits) to RGBA8888. */
+function decodeFbRowToRGBA(
+  src: Uint8Array, srcOff: number, count: number, format: number,
+  out: Uint8Array, outOff: number,
+): void {
+  if (format === 3) {
+    // ABGR8888 bytes are [r,g,b,a] — exactly GL RGBA.
+    out.set(src.subarray(srcOff, srcOff + count * 4), outOff);
+    return;
+  }
+  for (let i = 0; i < count; i++) {
+    const px = src[srcOff + i * 2]! | (src[srcOff + i * 2 + 1]! << 8);
+    const di = outOff + i * 4;
+    if (format === 0) { // BGR5650
+      out[di] = (px & 0x1f) << 3;
+      out[di + 1] = ((px >>> 5) & 0x3f) << 2;
+      out[di + 2] = ((px >>> 11) & 0x1f) << 3;
+      out[di + 3] = 255;
+    } else if (format === 1) { // ABGR5551
+      out[di] = (px & 0x1f) << 3;
+      out[di + 1] = ((px >>> 5) & 0x1f) << 3;
+      out[di + 2] = ((px >>> 10) & 0x1f) << 3;
+      out[di + 3] = (px >>> 15) ? 255 : 0;
+    } else { // ABGR4444
+      out[di] = (px & 0xf) << 4;
+      out[di + 1] = ((px >>> 4) & 0xf) << 4;
+      out[di + 2] = ((px >>> 8) & 0xf) << 4;
+      out[di + 3] = ((px >>> 12) & 0xf) << 4;
+    }
+  }
+}
+
+/** Pack one RGBA8888 pixel into PSP framebuffer bytes (inverse of decodeFbRowToRGBA). */
+function packRGBAToFb(
+  r: number, g: number, b: number, a: number, format: number,
+  out: Uint8Array, off: number,
+): void {
+  if (format === 3) {
+    out[off] = r; out[off + 1] = g; out[off + 2] = b; out[off + 3] = a;
+    return;
+  }
+  let px: number;
+  if (format === 0) {
+    px = (r >>> 3) | ((g >>> 2) << 5) | ((b >>> 3) << 11);
+  } else if (format === 1) {
+    px = (r >>> 3) | ((g >>> 3) << 5) | ((b >>> 3) << 10) | (a >= 128 ? 0x8000 : 0);
+  } else {
+    px = (r >>> 4) | ((g >>> 4) << 4) | ((b >>> 4) << 8) | ((a >>> 4) << 12);
+  }
+  out[off] = px & 0xff;
+  out[off + 1] = px >>> 8;
+}
+
 export class WebGLGERenderer {
   private gl: WebGLRenderingContext;
   private geProgram: twgl.ProgramInfo;
@@ -166,6 +219,8 @@ export class WebGLGERenderer {
     tex: WebGLTexture;
     depthRb: WebGLRenderbuffer;
     lastFrameUsed: number;
+    format: number; // PSP fb format: 0=5650 1=5551 2=4444 3=8888
+    stride: number; // fb width in pixels (VRAM row pitch), usually 512
   }>();
   private frameCount = 0;
   private currentRenderAddr = 0; // currently bound VFB address
@@ -179,6 +234,7 @@ export class WebGLGERenderer {
   // PPSSPP FramebufferManagerCommon.cpp DrawFramebufferToOutput
   private vramFallbackTex: WebGLTexture | null = null;
   private vramRef: Uint8Array | null = null;
+  private fallbackConvBuf: Uint8Array | null = null; // 16-bit→RGBA scratch
 
   // Debug info
   _dbgDisplayPath = "none";
@@ -194,8 +250,10 @@ export class WebGLGERenderer {
   private glBuffer: WebGLBuffer;
 
 
-  // Texture cache
-  private texCache = new Map<string, WebGLTexture>();
+  // Texture cache. hash is a sparse content sample — PPSSPP re-hashes texture
+  // memory to catch CPU-animated textures (TextureCacheCommon); without it a
+  // texture updated in place (no block transfer) stays frozen at first upload.
+  private texCache = new Map<string, { tex: WebGLTexture; hash: number }>();
   private dummyTex: WebGLTexture;
 
   // Track current GL state to minimize state changes
@@ -260,7 +318,7 @@ export class WebGLGERenderer {
     const gl = this.gl;
 
     // Bind the VFB for this draw's framebuffer address
-    this.bindRenderTarget(state.fbPtr);
+    this.bindRenderTarget(state.fbPtr, state.fbFormat, state.fbWidth);
     gl.viewport(0, 0, 512, PSP_HEIGHT);
 
     // Set up per-draw-call state
@@ -462,6 +520,8 @@ export class WebGLGERenderer {
     r: number, g: number, b: number, a: number,
     colorWrite: boolean, alphaWrite: boolean, depthWrite: boolean,
     fbPtr = 0,
+    fbFormat = 3,
+    fbStride = 512,
   ): void {
     const gl = this.gl;
     const normAddr = this.normFb(fbPtr);
@@ -469,7 +529,7 @@ export class WebGLGERenderer {
       this._dbgClearLog++;
       console.log(`[VFB] Clear 0x${normAddr.toString(16)} rgba(${r},${g},${b},${a})`);
     }
-    this.bindRenderTarget(fbPtr);
+    this.bindRenderTarget(fbPtr, fbFormat, fbStride);
     gl.viewport(0, 0, 512, PSP_HEIGHT);
 
     // Use scissor to limit the clear to the requested rectangle
@@ -511,6 +571,10 @@ export class WebGLGERenderer {
   presentToScreen(): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    // The GL framebuffer binding no longer matches any VFB; without this the
+    // next draw to the same address early-returns in bindRenderTarget and
+    // renders onto the canvas backbuffer (invisible — present overwrites it).
+    this.currentRenderAddr = 0;
     gl.viewport(0, 0, PSP_WIDTH, PSP_HEIGHT);
 
     // Disable all state for fullscreen blit — and reset tracking flags so
@@ -542,12 +606,15 @@ export class WebGLGERenderer {
     if (displayVfb) {
       gl.bindTexture(gl.TEXTURE_2D, displayVfb.tex);
     } else if (displayAddr && this.vramRef) {
-      // No VFB — game uses block transfers to compose the display buffer in VRAM.
-      // Upload VRAM bytes as a texture (like the old FramebufferRenderer).
+      // No VFB — game uses block transfers / CPU writes to compose the display
+      // buffer in VRAM. Upload VRAM bytes as a texture, decoding the display
+      // format (16-bit formats must be converted; raw upload only works for 8888).
       const vram = this.vramRef;
       const offset = displayAddr - 0x04000000;
       const stride = this.displayFbWidth;
-      if (offset < 0 || offset + stride * PSP_HEIGHT * 4 > vram.length) return;
+      const fmt = this.displayFbFormat;
+      const srcBpp = fmt === 3 ? 4 : 2;
+      if (offset < 0 || offset + stride * PSP_HEIGHT * srcBpp > vram.length) return;
 
       if (!this.vramFallbackTex) {
         this.vramFallbackTex = gl.createTexture()!;
@@ -556,16 +623,29 @@ export class WebGLGERenderer {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, stride, PSP_HEIGHT, 0,
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 512, PSP_HEIGHT, 0,
           gl.RGBA, gl.UNSIGNED_BYTE, null);
       } else {
         gl.bindTexture(gl.TEXTURE_2D, this.vramFallbackTex);
       }
+
+      let pixels: Uint8Array;
+      if (fmt === 3) {
+        pixels = new Uint8Array(vram.buffer, vram.byteOffset + offset, stride * PSP_HEIGHT * 4);
+      } else {
+        if (!this.fallbackConvBuf || this.fallbackConvBuf.length < stride * PSP_HEIGHT * 4) {
+          this.fallbackConvBuf = new Uint8Array(stride * PSP_HEIGHT * 4);
+        }
+        for (let y = 0; y < PSP_HEIGHT; y++) {
+          decodeFbRowToRGBA(vram, offset + y * stride * srcBpp, stride, fmt,
+            this.fallbackConvBuf, y * stride * 4);
+        }
+        pixels = this.fallbackConvBuf.subarray(0, stride * PSP_HEIGHT * 4);
+      }
       // Flip Y: VRAM is PSP-order (row 0 = top), WebGL texture is bottom-up
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, stride, PSP_HEIGHT,
-        gl.RGBA, gl.UNSIGNED_BYTE,
-        new Uint8Array(vram.buffer, vram.byteOffset + offset, stride * PSP_HEIGHT * 4));
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Math.min(stride, 512), PSP_HEIGHT,
+        gl.RGBA, gl.UNSIGNED_BYTE, pixels);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
     } else {
       return; // nothing to present
@@ -582,8 +662,8 @@ export class WebGLGERenderer {
    *  Games modify texture data in RAM between frames (animations, dynamic textures). */
   invalidateTextures(): void {
     const gl = this.gl;
-    for (const tex of this.texCache.values()) {
-      gl.deleteTexture(tex);
+    for (const entry of this.texCache.values()) {
+      gl.deleteTexture(entry.tex);
     }
     this.texCache.clear();
   }
@@ -603,10 +683,15 @@ export class WebGLGERenderer {
   }
 
   /** Get or create a VFB for the given address. PPSSPP DoSetRenderFrameBuffer. */
-  private getOrCreateVFB(addr: number): { fbo: WebGLFramebuffer; tex: WebGLTexture; depthRb: WebGLRenderbuffer; lastFrameUsed: number } {
+  private getOrCreateVFB(addr: number, format = 3, stride = 512): { fbo: WebGLFramebuffer; tex: WebGLTexture; depthRb: WebGLRenderbuffer; lastFrameUsed: number; format: number; stride: number } {
     const key = this.normFb(addr);
     const existing = this.vfbs.get(key);
-    if (existing) { existing.lastFrameUsed = this.frameCount; return existing; }
+    if (existing) {
+      existing.lastFrameUsed = this.frameCount;
+      existing.format = format; // games can reinterpret a buffer's format
+      existing.stride = stride || 512;
+      return existing;
+    }
 
     const gl = this.gl;
     const fbo = gl.createFramebuffer()!;
@@ -628,16 +713,20 @@ export class WebGLGERenderer {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-    const vfb = { fbo, tex, depthRb, lastFrameUsed: this.frameCount };
+    const vfb = { fbo, tex, depthRb, lastFrameUsed: this.frameCount, format, stride: stride || 512 };
     this.vfbs.set(key, vfb);
     return vfb;
   }
 
   /** Bind the VFB for the given address as the render target. */
-  private bindRenderTarget(addr: number): void {
+  private bindRenderTarget(addr: number, format = 3, stride = 512): void {
     const key = this.normFb(addr);
-    if (key === this.currentRenderAddr) return;
-    const vfb = this.getOrCreateVFB(addr);
+    if (key === this.currentRenderAddr) {
+      const cur = this.vfbs.get(key);
+      if (cur) { cur.format = format; cur.stride = stride || 512; }
+      return;
+    }
+    const vfb = this.getOrCreateVFB(addr, format, stride);
     this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, vfb.fbo);
     this.currentRenderAddr = key;
   }
@@ -647,29 +736,114 @@ export class WebGLGERenderer {
     return this.vfbs.get(this.normFb(addr)) ?? null;
   }
 
-  /** Read FBO pixels back to VRAM. PPSSPP ReadFramebufferToMemory. */
-  readbackToVRAM(vram: Uint8Array, addr: number, stride: number): void {
+  /** Find the VFB whose VRAM range contains addr (offset-tolerant, like PPSSPP
+   *  FindTransferFramebuffer). Returns the VFB base address, or -1. */
+  findVFBBaseContaining(addr: number): number {
+    const norm = this.normFb(addr);
+    for (const [base, vfb] of this.vfbs) {
+      const bpp = vfb.format === 3 ? 4 : 2;
+      if (norm >= base && norm < base + vfb.stride * PSP_HEIGHT * bpp) return base;
+    }
+    return -1;
+  }
+
+  /**
+   * Upload a just-transferred rect from VRAM bytes into the VFB covering dstAddr.
+   * PPSSPP NotifyBlockTransferAfter (FramebufferManagerCommon.cpp:2823): when a
+   * block transfer writes from plain memory INTO a framebuffer, the pixels must
+   * be drawn into the FBO or the transfer is invisible (FBO content never sees
+   * CPU memory). This is how many games place backgrounds and video frames.
+   * dstStride/dstX/dstY/width/height/bpp are in transfer units (bpp 2 or 4).
+   */
+  uploadRectFromVRAM(
+    vram: Uint8Array, dstAddr: number,
+    dstStride: number, dstX: number, dstY: number,
+    width: number, height: number, bpp: number,
+  ): boolean {
+    const base = this.findVFBBaseContaining(dstAddr);
+    if (base < 0) return false;
+    const vfb = this.vfbs.get(base)!;
+    const vfbBpp = vfb.format === 3 ? 4 : 2;
+    const fbStride = vfb.stride;
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, vfb.tex);
+    // FBO textures store the PSP image bottom-up (present quad maps v=0 to the
+    // bottom). FLIP_Y + flipped y offsets place rects correctly.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
+
+    // Each transferred row lives in VRAM at the TRANSFER's pitch; map it into
+    // the VFB's own (stride, format) pixel space. When the pitches agree the
+    // whole rect is one contiguous upload; otherwise upload row by row.
+    const baseOff = this.normFb(dstAddr) - base;
+    const rowFb = (r: number): { px: number; py: number } => {
+      const byte = baseOff + ((dstY + r) * dstStride + dstX) * bpp;
+      const p = Math.floor(byte / vfbBpp);
+      return { px: p % fbStride, py: Math.floor(p / fbStride) };
+    };
+    const { px, py } = rowFb(0);
+    const wpx = Math.min(Math.ceil((width * bpp) / vfbBpp), fbStride - px, 512 - px);
+    if (wpx <= 0 || py < 0 || py >= PSP_HEIGHT) {
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+      return false;
+    }
+    const vramBase = base - 0x04000000;
+    const samePitch = dstStride * bpp === fbStride * vfbBpp;
+
+    if (samePitch) {
+      const rows = Math.min(height, PSP_HEIGHT - py);
+      const out = new Uint8Array(wpx * rows * 4);
+      for (let y = 0; y < rows; y++) {
+        const src = vramBase + ((py + y) * fbStride + px) * vfbBpp;
+        if (src < 0 || src + wpx * vfbBpp > vram.length) { gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0); return false; }
+        decodeFbRowToRGBA(vram, src, wpx, vfb.format, out, y * wpx * 4);
+      }
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, px, PSP_HEIGHT - (py + rows), wpx, rows,
+        gl.RGBA, gl.UNSIGNED_BYTE, out);
+    } else {
+      const out = new Uint8Array(wpx * 4);
+      for (let r = 0; r < height; r++) {
+        const pos = rowFb(r);
+        if (pos.py < 0 || pos.py >= PSP_HEIGHT || pos.px + wpx > fbStride) continue;
+        const src = vramBase + (pos.py * fbStride + pos.px) * vfbBpp;
+        if (src < 0 || src + wpx * vfbBpp > vram.length) continue;
+        decodeFbRowToRGBA(vram, src, wpx, vfb.format, out, 0);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.px, PSP_HEIGHT - 1 - pos.py, wpx, 1,
+          gl.RGBA, gl.UNSIGNED_BYTE, out);
+      }
+    }
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+    vfb.lastFrameUsed = this.frameCount;
+    return true;
+  }
+
+  /** Read FBO pixels back to VRAM in the VFB's own pixel format and stride.
+   *  PPSSPP ReadFramebufferToMemory. */
+  readbackToVRAM(vram: Uint8Array, addr: number): void {
     const key = this.normFb(addr);
     const vfb = this.vfbs.get(key);
     if (!vfb) return;
     this._dbgReadbackCount++;
+    const stride = vfb.stride;
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, vfb.fbo);
-    const buf = new Uint8Array(stride * PSP_HEIGHT * 4);
-    gl.readPixels(0, 0, stride, PSP_HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const readW = Math.min(stride, 512);
+    const buf = new Uint8Array(readW * PSP_HEIGHT * 4);
+    gl.readPixels(0, 0, readW, PSP_HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, buf);
     const phys = key - 0x04000000;
     if (phys < 0) return;
+    const bpp = vfb.format === 3 ? 4 : 2;
     for (let y = 0; y < PSP_HEIGHT; y++) {
       const srcY = PSP_HEIGHT - 1 - y;
-      for (let x = 0; x < stride; x++) {
-        const si = (srcY * stride + x) * 4;
-        const di = phys + (y * stride + x) * 4;
-        if (di + 3 >= vram.length) continue;
-        vram[di] = buf[si]!; vram[di+1] = buf[si+1]!;
-        vram[di+2] = buf[si+2]!; vram[di+3] = buf[si+3]!;
+      for (let x = 0; x < readW; x++) {
+        const si = (srcY * readW + x) * 4;
+        const di = phys + (y * stride + x) * bpp;
+        if (di + bpp > vram.length) continue;
+        packRGBAToFb(buf[si]!, buf[si + 1]!, buf[si + 2]!, buf[si + 3]!,
+          vfb.format, vram, di);
       }
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.currentRenderAddr = 0; // binding no longer matches any VFB
   }
 
   /** Clean up old VFBs not used for 5+ frames. PPSSPP DecimateFBOs. */
@@ -754,8 +928,8 @@ export class WebGLGERenderer {
     if (this.vramFallbackTex) gl.deleteTexture(this.vramFallbackTex);
     gl.deleteBuffer(this.glBuffer);
     gl.deleteTexture(this.dummyTex);
-    for (const tex of this.texCache.values()) {
-      gl.deleteTexture(tex);
+    for (const entry of this.texCache.values()) {
+      gl.deleteTexture(entry.tex);
     }
     this.texCache.clear();
   }
@@ -861,6 +1035,25 @@ export class WebGLGERenderer {
     this.pushVertex(br);
   }
 
+  /** Sparse content hash of the texture bytes (+ CLUT). 64 samples spread over
+   *  the data; cheap enough to run per draw, catches in-place CPU updates. */
+  private hashTexture(texState: GETextureState, bus: MemoryBus): number {
+    const fmt = texState.texFormat;
+    const bppNum = fmt === 3 ? 4 : fmt >= 4 ? 1 : 2; // 8888=4B, CLUT4/8≈1B, 16-bit=2B
+    const bytes = Math.max(16, (texState.texBufWidth0 || texState.texWidth0) * texState.texHeight0 * bppNum);
+    const base = texState.texAddr0 >>> 0;
+    let h = 0;
+    const step = Math.max(4, (bytes >> 6) & ~3); // 64 samples, word-aligned
+    for (let off = 0; off < bytes; off += step) {
+      h = (h ^ bus.readU32(base + off)) >>> 0;
+      h = (h * 0x01000193) >>> 0; // FNV-style mix so position matters
+    }
+    if (texState.clutAddr) {
+      for (let i = 0; i < 16; i++) h = (h ^ bus.readU32(texState.clutAddr + i * 16)) >>> 0;
+    }
+    return h;
+  }
+
   private getOrUploadTexture(texState: GETextureState, bus: MemoryBus): WebGLTexture {
     // Framebuffer-as-texture: if texture address matches a known VFB, use it directly.
     // Can't use it if it's the CURRENT render target (would read while writing).
@@ -871,11 +1064,16 @@ export class WebGLGERenderer {
       return texVfb.tex;
     }
 
-    const key = texCacheKey(texState);
-    const cached = this.texCache.get(key);
-    if (cached) return cached;
-
     const gl = this.gl;
+    const key = texCacheKey(texState);
+    const hash = this.hashTexture(texState, bus);
+    const cached = this.texCache.get(key);
+    if (cached) {
+      if (cached.hash === hash) return cached.tex;
+      gl.deleteTexture(cached.tex); // content changed in place — re-upload
+      this.texCache.delete(key);
+    }
+
     const { data, width, height } = decodeTexture(bus, texState);
 
     const tex = gl.createTexture()!;
@@ -886,14 +1084,14 @@ export class WebGLGERenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
 
-    this.texCache.set(key, tex);
+    this.texCache.set(key, { tex, hash });
 
     // Evict old entries if cache gets too large
     if (this.texCache.size > 512) {
       const firstKey = this.texCache.keys().next().value;
       if (firstKey !== undefined) {
         const old = this.texCache.get(firstKey);
-        if (old) gl.deleteTexture(old);
+        if (old) gl.deleteTexture(old.tex);
         this.texCache.delete(firstKey);
       }
     }

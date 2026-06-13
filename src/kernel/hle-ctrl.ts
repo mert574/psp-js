@@ -4,7 +4,6 @@
 
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel } from "./hle-kernel.js";
-import { ThreadState, WaitType } from "./hle-kernel.js";
 import { CTRL } from "./nids.js";
 
 const log = Logger.get("HLE-CTRL");
@@ -13,6 +12,34 @@ export function registerCtrlHLE(kernel: HLEKernel): void {
 
   let analogEnabled = true;  // PPSSPP default
   let ctrlCycle = 0;
+
+  // Latch state — PPSSPP sceCtrl.cpp __CtrlUpdateLatch (113-162). The latch
+  // accumulates button edges across samples; games poll Peek/ReadLatch for
+  // "newly pressed" (btnMake) instead of diffing pad buffers themselves.
+  let latchMake = 0, latchBreak = 0, latchPress = 0, latchRelease = 0;
+  let latchBufs = 0;
+  let oldButtons = 0;
+
+  // Sampled once per vblank, like PPSSPP's ctrl sample event.
+  kernel.onCtrlVblankSample = () => {
+    const buttons = kernel.inputSnapshot ? kernel.inputSnapshot().buttons : 0;
+    const changed = (buttons ^ oldButtons) >>> 0;
+    latchMake = (latchMake | (buttons & changed)) >>> 0;
+    latchBreak = (latchBreak | (oldButtons & changed)) >>> 0;
+    latchPress = (latchPress | buttons) >>> 0;
+    latchRelease = (latchRelease | ~buttons) >>> 0;
+    latchBufs++;
+    oldButtons = buttons;
+  };
+
+  function writeLatch(bus: Parameters<Parameters<typeof kernel.register>[1]>[1], ptr: number): void {
+    // Our input only produces user-mode buttons, so no CTRL_MASK_USER needed.
+    if (ptr === 0) return;
+    bus.writeU32(ptr + 0, latchMake);
+    bus.writeU32(ptr + 4, latchBreak);
+    bus.writeU32(ptr + 8, latchPress);
+    bus.writeU32(ptr + 12, latchRelease);
+  }
 
   // sceCtrlGetSamplingCycle(cyclePtr)
   kernel.register(CTRL.sceCtrlGetSamplingCycle, (regs, bus) => {
@@ -101,28 +128,21 @@ export function registerCtrlHLE(kernel: HLEKernel): void {
     regs.setGpr(2, prev);
   });
 
-  // sceCtrlPeekLatch(latchDataPtr) — non-blocking, returns latch data
+  // sceCtrlPeekLatch(latchDataPtr) — returns latch without reset.
+  // PPSSPP sceCtrl.cpp:555-561: v0 = ctrlLatchBufs (samples since last read).
   kernel.register(CTRL.sceCtrlPeekLatch, (regs, bus) => {
-    const ptr = regs.getGpr(4);
-    if (ptr !== 0) {
-      bus.writeU32(ptr + 0, 0);  // uiMake (buttons pressed since last read)
-      bus.writeU32(ptr + 4, 0);  // uiBreak (buttons released)
-      bus.writeU32(ptr + 8, 0);  // uiPress (buttons currently held)
-      bus.writeU32(ptr + 12, 0); // uiRelease
-    }
-    regs.setGpr(2, 0);
+    writeLatch(bus, regs.getGpr(4));
+    regs.setGpr(2, latchBufs);
   });
 
-  // sceCtrlReadLatch(latchDataPtr) — non-blocking, returns latch data and resets
+  // sceCtrlReadLatch(latchDataPtr) — returns latch and resets it.
+  // PPSSPP sceCtrl.cpp:563-569 + __CtrlResetLatch.
   kernel.register(CTRL.sceCtrlReadLatch, (regs, bus) => {
-    const ptr = regs.getGpr(4);
-    if (ptr !== 0) {
-      bus.writeU32(ptr + 0, 0);
-      bus.writeU32(ptr + 4, 0);
-      bus.writeU32(ptr + 8, 0);
-      bus.writeU32(ptr + 12, 0);
-    }
-    regs.setGpr(2, 0);
+    writeLatch(bus, regs.getGpr(4));
+    const bufs = latchBufs;
+    latchMake = 0; latchBreak = 0; latchPress = 0; latchRelease = 0;
+    latchBufs = 0;
+    regs.setGpr(2, bufs);
   });
 
   // ── Stubs: CTRL ──────────────────────────────────────────────────────────

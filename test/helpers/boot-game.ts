@@ -14,6 +14,7 @@ import { isPbp, parsePbp } from "../../src/loader/pbp.js";
 import { pspDecryptPRX } from "../../src/loader/prx-decrypter.js";
 import { PSPEmulator } from "../../src/emulator.js";
 import { NID_NAMES } from "../../src/kernel/nids.js";
+import type { PspFileSystem } from "../../src/kernel/psp-filesystem.js";
 import { Logger } from "../../src/utils/logger.js";
 
 /** PSP pad button bits (mirrors src/frontend/input.ts PspButton, which is a
@@ -79,18 +80,28 @@ export function extractEboot(isoBuffer: ArrayBuffer): Uint8Array {
   return readFile(isoBuffer, eboot).slice();
 }
 
-export function mountIso(isoBuffer: ArrayBuffer, fileData: Map<string, Uint8Array>): void {
+export function mountIso(isoBuffer: ArrayBuffer, fileData: Map<string, Uint8Array>, pspFs?: PspFileSystem): void {
   const volume = parseIso(isoBuffer);
   function walk(node: IsoFile, path: string): void {
     if (node.isDirectory) {
+      if (path && pspFs) pspFs.setDirExtent("disc0:" + path, node.lba, node.size);
       for (const child of node.children ?? []) {
         walk(child, path + "/" + child.name.replace(/;1$/, "").toLowerCase());
       }
     } else {
-      fileData.set("disc0:" + path, readFile(isoBuffer, node));
+      const key = "disc0:" + path;
+      fileData.set(key, readFile(isoBuffer, node));
+      pspFs?.setFileSector(key, node.lba);
     }
   }
   walk(volume.root, "");
+  // Raw sector reader for sce_lbn opens (the full image is in memory here).
+  const bytes = new Uint8Array(isoBuffer);
+  pspFs?.setDiscReader((lbn, size) => {
+    const start = lbn * 2048;
+    if (start < 0 || start >= bytes.length) return null;
+    return bytes.subarray(start, Math.min(start + size, bytes.length));
+  });
 }
 
 /** Load an ISO into a fresh emulator, ready to run frames. */
@@ -105,7 +116,7 @@ export async function loadGame(isoPath: string): Promise<PSPEmulator> {
     data = dec as Uint8Array<ArrayBuffer>;
   }
   const emu = new PSPEmulator();
-  mountIso(isoBuffer, emu.hle.fileData);
+  mountIso(isoBuffer, emu.hle.fileData, emu.hle.pspFs);
   await emu.loadElfBinary(data);
   return emu;
 }
