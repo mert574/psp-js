@@ -353,7 +353,7 @@ export class WebGLGERenderer {
     this.applyBlendState(gl, state.fragState);
     this.applyDepthState(gl, state);
     this.applyScissorState(gl, state);
-    this.applyCullState(gl, state);
+    this.applyCullState(gl, state, primType);
     this.applyStencilState(gl, state.fragState);
     this.applyColorMask(gl, state.fragState);
 
@@ -1304,15 +1304,21 @@ export class WebGLGERenderer {
     }
   }
 
-  private applyCullState(gl: WebGLRenderingContext, state: GEDrawState): void {
-    if (state.cullEnable) {
+  private applyCullState(gl: WebGLRenderingContext, state: GEDrawState, primType: number): void {
+    // PPSSPP StateMappingGLES.cpp:218 — culling only applies to real triangles
+    // (TRIANGLES/STRIP/FAN = prim 3..5), never to points, lines, sprites
+    // (rectangles, prim 6), or clear mode. Sprites are axis-aligned 2D quads and
+    // must never be culled by winding.
+    const doCull = state.cullEnable && !state.clearMode && primType >= 3 && primType <= 5;
+    if (doCull) {
       if (!this.currentCullEnabled) { gl.enable(gl.CULL_FACE); this.currentCullEnabled = true; }
-      // PSP CW = cull clockwise faces. WebGL: gl.FRONT is CCW by default (glFrontFace(CCW)).
-      // So CW culling = gl.FRONT (if CCW is front, then CW faces are BACK)
-      // Actually PSP: cullCW=true means cull CW-wound triangles.
-      // WebGL default: front face = CCW. gl.cullFace(BACK) culls CCW, gl.cullFace(FRONT) culls CW.
-      // Wait — WebGL Y is flipped in our FBO, which reverses winding. So invert.
-      gl.cullFace(state.cullCW ? gl.BACK : gl.FRONT);
+      // PPSSPP StateMappingGLES.cpp:216: cullMode = {GL_FRONT, GL_BACK}[cullMode ^ !buffered],
+      // frontFace stays GL_CCW. Our GE vertex shader flips Y (ndc.y = -ndc.y), which
+      // reverses triangle winding in clip space — the same situation as PPSSPP's
+      // non-buffered (Y-flipped) path, so we take the XOR-inverted branch:
+      // cullCW(0) -> GL_BACK, cullCW(1) -> GL_FRONT. Without this every culled
+      // triangle is the wrong face (e.g. GoW's intro text fans got culled away).
+      gl.cullFace(state.cullCW ? gl.FRONT : gl.BACK);
     } else {
       if (this.currentCullEnabled) { gl.disable(gl.CULL_FACE); this.currentCullEnabled = false; }
     }
