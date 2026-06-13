@@ -86,11 +86,6 @@
               <span>TID <b id="hud-tid">-</b></span>
               <span>PC <b id="hud-pc">-</b></span>
               <span class="perf-bar__spacer"></span>
-              <span class="perf-bar__group">
-                <button class="perf-bar__btn perf-bar__btn--active" data-scale="1">1x</button>
-                <button class="perf-bar__btn" data-scale="2">2x</button>
-                <button class="perf-bar__btn" data-scale="3">3x</button>
-              </span>
               <button id="pause-btn" class="perf-bar__btn">⏸</button>
               <button id="step-btn" class="perf-bar__btn" disabled>⏭</button>
             </div>
@@ -133,6 +128,17 @@
 
             <div class="gameplay-toolbar">
               <button id="exit-btn" class="btn btn--ghost">← Back</button>
+              <span class="perf-bar__group" title="Display scale">
+                <button class="perf-bar__btn perf-bar__btn--active" data-scale="1">1x</button>
+                <button class="perf-bar__btn" data-scale="2">2x</button>
+                <button class="perf-bar__btn" data-scale="3">3x</button>
+              </span>
+              <span class="perf-bar__group" title="Emulation speed">
+                <button class="perf-bar__btn perf-bar__btn--active" data-speed="1">1×</button>
+                <button class="perf-bar__btn" data-speed="2">2×</button>
+                <button class="perf-bar__btn" data-speed="4">4×</button>
+              </span>
+              <button id="fullscreen-btn" class="btn btn--ghost" title="Fullscreen">⛶ Fullscreen</button>
               <span class="gameplay-toolbar__hint">Tab / H — toggle controls</span>
             </div>
           </div>

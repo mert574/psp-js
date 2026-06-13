@@ -88,12 +88,14 @@ export class DebugPanel {
     this._lastGeLists   = emu.hle.geListCount;
     this._lastIoOps     = emu.hle.ioOpsCount;
 
-    // RAM: sum allocated memBlocks
+    // RAM: sum allocated memBlocks. Total is the game's actual PSP RAM size
+    // (32MB or 64MB) — set per-game from PARAM.SFO MEMSIZE, not hardcoded.
     let ramUsed = 0;
     for (const blk of emu.hle.memBlocks.values()) ramUsed += blk.size;
+    const ramTotal   = emu.hle.ramSize || PSP_RAM_BYTES;
     const ramUsedKB  = Math.round(ramUsed / 1024);
-    const ramTotalKB = PSP_RAM_BYTES / 1024;
-    const ramPct     = Math.min(100, Math.round((ramUsed / PSP_RAM_BYTES) * 100));
+    const ramTotalKB = Math.round(ramTotal / 1024);
+    const ramPct     = Math.min(100, Math.round((ramUsed / ramTotal) * 100));
 
     const bar = (pct: number, color: string): string =>
       `<span class="dbg-bar" style="--pct:${pct}%;--clr:${color}"></span>`;

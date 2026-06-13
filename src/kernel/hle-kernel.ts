@@ -290,6 +290,11 @@ export class HLEKernel {
   readonly memBlocks = new Map<number, { addr: number; size: number; name: string }>();
   nextBlockId = 0x100;
 
+  /** PSP RAM size (PPSSPP g_MemorySize): 0x02000000 (32MB) by default, 0x04000000
+   *  (64MB) when the game requests it (PARAM.SFO MEMSIZE=1 / HD-remaster). Set in
+   *  setHeapBase; the debug panel reads this instead of hardcoding 64MB. */
+  ramSize = 0x04000000;
+
   /**
    * FPL pool tracking: fplId → { base, blockSize, numBlocks, nextBlock }
    * Separate from memBlocks so AllocateFpl can cycle through blocks properly.
@@ -297,11 +302,17 @@ export class HLEKernel {
   readonly fplPools = new Map<number, { base: number; blockSize: number; numBlocks: number; nextBlock: number }>();
 
   /** Called by emulator.ts after ELF load to position the heap above loaded segments. */
-  setHeapBase(loadedEnd: number): void {
+  setHeapBase(loadedEnd: number, largeMemory = false): void {
     // Initialize userMemory matching PPSSPP:
     // userMemory.Init(PSP_GetUserMemoryBase(), PSP_GetUserMemoryEnd() - PSP_GetUserMemoryBase())
+    // PSP_GetUserMemoryEnd() = 0x08000000 + g_MemorySize. g_MemorySize is
+    // RAM_NORMAL_SIZE (32MB) by default and RAM_DOUBLE_SIZE (64MB) only when the
+    // game requests it via PARAM.SFO MEMSIZE=1 (PPSSPP InitMemorySizeForGame).
+    // Most games are 32MB; giving them 64MB shifts their whole heap layout and
+    // makes their own allocations collide.
     const USER_MEM_BASE = 0x08800000;
-    const USER_MEM_END  = 0x0C000000; // 64MB PSP
+    const USER_MEM_END  = largeMemory ? 0x0C000000 : 0x0A000000;
+    this.ramSize = USER_MEM_END - 0x08000000; // g_MemorySize (32MB or 64MB)
     this.userMemory.init(USER_MEM_BASE, USER_MEM_END - USER_MEM_BASE);
 
     // Pre-allocate usersystemlib (PPSSPP sceKernelMemory.cpp:319)

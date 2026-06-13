@@ -1,0 +1,21 @@
+import { loadGame } from "../test/helpers/boot-game.js";
+import { NID_NAMES } from "../src/kernel/nids.js";
+const emu = await loadGame("test/fixtures/burnout-legends.iso");
+const kernel = emu.hle;
+const ev: string[] = [];
+const push = (s: string) => { ev.push(s); if (ev.length > 50) ev.shift(); };
+const orig = kernel.dispatch.bind(kernel);
+(kernel as unknown as { dispatch: (c: number, r: { getGpr(n: number): number }) => void }).dispatch = (code, regs) => {
+  const nid = kernel.getNidBySyscallForTest(code);
+  const name = nid != null ? (NID_NAMES.get(nid) ?? `0x${nid.toString(16)}`) : "?";
+  const a0 = regs.getGpr(4) >>> 0;
+  const isFeed = name === "sceMpegRingbufferPut" || (/sceIo(Read|WaitAsync|PollAsync|GetAsyncStat|Open)/.test(name) && (a0 === 149 || name === "sceIoOpenAsync" || name === "sceIoOpen"));
+  orig(code, regs as never);
+  if (isFeed) push(`t${kernel.currentThreadId} ${name}(fd/a0=${a0}) -> 0x${(regs.getGpr(2)>>>0).toString(16)}`);
+};
+for (let f = 0; f < 600; f++) emu.runFrame();
+console.log("RESULT feed/IO events (last 50):");
+console.log(ev.join("\n"));
+const WT = ["NONE","DELAY","VBLANK","SLEEP","SEMA","EVENT_FLAG","AUDIO","ATRAC","GE_DRAW","GE_LIST","THREAD_END","MUTEX","FPL","VPL","MODULE","LWMUTEX","CTRL","ASYNC_IO"];
+console.log("RESULT threads:");
+for (const t of kernel.threads.values()) if (t.state !== 4) console.log(`  t${t.id} state=${t.state} wait=${WT[t.waitType]??t.waitType}`);
