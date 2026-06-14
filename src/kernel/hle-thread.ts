@@ -101,8 +101,11 @@ export function registerThreadHLE(kernel: HLEKernel): void {
 
   const exitThread = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
     if (!kernel.exitCurrentThread(regs)) {
+      // "Alive" = could still run again (running/ready/waiting). DORMANT threads
+      // (exited or never-started) and DEAD ones can't run on their own, so they
+      // don't keep the CPU loop alive.
       const anyAlive = [...kernel.threads.values()].some(
-        (th) => th.state !== ThreadState.DEAD,
+        (th) => th.state !== ThreadState.DEAD && th.state !== ThreadState.DORMANT,
       );
       if (anyAlive) {
         kernel.idleBreak = true;
@@ -400,10 +403,10 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.register(THREAD.sceKernelGetThreadExitStatus, (regs) => {
     const thid = regs.getGpr(4);
     const t    = kernel.threads.get(thid);
-    if (t && t.state === ThreadState.DEAD) {
-      regs.setGpr(2, 0);
+    if (t && t.state === ThreadState.DORMANT) {
+      regs.setGpr(2, 0); // dormant (incl. exited) → report exit status (0)
     } else if (t) {
-      regs.setGpr(2, 0x800201a4 >>> 0);
+      regs.setGpr(2, 0x800201a4 >>> 0); // SCE_KERNEL_ERROR_NOT_DORMANT
     } else {
       regs.setGpr(2, 0x800201bc >>> 0);
     }
@@ -1229,7 +1232,7 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     const thid = regs.getGpr(4);
     const t = kernel.threads.get(thid);
     if (!t) { regs.setGpr(2, 0x800201bc >>> 0); return; }
-    t.state = ThreadState.DEAD;
+    t.state = ThreadState.DORMANT;
     kernel.userMemory.free(t.stackBase); // PPSSPP Cleanup() → FreeStack()
     kernel.threads.delete(thid);
     regs.setGpr(2, 0);

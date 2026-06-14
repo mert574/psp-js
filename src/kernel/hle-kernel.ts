@@ -395,6 +395,10 @@ export class HLEKernel {
   vblankCount: number = 0;
   cycleCount: number = 0;
   ioOpsCount: number = 0;
+  /** Cumulative wall-time (ms) spent processing GE command lists = the emulated
+   *  GPU's CPU load. Same path for both renderers (software raster vs WebGL draw
+   *  submit happens inside the scan). Read as a per-window delta for a GPU-load %. */
+  geTimeMs: number = 0;
   currentButtons: number = 0;
   /** Tracks how many times each stubbed syscall has been called (name → count). */
   readonly stubCalls = new Map<string, number>();
@@ -575,6 +579,41 @@ export class HLEKernel {
     return out;
   }
 
+  /** Read-only detail for the debug panel's thread inspector. Returns live values
+   *  for the running thread (from CPU regs) and saved context for the rest. */
+  getThreadDetail(id: number): {
+    id: number; entry: number; priority: number; state: ThreadState; waitType: WaitType;
+    pc: number; hi: number; lo: number;
+    stackBase: number; stackTop: number; stackSize: number;
+    gpr: number[];
+    wait: {
+      semaId: number; semaCount: number; evfId: number; evfBits: number; evfMode: number;
+      mutexId: number; mutexCount: number; geListId: number; threadEndId: number;
+      fplId: number; vplId: number; deadlineVbl: number;
+    };
+  } | null {
+    const t = this.threads.get(id);
+    if (!t) return null;
+    // The running thread's live state is in the CPU regs, not its saved context.
+    const r = (t.id === this.currentThreadId && t.state === ThreadState.RUNNING && this.cpu)
+      ? this.cpu.regs : t.context;
+    return {
+      id: t.id, entry: t.entry, priority: t.priority, state: t.state, waitType: t.waitType,
+      pc: r.pc,
+      hi: r.hi,
+      lo: r.lo,
+      stackBase: t.stackBase, stackTop: t.stackTop, stackSize: t.stackSize,
+      gpr: Array.from(r.gpr, v => v >>> 0),
+      wait: {
+        semaId: t.waitSemaId, semaCount: t.waitSemaCount,
+        evfId: t.waitEvfId, evfBits: t.waitEvfBits, evfMode: t.waitEvfMode,
+        mutexId: t.waitMutexId, mutexCount: t.waitMutexCount,
+        geListId: t.waitGeListId, threadEndId: t.waitThreadEndId,
+        fplId: t.waitFplId, vplId: t.waitVplId, deadlineVbl: t.waitDeadlineVbl,
+      },
+    };
+  }
+
   constructor(readonly bus: MemoryBus) {
     this.pspFs = new PspFileSystem(this.fileData);
     this.registerBuiltins();
@@ -601,7 +640,9 @@ export class HLEKernel {
   /** Scan a GE list inline and handle completion/pause. */
   private _scanAndCompleteGeList(listId: number, entry: GeListEntry): void {
     this.geScanningActive = true;
+    const geStart = performance.now();
     const result = this._scanGeListHeadless(entry);
+    this.geTimeMs += performance.now() - geStart;
     this.geScanningActive = false;
 
     // Note: HANDLER_CONTINUE signal callbacks are fired from _firePendingGeInterrupts()
@@ -1011,12 +1052,14 @@ export class HLEKernel {
     return false;
   }
 
-  /** Mark current thread as DEAD, wake any threads waiting on it, and reschedule. */
+  /** Mark current thread as DORMANT (exited but not deleted, matches PPSSPP — it
+   *  can be restarted and waiters/exit-status queries still work), wake any
+   *  threads waiting on it, and reschedule. */
   exitCurrentThread(regs: AllegrexRegisters): boolean {
     const dyingId = this.currentThreadId;
     const t = this.threads.get(dyingId);
     if (t) {
-      t.state = ThreadState.DEAD;
+      t.state = ThreadState.DORMANT;
       this.saveContext(t, regs);
       this.pspFs.threadEnded(dyingId);
     }

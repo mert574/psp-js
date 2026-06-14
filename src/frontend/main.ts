@@ -8,10 +8,12 @@ import { transcodeAt3, transcodePmfAudio } from "./pmf.js";
 import { warmupAtracDecode, getDecodeConcurrency } from "../audio/atrac-decoder.js";
 import { decodePmfNative, type PmfPlayer } from "./pmf-native.js";
 import { PSPEmulator } from "../emulator.js";
+import { CpuProfiler } from "../cpu/cpu-profiler.js";
 import { isPbp } from "../loader/pbp.js";
 import { FramebufferRenderer } from "../gpu/framebuffer-renderer.js";
 import { WebGLGERenderer } from "../gpu/ge-webgl-renderer.js";
-import { DebugPanel } from "./debug-panel.js";
+import "./debug-panel.js"; // registers the <debug-panel> custom element
+import type { DebugPanel } from "./debug-panel.js";
 import { SavedataOverlay } from "./savedata-overlay.js";
 import { SavedataList } from "./savedata-list.js";
 import "./game-library.js";
@@ -20,6 +22,22 @@ declare global {
   interface Window {
     _dbgEmu?: PSPEmulator;
     _dbgLogger?: typeof Logger;
+    /** Auto-pause the play loop once it reaches this displayed-frame count.
+     *  Set live from the console (`_dbgPauseAt(30)`) or via `?pauseAt=30` in the
+     *  URL. 0 disables. Pausing stops the rAF loop entirely, which is what frees
+     *  the machine — leaving the play page running is the real cost. */
+    _dbgPauseAt?: (frame: number) => void;
+    /** Per-frame profiler: splits each displayed frame into CPU (runFrame =
+     *  interpreter + inline GE) vs present (GPU submit) vs idle, so you can see
+     *  where the frame time actually goes. Enable with ?perf in the URL (it then
+     *  auto-prints a frames 11..pauseAt-1 summary at the ?pauseAt frame), or drive
+     *  it live: _dbgPerf.start(), let it run, _dbgPerf.report(from, to). */
+    _dbgPerf?: { start(): void; stop(): void; report(from?: number, to?: number): void };
+    /** Interpreter profiler: instruction-mix histogram + hot-PC sampling, to find
+     *  where the MIPS interpreter time goes. Separate from _dbgPerf so it doesn't
+     *  skew the frame-timing run (counting adds a little per-instruction cost).
+     *  Drive it: _dbgCpuProf.start(), let it run a few seconds, _dbgCpuProf.report(). */
+    _dbgCpuProf?: { start(sampleEvery?: number): void; stop(): void; report(topN?: number): void };
   }
 }
 
@@ -36,9 +54,13 @@ const errorClose = document.getElementById("error-close")!;
 const flash0Fonts = new Map<string, Uint8Array>();
 
 // ── Game library event ────────────────────────────────────────────────────────
+// mode "boot" (default for a card click) loads the game and jumps straight into
+// gameplay. mode "options" (the gear) opens the info/boot-options screen instead.
 document.getElementById("game-library")?.addEventListener("game-select", (e: Event) => {
-  const detail = (e as CustomEvent).detail as { file: File; parentDir: FileSystemDirectoryHandle | null };
-  void handleIso(detail.file, detail.parentDir ?? undefined);
+  const detail = (e as CustomEvent).detail as {
+    file: File; parentDir: FileSystemDirectoryHandle | null; mode?: "boot" | "options";
+  };
+  void handleIso(detail.file, detail.parentDir ?? undefined, detail.mode !== "options");
 });
 
 // ── Debug: ?iso=/name.iso fetches an ISO served from public/ and boots it ────
@@ -82,6 +104,10 @@ function isSoftwareRenderer(): boolean {
   return (document.getElementById("renderer-select") as HTMLSelectElement | null)?.value === "software";
 }
 
+function isProfilerEnabled(): boolean {
+  return (document.getElementById("profiler-chk") as HTMLInputElement | null)?.checked ?? false;
+}
+
 function resolutionScale(): number {
   const v = (document.getElementById("resolution-select") as HTMLSelectElement | null)?.value;
   const n = v ? parseInt(v, 10) : 1;
@@ -118,6 +144,9 @@ let mediaAbort: AbortController | null = null;
 let pmfPlayer: PmfPlayer | null = null;
 let lastIsoVolume: IsoVolume | null = null;
 let lastIsoFile: File | null = null;
+// True when the current game was opened via the options screen (gear), false when
+// booted straight from the library. Decides where "← Back" returns to.
+let optionsScreenReady = false;
 let pendingDirFiles: Map<string, Uint8Array> | null = null;
 let pendingStartDir: string | null = null;
 
@@ -165,7 +194,9 @@ fileInputEboot?.addEventListener("change", () => {
 });
 
 // ── Buttons ───────────────────────────────────────────────────────────────────
-bootBtn.addEventListener("click", () => {
+bootBtn.addEventListener("click", () => bootGame());
+
+function bootGame(): void {
   if (!ebootBytes) {
     showError("No EBOOT.BIN found in this ISO — cannot boot.");
     return;
@@ -194,11 +225,29 @@ bootBtn.addEventListener("click", () => {
     geRenderer = new WebGLGERenderer(canvas);
     geRenderer.setResolutionScale(resolutionScale());
   }
-  debugPanel = new DebugPanel();
+  // <debug-panel> is a persistent custom element in the DOM; grab it and reset
+  // its per-game state rather than constructing a new (unattached) instance.
+  debugPanel = document.querySelector<DebugPanel>("debug-panel");
+  debugPanel?.reset();
 
   emulator = new PSPEmulator();
   window._dbgEmu = emulator; // debug: expose for console inspection
   window._dbgLogger = Logger;  // debug: window._dbgLogger.minLevel = "debug"
+  window._dbgPauseAt = (frame: number) => { _pauseAtFrame = frame > 0 ? Math.floor(frame) : 0; }; // debug: auto-pause at a frame
+  window._dbgPerf = { // debug: per-frame CPU-vs-present profiler
+    start: () => { _perfEnabled = true; _perfFrames.clear(); },
+    stop:  () => { _perfEnabled = false; },
+    report: (from, to) => dbgPerfReport(from, to),
+  };
+  window._dbgCpuProf = { // debug: interpreter instruction-mix + hot-PC profiler
+    start: (sampleEvery = 64) => { if (emulator) emulator.cpu.profiler = new CpuProfiler(sampleEvery); },
+    stop:  () => { if (emulator) emulator.cpu.profiler = null; },
+    report: (topN = 20) => {
+      const p = emulator?.cpu.profiler;
+      if (p) p.report(topN);
+      else console.log("[CPUPROF] not started — call _dbgCpuProf.start() first");
+    },
+  };
   emulator.hle.inputSnapshot = () => inputHandler!.snapshot();
 
   // Wire savedata overlay + list selection (wait for custom element upgrades)
@@ -321,7 +370,7 @@ bootBtn.addEventListener("click", () => {
 
     startRafLoop();
   })();
-});
+}
 backToLibBtn.addEventListener("click", () => {
   mediaAbort?.abort(); mediaAbort = null;
   if (pmfPlayer) { pmfPlayer.stop(); pmfPlayer = null; }
@@ -334,9 +383,18 @@ errorClose.addEventListener("click", () => clearError());
 
 const exitBtn = document.getElementById("exit-btn")!;
 exitBtn.addEventListener("click", () => {
-  exitGameplayView();
   teardownGameplay();
-  navTo(`game/${currentGameSlug}`);
+  if (optionsScreenReady) {
+    // Came in via the gear → return to that game's options screen.
+    exitGameplayView();
+    navTo(`game/${currentGameSlug}`);
+  } else {
+    // Booted straight from the library → go back to the library.
+    exitGameplayView();
+    showFilePicker();
+    setStatus("");
+    navTo("library");
+  }
 });
 
 // ── Canvas scale buttons ─────────────────────────────────────────────────────
@@ -346,7 +404,7 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-scale]")) 
     const primary = document.querySelector<HTMLElement>(".gameplay-primary");
     if (primary) primary.style.setProperty("--psp-scale", String(scale));
     for (const b of document.querySelectorAll<HTMLButtonElement>("[data-scale]")) {
-      b.classList.toggle("perf-bar__btn--active", b === btn);
+      b.classList.toggle("seg__btn--active", b === btn);
     }
   });
 }
@@ -359,6 +417,25 @@ document.getElementById("fullscreen-btn")?.addEventListener("click", () => {
   else void document.exitFullscreen?.();
 });
 
+// ── Debug drawer toggle ───────────────────────────────────────────────────────
+// Slides the debug drawer in/out over the screen. Open by default.
+function setDebugOpen(open: boolean): void {
+  const panel = document.getElementById("debug-panel");
+  const btn   = document.getElementById("toggle-debug-btn");
+  if (!panel || !btn) return;
+  panel.classList.toggle("debug-sidebar--open", open);
+  btn.textContent = open ? "Hide debug" : "Debug ▸";
+  btn.setAttribute("aria-pressed", String(open));
+}
+document.getElementById("toggle-debug-btn")?.addEventListener("click", () => {
+  const isOpen = document.getElementById("debug-panel")?.classList.contains("debug-sidebar--open");
+  setDebugOpen(!isOpen);
+});
+// The <debug-panel> close button lives in its shadow DOM and bubbles this event.
+document.getElementById("debug-panel")?.addEventListener("close-debug", () => setDebugOpen(false));
+// Open by default.
+setDebugOpen(true);
+
 // ── Emulation speed buttons ───────────────────────────────────────────────────
 // Run N PSP frames per displayed frame (presenting once). Only helps games with
 // CPU headroom; audio plays in real time so it distorts above 1×.
@@ -368,7 +445,7 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-speed]")) 
     _speed = Number(btn.dataset.speed) || 1;
     emulator?.hle.audioEngine.setSpeed(_speed); // fast-forward audio in step
     for (const b of document.querySelectorAll<HTMLButtonElement>("[data-speed]")) {
-      b.classList.toggle("perf-bar__btn--active", b === btn);
+      b.classList.toggle("seg__btn--active", b === btn);
     }
   });
 }
@@ -386,10 +463,17 @@ window.addEventListener("popstate", () => {
     exitGameplayView();
     showFilePicker();
   } else if (route.startsWith("game/")) {
-    // Back to preview from gameplay: stop emulator but keep preview visible
+    // Back to the options screen from gameplay: stop the emulator. If the game was
+    // booted straight from the library (no options screen), fall back to it.
     if (emulator) {
-      exitGameplayView();
       teardownGameplay();
+      if (optionsScreenReady) {
+        exitGameplayView();
+      } else {
+        exitGameplayView();
+        showFilePicker();
+        navTo("library", true);
+      }
     }
   } else if (route.startsWith("play/")) {
     // Forward into gameplay — can't re-enter without re-booting, redirect to preview
@@ -417,7 +501,7 @@ function teardownGameplay(): void {
   geRenderer = null;
   renderer?.destroy();
   renderer = null;
-  debugPanel?.destroy();
+  debugPanel?.reset();
   debugPanel = null;
   emulator?.hle.audioEngine.destroy();
   emulator?.hle.terminateGeWorker();
@@ -434,10 +518,90 @@ let _fpsFrames = 0;
 let _fpsValue = 0;
 let _lastFrameTime = 0;
 let _paused = false;
+// Auto-pause target: when _frameCount reaches this, the play loop pauses and
+// stops scheduling rAF. 0 = disabled. Set via ?pauseAt=N (read at boot) or the
+// console helper window._dbgPauseAt(n). For debugging/measurement.
+let _pauseAtFrame = 0;
+// ── Frame profiler (debug) ───────────────────────────────────────────────────
+// Records, per displayed frame, the CPU time (the runFrame batch = interpreter +
+// inline GE) and the present time (GPU submit). Enable with ?perf (or
+// _dbgPerf.start()). Cheap: two extra performance.now() reads per frame. The
+// report splits the full frame period into CPU vs present vs idle so you can see
+// where the ms actually go.
+// cpuMs is the whole runFrame (interpreter + inline GE); geMs is the inline-GE
+// slice of it (hle.geTimeMs delta), so interpreter = cpuMs - geMs.
+interface PerfFrame { frame: number; startTs: number; cpuMs: number; geMs: number; presentMs: number }
+
+/** Ring buffer of per-frame profiler samples backed by parallel typed arrays:
+ *  O(1) push with zero allocation (no object per frame), packed and cache-
+ *  friendly. Capacity is rounded up to a power of two so the wrap is a bitmask,
+ *  not a modulo. Keeps the most recent samples, evicting the oldest, so recording
+ *  runs indefinitely with fixed memory. */
+class PerfRing {
+  readonly #frame: Int32Array;
+  readonly #startTs: Float64Array;
+  readonly #cpuMs: Float64Array;
+  readonly #geMs: Float64Array;
+  readonly #presentMs: Float64Array;
+  readonly #cap: number;
+  readonly #mask: number;
+  #head = 0; // next write index
+  #len = 0;  // samples held, capped at #cap
+  constructor(minCap: number) {
+    let cap = 1;
+    while (cap < minCap) cap <<= 1; // round up to a power of two
+    this.#cap = cap;
+    this.#mask = cap - 1;
+    this.#frame = new Int32Array(cap);
+    this.#startTs = new Float64Array(cap);
+    this.#cpuMs = new Float64Array(cap);
+    this.#geMs = new Float64Array(cap);
+    this.#presentMs = new Float64Array(cap);
+  }
+  get length(): number { return this.#len; }
+  push(frame: number, startTs: number, cpuMs: number, geMs: number, presentMs: number): void {
+    const i = this.#head;
+    this.#frame[i] = frame;
+    this.#startTs[i] = startTs;
+    this.#cpuMs[i] = cpuMs;
+    this.#geMs[i] = geMs;
+    this.#presentMs[i] = presentMs;
+    this.#head = (i + 1) & this.#mask;
+    if (this.#len < this.#cap) this.#len++;
+  }
+  clear(): void { this.#head = 0; this.#len = 0; }
+  /** Samples oldest-to-newest. Allocates objects, so call only for the occasional
+   *  report — never on the per-frame push path. */
+  toArray(): PerfFrame[] {
+    const out: PerfFrame[] = new Array(this.#len);
+    const start = (this.#head - this.#len + this.#cap) & this.#mask;
+    for (let i = 0; i < this.#len; i++) {
+      const j = (start + i) & this.#mask;
+      out[i] = { frame: this.#frame[j]!, startTs: this.#startTs[j]!, cpuMs: this.#cpuMs[j]!, geMs: this.#geMs[j]!, presentMs: this.#presentMs[j]! };
+    }
+    return out;
+  }
+}
+
+let _perfEnabled = false;
+// Keep the most recent ~PERF_RING_CAP frames (~34s at 60fps; rounded up to a
+// power of two internally); older ones are evicted so recording never stops and
+// never grows. The auto-report range (11..pauseAt) is tiny, so it's always still
+// in the ring when it fires.
+const PERF_RING_CAP = 2048;
+const _perfFrames = new PerfRing(PERF_RING_CAP);
 const FRAME_INTERVAL = 1000 / 60; // ~16.67ms for 60fps
 
-function togglePause(): void {
-  _paused = !_paused;
+// Cached perf-HUD element refs (looked up once per boot, not per frame).
+let _hudFps: HTMLElement | null = null;
+let _hudFrame: HTMLElement | null = null;
+let _hudTid: HTMLElement | null = null;
+let _hudPc: HTMLElement | null = null;
+let _lastHudUpdate = 0;
+const HUD_UPDATE_MS = 200;
+
+function setPaused(paused: boolean): void {
+  _paused = paused;
   const pauseBtn = document.getElementById("pause-btn");
   const stepBtn = document.getElementById("step-btn") as HTMLButtonElement | null;
   if (pauseBtn) pauseBtn.textContent = _paused ? "▶" : "⏸";
@@ -448,6 +612,10 @@ function togglePause(): void {
   }
 }
 
+function togglePause(): void {
+  setPaused(!_paused);
+}
+
 function doSingleFrame(): void {
   if (!emulator || !_paused) return;
   runOneFrame();
@@ -456,6 +624,15 @@ function doSingleFrame(): void {
 /** Run one frame and render (shared between frame loop and step). */
 function runOneFrame(): void {
   if (!emulator) return;
+  // Auto-pause once we've run _pauseAtFrame frames (debug/measurement). Checked
+  // before running more, so exactly _pauseAtFrame frames execute, then the loop
+  // stops scheduling rAF. Skipped while already paused so single-stepping works.
+  if (_pauseAtFrame > 0 && _frameCount >= _pauseAtFrame && !_paused) {
+    setPaused(true);
+    setStatus(`Auto-paused at frame ${_frameCount}.`);
+    if (_perfEnabled) dbgPerfReport(11, _pauseAtFrame - 1);
+    return;
+  }
   _frameCount++;
   if (_frameCount >= 1_000_000_000) _frameCount = 0;
 
@@ -463,15 +640,21 @@ function runOneFrame(): void {
   geRenderer?.onFrameStart();
 
   let cpuMs = 0;
+  let geMs = 0;
+  let presentMs = 0;
+  const frameStart = performance.now();
+  // Inline-GE time is tracked in hle.geTimeMs (the _scanGeListHeadless wrap); the
+  // delta over this frame is the GE slice of cpuMs, so interpreter = cpuMs - geMs.
+  const geBefore = emulator.hle.geTimeMs;
   try {
-    const cpuStart = performance.now();
     // Run _speed PSP frames per displayed frame for 2×/4× emulation speed;
     // we present only the last one. Stop early if the game halts mid-batch.
     for (let i = 0; i < _speed; i++) {
       emulator.runFrame();
       if (emulator.halted) break;
     }
-    cpuMs = performance.now() - cpuStart;
+    cpuMs = performance.now() - frameStart;
+    geMs = emulator.hle.geTimeMs - geBefore;
   } catch (err) {
     stopRafLoop();
     if (emulator && debugPanel) debugPanel.dumpStubsToConsole(emulator);
@@ -483,23 +666,34 @@ function runOneFrame(): void {
   const fbAddr = hle.framebufAddr !== 0 ? hle.framebufAddr : hle.geFbAddr;
 
   // Present: WebGL GE renderer → screen (GPU-accelerated path)
+  const presentStart = performance.now();
   if (geRenderer) {
     geRenderer.setDisplayFramebuf(fbAddr, hle.framebufWidth, hle.framebufFormat);
     geRenderer.presentToScreen();
+    // Profiler: stall on the GPU so present/GPU captures the host-GPU render time
+    // (WebGL draws are async, otherwise hidden in the idle/vsync gap).
+    if (_perfEnabled) geRenderer.finishGpu();
   } else if (fbAddr !== 0 && renderer) {
     // Fallback: upload VRAM bytes as texture
     renderer.render(emulator.bus.vramBuffer, fbAddr, hle.framebufWidth, hle.framebufFormat);
   }
-  const hudFps = document.getElementById("hud-fps");
-  const hudFrame = document.getElementById("hud-frame");
-  const hudTid = document.getElementById("hud-tid");
-  const hudPc = document.getElementById("hud-pc");
-  if (hudFps) hudFps.textContent = String(_fpsValue);
-  if (hudFrame) hudFrame.textContent = String(_frameCount);
-  if (hudTid) hudTid.textContent = String(emulator.hle.currentThreadId);
-  if (hudPc) hudPc.textContent = emulator.cpu.regs.pc.toString(16);
+  presentMs = performance.now() - presentStart;
+  if (_perfEnabled) {
+    _perfFrames.push(_frameCount, frameStart, cpuMs, geMs, presentMs);
+  }
+  // Update the perf HUD text at ~5Hz, not every frame — the counters are read by
+  // a human, so 60 text reflows/sec is wasted layout work. Force an update when
+  // paused so single-stepping shows fresh values immediately.
+  const hudNow = performance.now();
+  if (_paused || hudNow - _lastHudUpdate >= HUD_UPDATE_MS) {
+    _lastHudUpdate = hudNow;
+    if (_hudFps)   _hudFps.textContent   = String(_fpsValue);
+    if (_hudFrame) _hudFrame.textContent = String(_frameCount);
+    if (_hudTid)   _hudTid.textContent   = String(emulator.hle.currentThreadId);
+    if (_hudPc)    _hudPc.textContent    = emulator.cpu.regs.pc.toString(16);
+  }
 
-  debugPanel?.update(emulator, cpuMs);
+  debugPanel?.update(emulator, cpuMs, presentMs);
 
   if (emulator.halted) {
     stopRafLoop();
@@ -508,18 +702,79 @@ function runOneFrame(): void {
   }
 }
 
+/** Print a per-frame profiler summary for displayed frames [from, to]. Splits the
+ *  full frame period into CPU (runFrame = interpreter + inline GE), present (GPU
+ *  submit), and idle (vsync/overhead). A frame's period needs the next frame's
+ *  start, so the last frame in range contributes to CPU/present but not the period
+ *  average. Enable recording first via ?perf or _dbgPerf.start(). */
+function dbgPerfReport(from = 11, to = Number.MAX_SAFE_INTEGER): void {
+  const byFrame = new Map(_perfFrames.toArray().map((r): [number, PerfFrame] => [r.frame, r]));
+  const rows: { frame: number; cpuMs: number; geMs: number; interpMs: number; presentMs: number; periodMs: number }[] = [];
+  for (let n = from; n <= to; n++) {
+    const r = byFrame.get(n); if (!r) continue;
+    const next = byFrame.get(n + 1);
+    rows.push({
+      frame: n, cpuMs: r.cpuMs, geMs: r.geMs, interpMs: Math.max(0, r.cpuMs - r.geMs),
+      presentMs: r.presentMs, periodMs: next ? next.startTs - r.startTs : NaN,
+    });
+  }
+  if (rows.length === 0) {
+    console.log(`[PERF] no recorded frames in ${from}..${to} — enable with ?perf or _dbgPerf.start()`);
+    return;
+  }
+  const withPeriod = rows.filter(r => !Number.isNaN(r.periodMs));
+  const mean = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : NaN);
+  const cpu = mean(rows.map(r => r.cpuMs));
+  const ge = mean(rows.map(r => r.geMs));
+  const interp = mean(rows.map(r => r.interpMs));
+  const present = mean(rows.map(r => r.presentMs));
+  const period = mean(withPeriod.map(r => r.periodMs));
+  const idle = period - cpu - present;
+  const pct = (x: number) => (Number.isFinite(period) && period > 0 ? `${(100 * x / period).toFixed(0)}%` : "?");
+  console.log(`[PERF] displayed frames ${rows[0]!.frame}-${rows[rows.length - 1]!.frame} (${rows.length} frames, ${withPeriod.length} with period)`);
+  console.log(`[PERF]   CPU runFrame: ${cpu.toFixed(1)} ms (${pct(cpu)})`);
+  console.log(`[PERF]     interpreter: ${interp.toFixed(1)} ms (${pct(interp)})  = MIPS game code`);
+  console.log(`[PERF]     inline GE:   ${ge.toFixed(1)} ms (${pct(ge)})  = GE cmds + vertex xform + GL submit`);
+  console.log(`[PERF]   present/GPU:  ${present.toFixed(1)} ms (${pct(present)})  = host GPU`);
+  console.log(`[PERF]   idle/vsync:   ${idle.toFixed(1)} ms (${pct(idle)})`);
+  console.log(`[PERF]   frame total:  ${period.toFixed(1)} ms  ->  ${(1000 / period).toFixed(1)} fps`);
+  console.table(rows.map(r => ({
+    frame: r.frame,
+    interpMs: +r.interpMs.toFixed(1), geMs: +r.geMs.toFixed(1), cpuMs: +r.cpuMs.toFixed(1),
+    presentMs: +r.presentMs.toFixed(1), periodMs: Number.isNaN(r.periodMs) ? null : +r.periodMs.toFixed(1),
+  })));
+}
+
 function startRafLoop(): void {
   if (rafHandle !== 0) return;
 
   // Wire pause/step buttons
   document.getElementById("pause-btn")?.addEventListener("click", togglePause);
   document.getElementById("step-btn")?.addEventListener("click", doSingleFrame);
+
+  // Cache HUD refs so the frame loop doesn't query the DOM every frame
+  _hudFps   = document.getElementById("hud-fps");
+  _hudFrame = document.getElementById("hud-frame");
+  _hudTid   = document.getElementById("hud-tid");
+  _hudPc    = document.getElementById("hud-pc");
+  _lastHudUpdate = 0;
+
   _frameCount = 0;
   _fpsLastTime = performance.now();
   _lastFrameTime = performance.now();
   _fpsFrames = 0;
   _fpsValue = 0;
   _paused = false;
+  // Auto-pause target from ?pauseAt=N (a live _dbgPauseAt() call after boot wins).
+  _pauseAtFrame = 0;
+  const pauseAt = Number(new URLSearchParams(location.search).get("pauseAt"));
+  if (Number.isFinite(pauseAt) && pauseAt > 0) _pauseAtFrame = Math.floor(pauseAt);
+  // Frame profiler: the Profiler boot option (or ?perf) records per-frame CPU vs
+  // present time, shown live in the debug panel and auto-printed (frames
+  // 11..pauseAt-1) when the auto-pause fires. Reset the buffer each boot.
+  _perfFrames.clear();
+  _perfEnabled = isProfilerEnabled() || new URLSearchParams(location.search).has("perf");
+  if (debugPanel) debugPanel.profilerEnabled = _perfEnabled;
 
   rafHandle = requestAnimationFrame(frameLoop);
 }
@@ -690,7 +945,7 @@ async function loadCompanionFiles(
 }
 
 // ── ISO loading ───────────────────────────────────────────────────────────────
-async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle): Promise<void> {
+async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle, autoBoot = false): Promise<void> {
   clearError();
   clearGameVideo();
   clearGameAudio();
@@ -712,7 +967,7 @@ async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle): Pro
       pendingDirFiles = await loadCompanionFiles(parentDir, "disc0:");
       pendingStartDir = "disc0:/";
     }
-    await handleEboot(file);
+    await handleEboot(file, autoBoot);
     return;
   }
 
@@ -775,8 +1030,19 @@ async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle): Pro
     saveDetail: meta.saveDetail,
   };
 
-  // Show card immediately with static assets
   currentGameSlug = gameSlug(gameInfo.discId, file.name);
+
+  // Instant boot: skip the options screen and the icon/audio preview, go straight
+  // into the game. The ISO filesystem + EBOOT are already loaded above.
+  if (autoBoot) {
+    optionsScreenReady = false;
+    setStatus(`Booting ${gameInfo.title}…`);
+    bootGame();
+    return;
+  }
+
+  // Show options screen with static assets
+  optionsScreenReady = true;
   showGameView(gameInfo, meta.iconUrl ?? undefined, meta.bgUrl ?? undefined, meta.logoUrl ?? undefined);
   showFileTree(volume.root);
   setStatus(`Loaded: ${gameInfo.title}${gameInfo.discId ? ` · ${gameInfo.discId}` : ""}`);
@@ -921,7 +1187,7 @@ async function handleDirectory(files: FileList): Promise<void> {
 }
 
 // ── Direct EBOOT / PBP loading ────────────────────────────────────────────────
-async function handleEboot(file: File): Promise<void> {
+async function handleEboot(file: File, autoBoot = false): Promise<void> {
   clearError();
   clearGameVideo();
   clearGameAudio();
@@ -953,6 +1219,16 @@ async function handleEboot(file: File): Promise<void> {
     saveDetail: ""
   };
 
+  currentGameSlug = gameSlug(gameInfo.discId, file.name);
+
+  if (autoBoot) {
+    optionsScreenReady = false;
+    setStatus(`Booting ${gameInfo.title}…`);
+    bootGame();
+    return;
+  }
+
+  optionsScreenReady = true;
   showGameView(gameInfo, undefined, undefined, undefined);
   setStatus("Direct ELF boot — disc filesystem not available");
 }

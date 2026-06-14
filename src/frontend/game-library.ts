@@ -151,12 +151,45 @@ const STYLES = `
   color: #c9d1d9;
 }
 
+.header__controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.search {
+  background: #0b0e14;
+  border: 1px solid #2a313c;
+  color: #e6edf3;
+  padding: 7px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  width: 200px;
+  max-width: 46vw;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.search::placeholder { color: #6e7681; }
+.search:focus { border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15); }
+
+.sort {
+  background: #1c232d;
+  border: 1px solid #2a313c;
+  color: #c9d1d9;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.sort:hover { border-color: #58a6ff; }
+
 .change-btn {
   background: transparent;
   border: 1px solid #30363d;
   color: #8b949e;
-  padding: 6px 14px;
-  border-radius: 6px;
+  padding: 7px 14px;
+  border-radius: 8px;
   cursor: pointer;
   font-size: 12px;
   transition: border-color 0.15s, color 0.15s;
@@ -164,6 +197,13 @@ const STYLES = `
 .change-btn:hover {
   border-color: #58a6ff;
   color: #58a6ff;
+}
+
+.empty-filter {
+  padding: 60px 20px;
+  text-align: center;
+  color: #8b949e;
+  font-size: 14px;
 }
 
 .empty {
@@ -277,6 +317,55 @@ const STYLES = `
   font-size: 32px;
 }
 
+/* Play affordance — appears over the art on hover */
+.card__play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 46px;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(88, 166, 255, 0.92);
+  color: #07101f;
+  font-size: 18px;
+  padding-left: 3px;
+  opacity: 0;
+  transform: scale(0.8);
+  transition: opacity 0.15s, transform 0.15s;
+  pointer-events: none;
+  z-index: 2;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+.card:hover .card__play { opacity: 1; transform: scale(1); }
+
+/* Gear — opens boot options without booting */
+.card__gear {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 7px;
+  background: rgba(13, 17, 23, 0.72);
+  backdrop-filter: blur(4px);
+  color: #c9d1d9;
+  font-size: 14px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s, border-color 0.15s;
+  z-index: 3;
+}
+.card:hover .card__gear { opacity: 1; }
+.card__gear:hover { background: #1c232d; color: #58a6ff; border-color: #58a6ff; }
+
 .card__loading {
   position: absolute;
   bottom: 4px;
@@ -352,6 +441,10 @@ export class GameLibrary extends HTMLElement {
   private _hoverCard: HTMLElement | null = null;
   /** Cache: fileKey → { pmfData, at3Url } so we don't re-extract on re-hover */
   private _mediaCache = new Map<string, { pmfData: Uint8Array | null; at3Url: string | null }>();
+
+  // Grid filter / sort state
+  private _filter = "";
+  private _sort: "title" | "size" = "title";
 
   constructor() {
     super();
@@ -455,6 +548,7 @@ export class GameLibrary extends HTMLElement {
 
   private renderGrid(): void {
     const hasApi = typeof window.showDirectoryPicker === "function";
+    if (this.games.length > 0) { this._renderGridFull(hasApi); return; }
     let html = `<div class="header">
       <h2>Games (${this.games.length})</h2>
       <div>
@@ -463,62 +557,131 @@ export class GameLibrary extends HTMLElement {
       </div>
     </div>`;
 
-    if (this.games.length === 0) {
-      html += `<div class="empty">
+    html += `<div class="empty">
         <p class="empty__label">No ISO or PBP files found in this folder</p>
         ${hasApi ? `<button class="select-btn" data-action="change">Choose Another Folder</button>` : ""}
       </div>`;
-    } else {
-      html += `<div class="grid">`;
-      for (const game of this.games) {
-        const thumb = game.iconDataUrl
-          ? `<img class="card__thumb" src="${game.iconDataUrl}" alt="" />`
-          : `<div class="card__fallback">💿</div>`;
-        html += `
-          <div class="card" data-file="${this.escAttr(game.fileName)}" data-size="${game.fileSize}">
-            <div class="card__media">${thumb}</div>
-            <div class="card__body">
-              <div class="card__title">${this.escHtml(game.title)}</div>
-              <div class="card__disc-id">${this.escHtml(game.discId || "\u00a0")}</div>
-            </div>
-          </div>
-        `;
-      }
-      html += `</div>`;
-    }
 
     this.container.innerHTML = html;
 
-    // Bind events
-    for (const card of this.container.querySelectorAll(".card")) {
-      card.addEventListener("click", () => {
-        this._stopHoverPreview();
+    this.container.querySelector('[data-action="change"]')
+      ?.addEventListener("click", () => void this.pickDirectory());
+    this.container.querySelector('[data-action="refresh"]')
+      ?.addEventListener("click", () => void this.refresh());
+  }
 
-        const fileName = (card as HTMLElement).dataset.file!;
-        const fileSize = Number((card as HTMLElement).dataset.size!);
-        const fileKey = `${fileName}:${fileSize}`;
-        void this._getFile(fileKey).then(file => {
-          if (file) {
-            this.dispatchEvent(new CustomEvent("game-select", {
-              bubbles: true,
-              composed: true,
-              detail: { file, parentDir: this.parentDirMap.get(fileKey) ?? null },
-            }));
-          }
-        });
+  /** Render the populated library: header with search + sort, plus the card grid. */
+  private _renderGridFull(hasApi: boolean): void {
+    this.container.innerHTML = `<div class="header">
+        <h2>Games (<span class="game-count">${this.games.length}</span>)</h2>
+        <div class="header__controls">
+          <input class="search" type="search" placeholder="Search games…" aria-label="Search games" />
+          <select class="sort" aria-label="Sort games">
+            <option value="title">Sort: Title</option>
+            <option value="size">Sort: Size</option>
+          </select>
+          <button class="change-btn" data-action="refresh">Refresh</button>
+          ${hasApi ? `<button class="change-btn" data-action="change">Change Folder</button>` : ""}
+        </div>
+      </div>
+      <div class="grid"></div>
+      <div class="empty-filter" hidden>No games match your search.</div>`;
+
+    const search = this.container.querySelector<HTMLInputElement>(".search");
+    if (search) {
+      search.value = this._filter;
+      search.addEventListener("input", () => {
+        this._filter = search.value;
+        this._renderCards();
       });
     }
-
-    // Hover preview: mouseenter → start, mouseleave → stop
-    for (const card of this.container.querySelectorAll(".card")) {
-      card.addEventListener("mouseenter", () => void this._startHoverPreview(card as HTMLElement));
-      card.addEventListener("mouseleave", () => this._stopHoverPreview());
+    const sort = this.container.querySelector<HTMLSelectElement>(".sort");
+    if (sort) {
+      sort.value = this._sort;
+      sort.addEventListener("change", () => {
+        this._sort = sort.value === "size" ? "size" : "title";
+        this._renderCards();
+      });
     }
 
     this.container.querySelector('[data-action="change"]')
       ?.addEventListener("click", () => void this.pickDirectory());
     this.container.querySelector('[data-action="refresh"]')
       ?.addEventListener("click", () => void this.refresh());
+
+    this._renderCards();
+  }
+
+  private _visibleGames(): GameMeta[] {
+    const q = this._filter.trim().toLowerCase();
+    let list = this.games;
+    if (q) {
+      list = list.filter(g =>
+        g.title.toLowerCase().includes(q) || g.discId.toLowerCase().includes(q));
+    }
+    return [...list].sort(this._sort === "size"
+      ? (a, b) => b.fileSize - a.fileSize
+      : (a, b) => a.title.localeCompare(b.title));
+  }
+
+  /** Render just the card grid — called on first paint and on filter/sort changes
+   *  so the search input keeps focus. */
+  private _renderCards(): void {
+    this._stopHoverPreview();
+    const grid  = this.container.querySelector<HTMLElement>(".grid");
+    const empty = this.container.querySelector<HTMLElement>(".empty-filter");
+    const count = this.container.querySelector<HTMLElement>(".game-count");
+    if (!grid) return;
+
+    const games = this._visibleGames();
+    if (count) count.textContent = String(games.length);
+    if (empty) empty.hidden = games.length > 0;
+
+    grid.innerHTML = games.map(game => {
+      const thumb = game.iconDataUrl
+        ? `<img class="card__thumb" src="${game.iconDataUrl}" alt="" />`
+        : `<div class="card__fallback">💿</div>`;
+      const discId = game.discId ? this.escHtml(game.discId) : "&nbsp;";
+      return `
+        <div class="card" data-file="${this.escAttr(game.fileName)}" data-size="${game.fileSize}" title="Click to boot ${this.escAttr(game.title)}">
+          <div class="card__media">
+            ${thumb}
+            <button class="card__play" aria-hidden="true" tabindex="-1">▶</button>
+            <button class="card__gear" data-action="options" title="Boot options" aria-label="Boot options">⚙</button>
+          </div>
+          <div class="card__body">
+            <div class="card__title">${this.escHtml(game.title)}</div>
+            <div class="card__disc-id">${discId}</div>
+          </div>
+        </div>`;
+    }).join("");
+
+    for (const card of grid.querySelectorAll<HTMLElement>(".card")) {
+      // Click anywhere on the card boots the game straight away.
+      card.addEventListener("click", () => this._selectGame(card, "boot"));
+      // The gear opens boot options instead (metadata + renderer/audio settings).
+      card.querySelector('[data-action="options"]')?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._selectGame(card, "options");
+      });
+      card.addEventListener("mouseenter", () => void this._startHoverPreview(card));
+      card.addEventListener("mouseleave", () => this._stopHoverPreview());
+    }
+  }
+
+  private _selectGame(card: HTMLElement, mode: "boot" | "options"): void {
+    this._stopHoverPreview();
+    const fileName = card.dataset.file!;
+    const fileSize = Number(card.dataset.size!);
+    const fileKey = `${fileName}:${fileSize}`;
+    void this._getFile(fileKey).then(file => {
+      if (!file) return;
+      this.dispatchEvent(new CustomEvent("game-select", {
+        bubbles: true,
+        composed: true,
+        detail: { file, parentDir: this.parentDirMap.get(fileKey) ?? null, mode },
+      }));
+    });
   }
 
   private async pickDirectory(): Promise<void> {

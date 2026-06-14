@@ -104,16 +104,14 @@ export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string, l
     info.parentalLevel > 0 ? (PARENTAL_LABELS[info.parentalLevel] ?? `Level ${info.parentalLevel}`) : "—";
 
   const saveTitleEl = document.getElementById("game-save-title")  as HTMLElement;
-  const saveLabelEl = document.getElementById("game-save-title-label") as HTMLElement;
+  const saveRowEl   = document.getElementById("game-save-row")    as HTMLElement | null;
   if (info.saveTitle) {
     saveTitleEl.textContent = info.saveDetail
       ? `${info.saveTitle} — ${info.saveDetail}`
       : info.saveTitle;
-    saveTitleEl.hidden = false;
-    saveLabelEl.hidden = false;
+    if (saveRowEl) saveRowEl.hidden = false;
   } else {
-    saveTitleEl.hidden = true;
-    saveLabelEl.hidden = true;
+    if (saveRowEl) saveRowEl.hidden = true;
   }
 
   const card = document.querySelector(".game-card") as HTMLElement;
@@ -190,6 +188,9 @@ export function showGameplayView(): void {
   const audio = document.getElementById("game-audio") as HTMLAudioElement;
   if (!audio.paused) audio.pause();
 
+  // Hide both the library and the options screen — gameplay is its own page.
+  // (Instant boot skips the options screen, so we must hide the library here.)
+  if (gameLibraryEl) gameLibraryEl.hidden = true;
   gameViewEl.hidden      = true;
   gameplayViewEl.hidden  = false;
   setStatus("Gameplay mode  ·  Tab / H — controls overlay");
