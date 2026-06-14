@@ -3,6 +3,7 @@ import { MemoryBus } from "../memory/memory-bus.js";
 import { MemoryRegion } from "../memory/memory-map.js";
 import { decodeInto } from "./decoder.js";
 import { executeInstruction } from "./executor.js";
+import type { CpuProfiler } from "./cpu-profiler.js";
 import type { Instruction } from "./instruction.js";
 import type { HLEKernel } from "../kernel/hle-kernel.js";
 import { Logger } from "../utils/logger.js";
@@ -68,6 +69,10 @@ export class AllegrexCPU {
   /** Optional callback for BREAK instructions. If it returns true, execution continues. */
   onBreak: ((pc: number) => boolean) | null = null;
 
+  /** Optional interpreter profiler. Null on a normal run (one null-check per step);
+   *  set it to count instruction mix + sample hot PCs. See cpu-profiler.ts. */
+  profiler: CpuProfiler | null = null;
+
   constructor(readonly bus: MemoryBus) {}
 
   // Circular buffer for last N PCs (debug trace)
@@ -115,6 +120,9 @@ export class AllegrexCPU {
 
     const instr = this._instr;
     decodeInto(instr, raw, pc);
+
+    // Interpreter profiler — null on a normal run, so this is one branch per step.
+    if (this.profiler !== null) this.profiler.tick(instr.op, instr.funct, pc, raw);
 
     const inDelaySlot = this.inDelaySlot;
     const delayTarget = this.delaySlotTarget;
