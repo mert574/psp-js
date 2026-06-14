@@ -32,7 +32,8 @@ export class SavedataOverlay extends LitElement {
     }
     .card.fade-out { opacity: 0; }
     .label {
-      font: 700 9px/1 var(--mono, monospace);
+      font: var(--fw-heavy) 9px/1 var(--ui);
+      font-stretch: var(--ui-condensed);
       letter-spacing: 0.12em;
       text-transform: uppercase;
       color: var(--faint, #6e7681);
@@ -47,8 +48,8 @@ export class SavedataOverlay extends LitElement {
       animation: spin 0.7s linear infinite;
       flex-shrink: 0;
     }
-    .text { font: 12px/1.3 var(--mono, monospace); color: var(--text, #e0e0e0); white-space: nowrap; }
-    .action { color: var(--accent, #4a9eff); font-weight: 600; }
+    .text { font: 12px/1.3 var(--ui); font-stretch: var(--ui-condensed); color: var(--text, #e0e0e0); white-space: nowrap; }
+    .action { color: var(--accent, #4a9eff); font-weight: var(--fw-bold); }
     .action.done { color: var(--ok, #4aef7a); }
     .action.err  { color: var(--danger, #ef4a4a); }
     .detail { color: var(--muted, #888); margin-left: 4px; }
