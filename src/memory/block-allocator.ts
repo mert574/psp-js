@@ -148,6 +148,15 @@ export class BlockAllocator {
     return true;
   }
 
+  /** Snapshot of every block (free and taken), low address first, for inspection. */
+  listBlocks(): Array<{ start: number; size: number; taken: boolean; tag: string }> {
+    const out: Array<{ start: number; size: number; taken: boolean; tag: string }> = [];
+    for (let bp = this.bottom; bp !== null; bp = bp.next) {
+      out.push({ start: bp.start, size: bp.size, taken: bp.taken, tag: bp.tag });
+    }
+    return out;
+  }
+
   getTotalFreeBytes(): number {
     let total = 0;
     for (let bp = this.bottom; bp !== null; bp = bp.next) {

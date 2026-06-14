@@ -3,20 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>PSP.js</title>
   </head>
   <body>
-    <header>
-      <a href="/" class="header-logo" style="text-decoration:none;color:inherit">PSP.js</a>
+    <header class="app-bar">
+      <a href="/" class="app-bar__logo" aria-label="PSP.js home">
+        <span class="app-bar__mark">PSP</span><span class="app-bar__dot">.js</span>
+      </a>
+      <span class="app-bar__tag">PlayStation Portable emulator</span>
+      <span class="app-bar__spacer"></span>
+      <a class="app-bar__link" href="https://github.com/mert574/psp-js" target="_blank" rel="noopener">GitHub</a>
     </header>
 
-    <div id="error-banner">
+    <div id="error-banner" role="alert">
+      <span class="error-banner__icon" aria-hidden="true">⚠</span>
       <span id="error-message"></span>
       <button class="error-banner__close" id="error-close" aria-label="Dismiss">✕</button>
     </div>
 
     <main>
-      <!-- Game library (replaces old file picker) -->
+      <!-- Game library (folder picker + grid) -->
       <game-library id="game-library"></game-library>
 
       <!-- Hidden fallback file inputs (used by legacy code paths) -->
@@ -24,51 +31,61 @@
       <input id="file-input-dir"   type="file" webkitdirectory              hidden />
       <input id="file-input-eboot" type="file" accept=".bin,.BIN,.pbp,.PBP" hidden />
 
-      <!-- Shown after ISO is loaded -->
+      <!-- Shown after a game is selected -->
       <section id="game-view" class="game-view" hidden>
         <div class="game-card">
-          <!-- Left: static icon (ICON0.PNG) -->
+          <img id="game-logo" class="game-card__logo" src="" alt="" hidden />
+
           <div class="game-card__media">
             <img id="game-icon" class="game-card__icon" src="" alt="" hidden />
             <div id="game-media-placeholder" class="game-card__placeholder" hidden></div>
             <div id="game-media-spinner" class="game-card__spinner" hidden></div>
           </div>
 
-          <!-- Right: metadata + actions -->
           <div class="game-card__body">
-            <img id="game-logo" class="game-card__logo" src="" alt="" hidden />
-            <div class="game-card__body-content">
-              <h2 id="game-title" class="game-card__title"></h2>
-              <dl class="game-card__meta">
-                <dt>Disc ID</dt>   <dd id="game-disc-id">—</dd>
-                <dt>Region</dt>    <dd id="game-region">—</dd>
-                <dt>Version</dt>   <dd id="game-version">—</dd>
-                <dt>Rating</dt>    <dd id="game-rating">—</dd>
-                <dt id="game-save-title-label" hidden>Save</dt> <dd id="game-save-title" hidden>—</dd>
-              </dl>
-            </div>
-            <div class="game-card__actions">
-              <button id="back-to-library-btn" class="btn btn--ghost">← Back</button>
-              <button id="boot-btn"   class="btn btn--primary">▶&nbsp;Boot</button>
-              <button id="audio-btn"  class="btn btn--ghost audio-btn--loading" hidden>🔊…</button>
-              <label class="debug-toggle" title="Skip all audio decoding and AudioEngine init (for performance testing)">
-                <input type="checkbox" id="disable-audio-chk" checked> Disable audio
+            <h2 id="game-title" class="game-card__title"></h2>
+
+            <dl class="game-card__meta">
+              <div class="meta-item"><dt>Disc ID</dt><dd id="game-disc-id">—</dd></div>
+              <div class="meta-item"><dt>Region</dt><dd id="game-region">—</dd></div>
+              <div class="meta-item"><dt>Version</dt><dd id="game-version">—</dd></div>
+              <div class="meta-item"><dt>Rating</dt><dd id="game-rating">—</dd></div>
+              <div class="meta-item" id="game-save-row" hidden>
+                <dt id="game-save-title-label">Save</dt><dd id="game-save-title">—</dd>
+              </div>
+            </dl>
+
+            <fieldset class="game-settings">
+              <legend>Boot options</legend>
+              <label class="setting setting--check" title="Skip all audio decoding and AudioEngine init (faster boot, useful for performance testing)">
+                <input type="checkbox" id="disable-audio-chk" checked>
+                <span>Disable audio</span>
               </label>
-              <label class="debug-toggle" title="Renderer used for GE primitives (applies on boot). Software rasterizes into VRAM on the CPU — slower but useful for comparing against WebGL output.">
-                Renderer
+              <label class="setting setting--check" title="Record per-frame CPU (interpreter + GE) vs present (GPU) time and show it live in the debug panel. Small overhead; for performance measurement.">
+                <input type="checkbox" id="profiler-chk">
+                <span>Profiler</span>
+              </label>
+              <label class="setting" title="WebGL draws GE primitives on the GPU. Software rasterizes into VRAM on the CPU — slower but useful for comparing output.">
+                <span>Renderer</span>
                 <select id="renderer-select">
                   <option value="webgl" selected>WebGL</option>
                   <option value="software">Software</option>
                 </select>
               </label>
-              <label class="debug-toggle" title="Internal rendering resolution (WebGL only, applies on boot). Higher values render 3D geometry at a larger resolution for sharper output on big screens, at a GPU cost.">
-                Resolution
+              <label class="setting" title="Internal rendering resolution (WebGL only). Higher values render 3D geometry larger for sharper output, at a GPU cost.">
+                <span>Resolution</span>
                 <select id="resolution-select">
                   <option value="1" selected>1× (480×272)</option>
                   <option value="2">2× (960×544)</option>
                   <option value="3">3× (1440×816)</option>
                 </select>
               </label>
+            </fieldset>
+
+            <div class="game-card__actions">
+              <button id="back-to-library-btn" class="btn btn--ghost">← Library</button>
+              <button id="boot-btn"   class="btn btn--primary">▶ Boot game</button>
+              <button id="audio-btn"  class="btn btn--ghost audio-btn--loading" hidden>🔊…</button>
             </div>
           </div>
         </div>
@@ -77,7 +94,7 @@
 
         <!-- Collapsible ISO file tree -->
         <details class="iso-tree">
-          <summary class="iso-tree__summary">ISO Contents</summary>
+          <summary class="iso-tree__summary">ISO contents</summary>
           <div id="file-tree" class="iso-tree__body"></div>
         </details>
       </section>
@@ -89,13 +106,13 @@
           <!-- Left: game canvas + controls -->
           <div class="gameplay-primary">
             <div id="perf-bar" class="perf-bar">
-              <span>FPS <b id="hud-fps">0</b></span>
-              <span>Frame <b id="hud-frame">0</b></span>
-              <span>TID <b id="hud-tid">-</b></span>
-              <span>PC <b id="hud-pc">-</b></span>
+              <span title="Frames per second">FPS <b id="hud-fps">0</b></span>
+              <span title="Frame number">Frame <b id="hud-frame">0</b></span>
+              <span title="Current thread ID">TID <b id="hud-tid">-</b></span>
+              <span title="Program counter">PC <b id="hud-pc">-</b></span>
               <span class="perf-bar__spacer"></span>
-              <button id="pause-btn" class="perf-bar__btn">⏸</button>
-              <button id="step-btn" class="perf-bar__btn" disabled>⏭</button>
+              <button id="pause-btn" class="perf-bar__btn" title="Pause / resume">⏸</button>
+              <button id="step-btn" class="perf-bar__btn" title="Step one frame" disabled>⏭</button>
             </div>
 
             <div class="gameplay-screen">
@@ -136,61 +153,27 @@
 
             <div class="gameplay-toolbar">
               <button id="exit-btn" class="btn btn--ghost">← Back</button>
-              <span class="perf-bar__group" title="Display scale">
-                <button class="perf-bar__btn perf-bar__btn--active" data-scale="1">1x</button>
-                <button class="perf-bar__btn" data-scale="2">2x</button>
-                <button class="perf-bar__btn" data-scale="3">3x</button>
+              <span class="seg" title="Display scale">
+                <button class="seg__btn" data-scale="1">1×</button>
+                <button class="seg__btn seg__btn--active" data-scale="2">2×</button>
+                <button class="seg__btn" data-scale="3">3×</button>
               </span>
-              <span class="perf-bar__group" title="Emulation speed">
-                <button class="perf-bar__btn perf-bar__btn--active" data-speed="1">1×</button>
-                <button class="perf-bar__btn" data-speed="2">2×</button>
-                <button class="perf-bar__btn" data-speed="4">4×</button>
+              <span class="seg" title="Emulation speed">
+                <button class="seg__btn seg__btn--active" data-speed="1">1×</button>
+                <button class="seg__btn" data-speed="2">2×</button>
+                <button class="seg__btn" data-speed="4">4×</button>
               </span>
               <button id="fullscreen-btn" class="btn btn--ghost" title="Fullscreen">⛶ Fullscreen</button>
-              <span class="gameplay-toolbar__hint">Tab / H — toggle controls</span>
+              <span class="gameplay-toolbar__spacer"></span>
+              <button id="toggle-debug-btn" class="btn btn--ghost" title="Show / hide the debug panel" aria-pressed="false">Debug ▸</button>
+              <span class="gameplay-toolbar__hint">Tab / H — controls</span>
             </div>
           </div>
 
-          <!-- Right: debug sidebar -->
-          <aside id="debug-panel" class="debug-sidebar">
-            <h3 class="debug-sidebar__title">Debug</h3>
-
-            <section class="debug-section">
-              <h4 class="debug-section__title">Performance</h4>
-              <div id="debug-perf-body" class="debug-perf"></div>
-            </section>
-
-            <section class="debug-section">
-              <h4 class="debug-section__title">Threads</h4>
-              <table class="debug-threads">
-                <thead><tr><th>TID</th><th>State / Wait</th><th>Prio</th><th>PC</th></tr></thead>
-                <tbody id="debug-threads-body"></tbody>
-              </table>
-            </section>
-
-            <section class="debug-section">
-              <h4 class="debug-section__title">GE</h4>
-              <div id="debug-ge-body" class="debug-ge"></div>
-            </section>
-
-            <section class="debug-section">
-              <h4 class="debug-section__title">Save Data</h4>
-              <div id="debug-savedata-body" class="debug-stubs"></div>
-            </section>
-
-            <section class="debug-section">
-              <h4 class="debug-section__title">Stubs Called</h4>
-              <div id="debug-stubs-body" class="debug-stubs"></div>
-            </section>
-
-            <section class="debug-section">
-              <h4 class="debug-section__title">Log <span style="color:var(--muted);font-weight:normal">(warn / error)</span></h4>
-              <div id="debug-log-body" class="debug-log"></div>
-            </section>
-          </aside>
+          <!-- Right: debug panel (web component; pushes the canvas aside when open) -->
+          <debug-panel id="debug-panel"></debug-panel>
 
         </div>
-
       </section>
     </main>
 

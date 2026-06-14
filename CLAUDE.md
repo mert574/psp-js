@@ -34,8 +34,8 @@ PSPEmulator (src/emulator.ts)
 ├── MemoryBus         — 64MB RAM (0x08000000), 2MB VRAM (0x04000000), 16KB scratchpad (src/memory/)
 ├── HLEKernel         — Syscall dispatch, thread scheduler, all sceXxx handlers (src/kernel/hle-*.ts)
 ├── CoreTiming        — Cycle-accurate event scheduler (models PPSSPP CoreTiming.cpp) (src/timing/)
-├── GeDispatcher      — Coordinates GE command lists with Web Worker (src/gpu/)
-└── GE Worker         — Off-thread GE command processing via SharedArrayBuffer (src/gpu/ge-worker.ts)
+├── GEProcessor       — GE command processing, runs INLINE on the main thread (src/gpu/ge-processor.ts)
+└── GeDispatcher      — Web Worker GE path; DEAD CODE, never initialized (src/gpu/ge-dispatcher.ts + ge-worker.ts)
 ```
 
 ### Major Subsystems
@@ -89,9 +89,13 @@ kernel.register(THREAD.sceKernelCreateThread, handler);
 
 Models PPSSPP's `CoreTiming.cpp`. CPU_HZ starts at 222MHz (not 333MHz), changes dynamically via `scePowerSetClockFrequency`. VBlank fires every ~16.683ms. Events scheduled by cycle count, not wall clock.
 
-### GE Worker
+### GE Worker (DISABLED: GE actually runs INLINE on the main thread)
 
-GPU command lists processed on a Web Worker with SharedArrayBuffer. The worker reads GE commands from shared RAM, writes pixels to shared VRAM. Block transfers (`doBlockTransfer`) can write to RAM — this is a source of data races.
+The Web Worker path (`GeDispatcher`, `src/gpu/ge-worker.ts`) exists but is **dead code**. `initGeWorker()` is never called, so `geDispatcher` is always null and every GE path falls through `if (!this.geDispatcher) this._processGeQueue()`. GE runs **inline on the main thread** in BOTH browser and headless: `_processGeQueue` → `_scanAndCompleteGeList` → `_scanGeListHeadless` → `GEProcessor.executeCommand` (one call per GE command). The worker was turned off because of a postMessage/stall race (`emulator.ts initWorker` is a no-op). Reviving it is a real, currently-unrealized way to offload GE work from the main thread so it runs next to the interpreter.
+
+Profiling note: to measure GE cost, hook `GEProcessor.executeCommand` (the live inline entry). Do NOT hook `executeList`/`executeListBudgeted`; they are not on the inline path, so a wrapper there records zero calls and silently hides GE time inside what looks like "interpreter" time.
+
+Block transfers (`doBlockTransfer`) can write to RAM, a source of data races if the worker is ever revived.
 
 GE finish callbacks use a mini-CPU-loop with BREAK trampoline at `0x08000010`. Stack space (512 bytes) is reserved below `$sp` to prevent corruption.
 
