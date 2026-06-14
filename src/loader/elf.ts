@@ -68,8 +68,6 @@ const MIPS_SYSCALL = 0x0000000c; // syscall (code in bits 25:6)
 
 // Well-known export NIDs
 const NID_MODULE_START = 0xD632ACDB;
-const NID_MODULE_STOP  = 0xCEE8593C;
-const NID_MODULE_START_THREAD_PARAM = 0x0F7C276C;
 
 export interface LoadResult {
   entryPoint: number;

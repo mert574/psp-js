@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>PSP.js</title>
+    <link rel="stylesheet" href="/src/frontend/style.css" />
   </head>
   <body>
     <header class="app-bar">
@@ -84,8 +85,8 @@
 
             <div class="game-card__actions">
               <button id="back-to-library-btn" class="btn btn--ghost">← Library</button>
-              <button id="boot-btn"   class="btn btn--primary">▶ Boot game</button>
-              <button id="audio-btn"  class="btn btn--ghost audio-btn--loading" hidden>🔊…</button>
+              <button id="boot-btn"   class="btn btn--primary">Boot game</button>
+              <button id="audio-btn"  class="btn btn--ghost audio-btn--loading" hidden>Audio…</button>
             </div>
           </div>
         </div>
@@ -111,8 +112,8 @@
               <span title="Current thread ID">TID <b id="hud-tid">-</b></span>
               <span title="Program counter">PC <b id="hud-pc">-</b></span>
               <span class="perf-bar__spacer"></span>
-              <button id="pause-btn" class="perf-bar__btn" title="Pause / resume">⏸</button>
-              <button id="step-btn" class="perf-bar__btn" title="Step one frame" disabled>⏭</button>
+              <button id="pause-btn" class="perf-bar__btn" title="Pause / resume">Pause</button>
+              <button id="step-btn" class="perf-bar__btn" title="Step one frame" disabled>Step</button>
             </div>
 
             <div class="gameplay-screen">
@@ -163,7 +164,7 @@
                 <button class="seg__btn" data-speed="2">2×</button>
                 <button class="seg__btn" data-speed="4">4×</button>
               </span>
-              <button id="fullscreen-btn" class="btn btn--ghost" title="Fullscreen">⛶ Fullscreen</button>
+              <button id="fullscreen-btn" class="btn btn--ghost" title="Fullscreen">Fullscreen</button>
               <span class="gameplay-toolbar__spacer"></span>
               <button id="toggle-debug-btn" class="btn btn--ghost" title="Show / hide the debug panel" aria-pressed="false">Debug ▸</button>
               <span class="gameplay-toolbar__hint">Tab / H — controls</span>

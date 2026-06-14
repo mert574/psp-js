@@ -5,14 +5,6 @@ import { Logger } from "../utils/logger.js";
 
 const log = Logger.get("CPU");
 
-/** Clamp float-to-int result — matches real PSP hardware behavior. */
-function vfpuFloatToInt(v: number): number {
-  if (!isFinite(v) || isNaN(v)) return 0x7FFFFFFF; // Inf, -Inf, NaN → INT_MAX
-  if (v >= 2147483647) return 0x7FFFFFFF;
-  if (v <= -2147483648) return 0x80000000;
-  return (v | 0) >>> 0;
-}
-
 /** IEEE 754 round-to-nearest-even (banker's rounding). */
 function roundToNearestEven(x: number): number {
   const f = Math.floor(x);
@@ -1025,11 +1017,6 @@ function vfpuOffset(reg: number): number {
   return mtx + col * 4 + row;
 }
 
-/** Read a single VFPU element as u32 bits. */
-function vfpuReadBits(r: AllegrexRegisters, reg: number): number {
-  return r.getVfprBits(vfpuOffset(reg));
-}
-
 // ── VFPU operand prefixes (vpfxs/vpfxt/vpfxd) ──────────────────────────────
 // Prefix word layout (PPSSPP GPUState / MIPSIntVFPU ApplySwizzleS/T):
 //   bits 0-7:  swizzle, 2 bits per lane (source lane index)
@@ -1897,32 +1884,6 @@ function execVFPU3(cpu: AllegrexCPU, i: Instruction): void {
 }
 
 // ── VFPU matrix helpers ──────────────────────────────────────────────
-
-/** Get column vector register names for a matrix register. */
-function getMatrixColumns(reg: number, n: number): number[] {
-  const col = reg & 3;
-  const row = (reg >>> 5) & 2;
-  const transpose = (reg >>> 5) & 1;
-  const vecs: number[] = [];
-  for (let k = 0; k < n; k++) {
-    vecs.push((transpose << 5) | (row << 5) | (reg & 0x1C) | ((k + col) & 3));
-  }
-  return vecs;
-}
-
-/** Get row vector register names for a matrix register. */
-function getMatrixRows(reg: number, n: number): number[] {
-  const col = reg & 3;
-  const row = (reg >>> 5) & 2;
-  const swappedCol = row ? (n === 3 ? 1 : 2) : 0;
-  const swappedRow = col ? 2 : 0;
-  const transpose = ((reg >>> 5) & 1) ^ 1;
-  const vecs: number[] = [];
-  for (let k = 0; k < n; k++) {
-    vecs.push((transpose << 5) | (swappedRow << 5) | (reg & 0x1C) | ((k + swappedCol) & 3));
-  }
-  return vecs;
-}
 
 /** Read an NxN matrix — matches PPSSPP ReadMatrix exactly.
  *  Output: rd[j*4+i] = register at computed flat index.

@@ -36,16 +36,12 @@ function peekElfModuleName(data: Uint8Array): string | null {
   if (eType !== 0xFFA0) return null; // not a PRX
 
   const phoff = view.getUint32(0x1c, le);
-  const phentsize = view.getUint16(0x2a, le);
   const phnum = view.getUint16(0x2c, le);
   if (phnum === 0) return null;
 
-  const pVaddr  = view.getUint32(phoff + 0x08, le);
   const pPaddr  = view.getUint32(phoff + 0x0c, le);
   const pOffset = view.getUint32(phoff + 0x04, le);
-  // Module info offset within the file
-  const modinfoFileOff = pOffset + (pPaddr & 0x7FFFFFFF) - pOffset + pOffset;
-  // Simpler: moduleinfo is at file_offset = pOffset + (pPaddr - pVaddr) for PRX
+  // moduleinfo is at file_offset = pOffset + (pPaddr - pVaddr) for PRX
   const miOff = pOffset + (pPaddr & 0x7FFFFFFF);
   if (miOff + 0x20 > data.byteLength) return null;
 

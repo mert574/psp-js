@@ -15,11 +15,11 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "@types/node": "^25.4.0",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3",
-    "vite": "^7.3.1",
-    "vitest": "^4.0.18"
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",
@@ -28,6 +28,7 @@
     "@libav.js/types": "^6.8.8",
     "libav.js": "^6.8.8",
     "libavjs-webcodecs-bridge": "^0.3.2",
+    "lit": "^3.3.3",
     "twgl.js": "^7.0.0"
   }
 }

@@ -2,7 +2,7 @@
  * amctrl — PGD decryption. Faithful port of PPSSPP ext/libkirk/amctrl.c
  */
 
-import { type AESCtx, aesCreateCtx, aesSetKey, aesEncryptBlock } from "./aes.js";
+import { aesCreateCtx, aesSetKey, aesEncryptBlock } from "./aes.js";
 import { type KirkState, kirkSceUtilsBufferCopyWithRange } from "./kirk.js";
 
 // ── Constants from amctrl.c ──────────────────────────────────────────

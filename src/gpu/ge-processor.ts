@@ -69,6 +69,7 @@ export class GEProcessor {
   private clearDepthWrite = false; // bit 10: write depth
 
   // Texture LOD slope (0xD0) — PPSSPP ge_constants.h:217
+  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
   private texLodSlope = 0.0;
 
   // Texture state
@@ -184,6 +185,7 @@ export class GEProcessor {
   // Patch state (PPSSPP: GE_CMD_PATCHDIVISION=0x36, PATCHPRIMITIVE=0x37, PATCHFACING=0x38)
   private patchDivU = 0;
   private patchDivV = 0;
+  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
   private patchPrimType = 0; // 0=triangles,1=lines,2=points
   private patchFacing = false;
 
@@ -282,9 +284,12 @@ export class GEProcessor {
   private immVscz = 0;
   private immVtcs = 0;
   private immVtct = 0;
+  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
   private immVtcq = 0;
   private immCv = 0;   // vertex color RGB (24 bits)
+  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
   private immFc = 0;   // fog coefficient
+  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
   private immScv = 0;  // secondary color (specular)
   private immBuffer: Vertex[] = [];
   private immPrim = -1; // current immediate prim type (-1 = none)
@@ -319,8 +324,6 @@ export class GEProcessor {
   private _dbgTotalCmds = 0;
   private _dbgAllOpcodes = new Map<number, number>(); // opcode -> total count
   private _dbgBadFbOff = 0; // draws skipped because fbOff was out of VRAM bounds
-  /** One-shot alpha=0 probe: logs once per unique (texFmt|texFunc|texFuncAlpha|blend) key. */
-  private _dbgAlpha0Seen = new Set<number>();
 
   /** Current GE draw framebuffer address (0 = VRAM offset 0 = 0x04000000). */
   private toPhysical(ptr: number): number {

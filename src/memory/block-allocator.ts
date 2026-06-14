@@ -16,7 +16,6 @@ interface Block {
 export class BlockAllocator {
   private bottom: Block | null = null;
   private top: Block | null = null;
-  private rangeStart = 0;
   private rangeSize = 0;
   private readonly grain: number;
 
@@ -28,7 +27,6 @@ export class BlockAllocator {
 
   init(rangeStart: number, rangeSize: number): void {
     this.shutdown();
-    this.rangeStart = rangeStart;
     this.rangeSize = rangeSize;
     const block: Block = { start: rangeStart, size: rangeSize, taken: false, tag: "", prev: null, next: null };
     this.bottom = block;

@@ -42,7 +42,7 @@ export function unlockAudio(): void {
 
 export function showAudioLoading(): void {
   const btn = document.getElementById("audio-btn") as HTMLButtonElement;
-  btn.textContent = "🔊…";
+  btn.textContent = "Audio…";
   btn.classList.add("audio-btn--loading");
   btn.disabled = true;
   btn.hidden   = false;
@@ -56,7 +56,7 @@ export function playGameAudio(audioUrl: string): void {
     btn.hidden = true;
   }).catch(() => {
     // Autoplay blocked — let user click to unmute
-    btn.textContent = "🔊 Play audio";
+    btn.textContent = "Play audio";
     btn.classList.remove("audio-btn--loading");
     btn.disabled = false;
     btn.hidden   = false;
@@ -228,7 +228,7 @@ function renderTree(container: HTMLElement, files: IsoFile[], depth: number): vo
     item.className = "file-tree__item " +
       (file.isDirectory ? "file-tree__item--dir" : "file-tree__item--file");
     const indent = "\u00a0\u00a0".repeat(depth * 2);
-    const prefix = file.isDirectory ? "▶ " : "  ";
+    const prefix = file.isDirectory ? "> " : "  ";
     item.textContent = indent + prefix + file.name;
     container.appendChild(item);
     if (file.isDirectory && file.children) renderTree(container, file.children, depth + 1);
