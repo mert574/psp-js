@@ -18,6 +18,11 @@ import type { SavedataOverlay } from "./savedata-overlay.js";
 import "./savedata-list.js"; // registers <savedata-list>
 import type { SavedataList } from "./savedata-list.js";
 import "./game-library.js";
+import { initWaveBackground } from "./wave-background.js";
+import { initClock } from "./clock.js";
+
+initWaveBackground();
+initClock();
 
 declare global {
   interface Window {

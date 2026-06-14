@@ -9,7 +9,9 @@ const gameplayViewEl = document.getElementById("gameplay-view") as HTMLElement;
 const gameplayHudEl  = document.getElementById("gameplay-hud")  as HTMLElement;
 
 export function setStatus(message: string): void {
-  document.getElementById("status-bar")!.textContent = message;
+  // The status bar was removed; keep this a safe no-op for existing callers.
+  const el = document.getElementById("status-bar");
+  if (el) el.textContent = message;
 }
 
 export function showError(message: string, cause?: unknown): void {
@@ -94,6 +96,12 @@ const PARENTAL_LABELS: Record<number, string> = {
   8: "Adults Only 18+",
   9: "Adults Only 18+",
 };
+
+/** Friendly label for a PSP parental level, or "" when not set. */
+export function ratingLabel(level: number): string {
+  if (level <= 0) return "";
+  return PARENTAL_LABELS[level] ?? `Level ${level}`;
+}
 
 export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string, logoUrl?: string): void {
   document.getElementById("game-title")!.textContent    = info.title;
