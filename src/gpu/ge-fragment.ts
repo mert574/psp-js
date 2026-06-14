@@ -305,10 +305,12 @@ export function getBlendFactor(
     case 3:  out[0] = out[1] = out[2] = 255 - sa; break;                      // INV_SRC_ALPHA
     case 4:  out[0] = out[1] = out[2] = da; break;                            // DST_ALPHA
     case 5:  out[0] = out[1] = out[2] = 255 - da; break;                      // INV_DST_ALPHA
-    case 6:  out[0] = out[1] = out[2] = Math.min(255, 2 * sa); break;         // 2*SRC_ALPHA
-    case 7:  out[0] = out[1] = out[2] = Math.min(255, 2 * (255 - sa)); break; // 2*INV_SRC_ALPHA
-    case 8:  out[0] = out[1] = out[2] = Math.min(255, 2 * da); break;         // 2*DST_ALPHA
-    case 9:  out[0] = out[1] = out[2] = Math.min(255, 2 * (255 - da)); break; // 2*INV_DST_ALPHA
+    // PPSSPP DrawPixel.cpp:440-450. The doubled factor is left unclamped (can
+    // exceed 255); the caller divides by 255 and clamps the final blend result.
+    case 6:  out[0] = out[1] = out[2] = 2 * sa; break;                        // 2*SRC_ALPHA
+    case 7:  out[0] = out[1] = out[2] = 255 - Math.min(2 * sa, 255); break;   // 2*INV_SRC_ALPHA
+    case 8:  out[0] = out[1] = out[2] = 2 * da; break;                        // 2*DST_ALPHA
+    case 9:  out[0] = out[1] = out[2] = 255 - Math.min(2 * da, 255); break;   // 2*INV_DST_ALPHA
     case 10: { // FIXA / FIXB
       const f = isSrc ? state.blendFixedA : state.blendFixedB;
       out[0] = f & 0xFF; out[1] = (f >> 8) & 0xFF; out[2] = (f >> 16) & 0xFF;

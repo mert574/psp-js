@@ -328,7 +328,7 @@ export function sampleDXT3(bus: MemoryBus, u: number, v: number, bw: number, add
   // Alpha: 8 bytes of 4-bit alpha per pixel
   const px = u & 3, py = v & 3;
   const alphaWord = bus.readU16(blockAddr + py * 2);
-  const alpha = ((alphaWord >> (px * 4)) & 0xF) * 17; // expand 4-bit to 8-bit
+  const alpha = ((alphaWord >> (px * 4)) & 0xF) << 4; // 4-bit to 8-bit (PPSSPP WriteColorsDXT3: nibble<<4)
 
   // Color: same as DXT1 at offset +8
   const color = sampleDXT1(bus, u, v, bw, addr + 8);
