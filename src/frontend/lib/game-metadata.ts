@@ -5,13 +5,20 @@ import { extractFromFile } from "../../iso/iso-metadata.js";
 export interface GameMeta {
   title: string;
   discId: string;
+  region: string;
+  version: string;
+  parentalLevel: number;
+  saveTitle: string;
+  saveDetail: string;
   iconDataUrl: string | null;
   fileName: string;
   fileSize: number;
 }
 
+// v3: added save title/detail (v2 added region/version/rating); bumping the
+// key re-extracts older cached entries that miss the newer fields.
 function cacheKey(name: string, size: number): string {
-  return `pspjs:lib:${name}:${size}`;
+  return `pspjs:lib3:${name}:${size}`;
 }
 
 export function getCachedMeta(name: string, size: number): GameMeta | null {
@@ -39,6 +46,11 @@ export async function extractIsoMetadata(file: File): Promise<GameMeta> {
   return {
     title: partial.title,
     discId: partial.discId,
+    region: partial.region,
+    version: partial.version,
+    parentalLevel: partial.parentalLevel,
+    saveTitle: partial.saveTitle,
+    saveDetail: partial.saveDetail,
     iconDataUrl: partial.iconDataUrl,
     fileName: file.name,
     fileSize: file.size,

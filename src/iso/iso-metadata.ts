@@ -142,6 +142,11 @@ async function readIsoFilePartial(file: File, entry: IsoFile): Promise<Uint8Arra
 export interface PartialIsoMetadata {
   title: string;
   discId: string;
+  region: string;
+  version: string;
+  parentalLevel: number;
+  saveTitle: string;
+  saveDetail: string;
   iconDataUrl: string | null;
 }
 
@@ -151,7 +156,10 @@ export interface PartialIsoMetadata {
  */
 export async function extractFromFile(file: File): Promise<PartialIsoMetadata> {
   const fallbackTitle = file.name.replace(/\.[^.]+$/, "");
-  const result: PartialIsoMetadata = { title: fallbackTitle, discId: "", iconDataUrl: null };
+  const result: PartialIsoMetadata = {
+    title: fallbackTitle, discId: "", region: "", version: "", parentalLevel: 0,
+    saveTitle: "", saveDetail: "", iconDataUrl: null,
+  };
 
   try {
     // Read PVD
@@ -180,6 +188,11 @@ export async function extractFromFile(file: File): Promise<PartialIsoMetadata> {
       const info = extractGameInfo(sfo);
       result.title = info.title || fallbackTitle;
       result.discId = info.discId || "";
+      result.region = info.region || "";
+      result.version = info.version || "";
+      result.parentalLevel = info.parentalLevel || 0;
+      result.saveTitle = info.saveTitle || "";
+      result.saveDetail = info.saveDetail || "";
     }
 
     // ICON0.PNG
@@ -200,31 +213,36 @@ export async function extractFromFile(file: File): Promise<PartialIsoMetadata> {
  * Extract media files (ICON1.PMF, SND0.AT3) from an ISO via partial reads.
  * Returns raw Uint8Array data for each found file.
  */
-export async function extractMediaFromFile(file: File): Promise<{ pmf: Uint8Array | null; at3: Uint8Array | null }> {
+export async function extractMediaFromFile(file: File): Promise<{ pmf: Uint8Array | null; at3: Uint8Array | null; pic1: Uint8Array | null; pic0: Uint8Array | null }> {
+  const empty = { pmf: null, at3: null, pic1: null, pic0: null };
   try {
     const pvdBuf = await readSlice(file, PVD_SECTOR_NUM * SECTOR, SECTOR);
-    if (new DataView(pvdBuf).getUint8(0) !== 1) return { pmf: null, at3: null };
+    if (new DataView(pvdBuf).getUint8(0) !== 1) return empty;
     const ident = new TextDecoder("ascii").decode(new Uint8Array(pvdBuf, 1, 5));
-    if (ident !== "CD001") return { pmf: null, at3: null };
+    if (ident !== "CD001") return empty;
 
     const rootEntry = parseDirRecord(pvdBuf, 156);
-    if (!rootEntry) return { pmf: null, at3: null };
+    if (!rootEntry) return empty;
 
     const rootEntries = await readDirEntries(file, rootEntry.lba, rootEntry.size);
     const pspGame = rootEntries.find(e => e.isDirectory && e.name.toUpperCase() === "PSP_GAME");
-    if (!pspGame) return { pmf: null, at3: null };
+    if (!pspGame) return empty;
 
     const gameEntries = await readDirEntries(file, pspGame.lba, pspGame.size);
 
     const pmfEntry = gameEntries.find(e => !e.isDirectory && e.name.toUpperCase() === "ICON1.PMF");
     const at3Entry = gameEntries.find(e => !e.isDirectory && e.name.toUpperCase() === "SND0.AT3");
+    const pic1Entry = gameEntries.find(e => !e.isDirectory && e.name.toUpperCase() === "PIC1.PNG");
+    const pic0Entry = gameEntries.find(e => !e.isDirectory && e.name.toUpperCase() === "PIC0.PNG");
 
     const pmf = pmfEntry ? await readIsoFilePartial(file, pmfEntry) : null;
     const at3 = at3Entry ? await readIsoFilePartial(file, at3Entry) : null;
+    const pic1 = pic1Entry ? await readIsoFilePartial(file, pic1Entry) : null;
+    const pic0 = pic0Entry ? await readIsoFilePartial(file, pic0Entry) : null;
 
-    return { pmf, at3 };
+    return { pmf, at3, pic1, pic0 };
   } catch {
-    return { pmf: null, at3: null };
+    return empty;
   }
 }
 
