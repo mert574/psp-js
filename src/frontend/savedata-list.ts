@@ -39,8 +39,8 @@ export class SavedataList extends LitElement {
       gap: 8px;
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
     }
-    .title { font: 600 15px/1.3 sans-serif; color: var(--text, #e0e0e0); margin: 0; }
-    .subtitle { font: 12px/1.3 sans-serif; color: var(--muted, #888); margin: 0 0 4px; }
+    .title { font: var(--fw-bold) 15px/1.3 var(--ui); color: var(--text, #e0e0e0); margin: 0; }
+    .subtitle { font: 12px/1.3 var(--ui); color: var(--muted, #888); margin: 0 0 4px; }
     .slots {
       display: flex;
       flex-direction: column;
@@ -58,7 +58,8 @@ export class SavedataList extends LitElement {
       border-radius: 6px;
       cursor: pointer;
       transition: background 0.1s, border-color 0.1s;
-      font: 13px/1.3 var(--mono, monospace);
+      font: 13px/1.3 var(--ui);
+      font-stretch: var(--ui-condensed);
       color: var(--text-dim, #ccc);
     }
     .slot:hover, .slot:focus {
@@ -67,7 +68,7 @@ export class SavedataList extends LitElement {
       outline: none;
     }
     .slot.disabled { opacity: 0.4; cursor: default; }
-    .slot-name { flex: 1; color: var(--text, #e0e0e0); font-weight: 600; }
+    .slot-name { flex: 1; color: var(--text, #e0e0e0); font-weight: var(--fw-bold); }
     .slot-info { color: var(--muted, #888); font-size: 11px; }
     .slot-empty { color: var(--faint, #555); font-style: italic; }
     .cancel-btn {
@@ -77,7 +78,7 @@ export class SavedataList extends LitElement {
       border-radius: 4px;
       color: var(--muted, #888);
       padding: 4px 12px;
-      font: 12px sans-serif;
+      font: 12px var(--ui);
       cursor: pointer;
       margin-top: 4px;
     }

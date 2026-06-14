@@ -28,7 +28,7 @@ const sheet = new CSSStyleSheet();
 sheet.replaceSync(`
   :host {
     display: none;
-    flex: 0 0 390px;
+    flex: 0 0 350px;
     align-self: stretch;
     position: sticky;
     top: 64px;
@@ -39,8 +39,8 @@ sheet.replaceSync(`
     border: 1px solid var(--border, #2a313c);
     border-radius: var(--radius, 12px);
     padding: 16px;
-    font-family: var(--mono, monospace);
-    font-size: 11px;
+    font-family: var(--mono);
+    font-size: 13px;
     color: var(--text-dim, #c9d1d9);
     scrollbar-width: thin;
     scrollbar-color: var(--border, #2a313c) transparent;
@@ -76,8 +76,8 @@ sheet.replaceSync(`
        paint over the title when their section scrolls up under it. */
     z-index: 5;
     background: var(--bg-elev, #11161f);
-    font-size: 12px;
-    font-weight: 700;
+    font-size: 14px;
+    font-weight: var(--fw-bold);
     color: var(--text-dim, #c9d1d9);
     text-transform: uppercase;
     letter-spacing: 0.14em;
@@ -94,7 +94,7 @@ sheet.replaceSync(`
     border: none;
     color: var(--muted, #8b949e);
     cursor: pointer;
-    font-size: 13px;
+    font-size: 15px;
     line-height: 1;
     padding: 2px 5px;
     border-radius: 5px;
@@ -110,14 +110,14 @@ sheet.replaceSync(`
     margin-bottom: 6px;
 
     & > h4 {
-      font-size: 10px;
-      font-weight: 700;
+      font-size: 12px;
+      font-weight: var(--fw-bold);
       text-transform: uppercase;
       letter-spacing: 0.08em;
       color: var(--faint, #6e7681);
       margin: 0 0 8px;
     }
-    & .note { color: var(--muted, #8b949e); font-weight: 400; }
+    & .note { color: var(--muted, #8b949e); font-weight: var(--fw-regular); }
   }
 
   /* Info icon + hover tooltip. position:fixed + anchor positioning so the popup
@@ -135,8 +135,8 @@ sheet.replaceSync(`
     border-radius: 50%;
     border: 1px solid var(--border, #2a313c);
     color: var(--muted, #8b949e);
-    font-size: 8px;
-    font-weight: 700;
+    font-size: 10px;
+    font-weight: var(--fw-bold);
     font-style: normal;
     text-transform: none;
     letter-spacing: 0;
@@ -161,14 +161,14 @@ sheet.replaceSync(`
     border: 1px solid var(--border, #2a313c);
     border-radius: 8px;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
-    font-size: 10px;
-    font-weight: 400;
+    font-size: 12px;
+    font-weight: var(--fw-regular);
     text-transform: none;
     letter-spacing: 0;
     color: var(--text-dim, #c9d1d9);
     white-space: normal;
 
-    & strong { display: block; color: var(--text, #e6edf3); font-size: 11px; margin-bottom: 4px; }
+    & strong { display: block; color: var(--text, #e6edf3); font-size: 13px; margin-bottom: 4px; }
     & > div { color: var(--muted, #8b949e); margin-bottom: 8px; }
     & dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; }
     & dt { color: var(--accent, #58a6ff); }
@@ -189,10 +189,10 @@ sheet.replaceSync(`
 
     &.wide { grid-column: 1 / -1; gap: 6px; }
     & .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-    & .label { color: var(--faint, #6e7681); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
-    & .val { color: var(--text, #e6edf3); font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
-    &.wide .val { font-size: 13px; }
-    & .detail { color: var(--muted, #8b949e); font-size: 10px; }
+    & .label { color: var(--faint, #6e7681); font-size: 11px; font-weight: var(--fw-bold); text-transform: uppercase; letter-spacing: 0.06em; }
+    & .val { color: var(--text, #e6edf3); font-size: 17px; font-weight: var(--fw-bold); font-variant-numeric: tabular-nums; }
+    &.wide .val { font-size: 15px; }
+    & .detail { color: var(--muted, #8b949e); font-size: 12px; }
   }
   .bar {
     display: block;
@@ -223,7 +223,7 @@ sheet.replaceSync(`
     &::-webkit-scrollbar { width: 4px; }
     &::-webkit-scrollbar-thumb { background: var(--border, #2a313c); border-radius: 2px; }
   }
-  .threads table { width: 100%; border-collapse: collapse; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+  .threads table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
   .threads th {
     position: sticky;
     top: 0;
@@ -232,8 +232,8 @@ sheet.replaceSync(`
     padding: 2px 6px;
     background: var(--surface, #161b22);
     color: var(--faint, #6e7681);
-    font-size: 9px;
-    font-weight: 700;
+    font-size: 11px;
+    font-weight: var(--fw-bold);
     text-transform: uppercase;
     letter-spacing: 0.04em;
     border-bottom: 1px solid var(--border-soft, #21262d);
@@ -242,7 +242,7 @@ sheet.replaceSync(`
   .threads th:nth-child(3) { width: 30px; }
   .threads th:nth-child(4) { width: 82px; }
   .threads td { padding: 2px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .threads tr.active td { color: var(--accent, #58a6ff); font-weight: 600; }
+  .threads tr.active td { color: var(--accent, #58a6ff); font-weight: var(--fw-medium); }
   .threads .t-id { display: flex; align-items: center; gap: 6px; color: var(--text-dim, #c9d1d9); }
   .threads .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint, #6e7681); flex-shrink: 0; }
   .threads .wait { color: var(--muted, #8b949e); }
@@ -270,11 +270,11 @@ sheet.replaceSync(`
   }
   .thread-detail[hidden] { display: none; }
   .td-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .td-title { color: var(--accent, #58a6ff); font-weight: 700; font-size: 11px; }
-  .td-meta { color: var(--muted, #8b949e); font-size: 10px; }
+  .td-title { color: var(--accent, #58a6ff); font-weight: var(--fw-bold); font-size: 13px; }
+  .td-meta { color: var(--muted, #8b949e); font-size: 12px; }
   .td-rows { display: flex; flex-direction: column; gap: 2px; }
-  .td-row, .td-wait { display: flex; gap: 8px; font-size: 10px; align-items: baseline; }
-  .td-k { flex-shrink: 0; min-width: 42px; color: var(--faint, #6e7681); text-transform: uppercase; letter-spacing: 0.04em; font-size: 9px; }
+  .td-row, .td-wait { display: flex; gap: 8px; font-size: 12px; align-items: baseline; }
+  .td-k { flex-shrink: 0; min-width: 42px; color: var(--faint, #6e7681); text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
   .td-v { color: var(--text-dim, #c9d1d9); font-variant-numeric: tabular-nums; }
   .td-wait .td-k { color: var(--warn, #d29922); }
   .td-wait span:last-child { color: var(--text-dim, #c9d1d9); }
@@ -287,7 +287,7 @@ sheet.replaceSync(`
     padding-top: 6px;
     border-top: 1px solid var(--border-soft, #21262d);
   }
-  .td-reg { display: flex; justify-content: space-between; gap: 4px; font-size: 9px; font-variant-numeric: tabular-nums; }
+  .td-reg { display: flex; justify-content: space-between; gap: 4px; font-size: 11px; font-variant-numeric: tabular-nums; }
   .td-rn { color: var(--faint, #6e7681); }
   .td-rv { color: var(--text-dim, #c9d1d9); }
   .td-reg.hot .td-rn, .td-reg.hot .td-rv { color: var(--accent, #58a6ff); }
@@ -297,7 +297,7 @@ sheet.replaceSync(`
   .heap-ctl { display: flex; gap: 6px; align-items: center; }
   .heap-ctl select, .heap-ctl input {
     font: inherit;
-    font-size: 10px;
+    font-size: 12px;
     background: var(--bg, #0b0e14);
     color: var(--text-dim, #c9d1d9);
     border: 1px solid var(--border-soft, #21262d);
@@ -316,24 +316,24 @@ sheet.replaceSync(`
     padding: 3px 8px;
     cursor: pointer;
     font: inherit;
-    font-size: 11px;
+    font-size: 13px;
     line-height: 1;
 
     &:hover { color: var(--text, #e6edf3); border-color: var(--border, #2a313c); }
   }
-  .heap-toggle { font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; min-width: 34px; }
+  .heap-toggle { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; min-width: 34px; }
   .heap-toggle[aria-pressed="true"] { color: var(--ok, #3fb950); border-color: color-mix(in srgb, var(--ok, #3fb950) 45%, transparent); }
   .heap-skip-lbl {
     display: flex;
     align-items: center;
     gap: 5px;
-    font-size: 9.5px;
+    font-size: 11.5px;
     color: var(--muted, #8b949e);
     cursor: pointer;
     user-select: none;
   }
   .heap-skip-lbl input { accent-color: var(--accent, #58a6ff); width: 12px; height: 12px; margin: 0; cursor: pointer; }
-  .heap-sum { color: var(--muted, #8b949e); font-size: 9.5px; }
+  .heap-sum { color: var(--muted, #8b949e); font-size: 11.5px; }
   .heap-sum b { color: var(--text-dim, #c9d1d9); font-variant-numeric: tabular-nums; }
   .hexdump {
     max-height: 360px;
@@ -348,7 +348,7 @@ sheet.replaceSync(`
     &::-webkit-scrollbar { width: 4px; }
     &::-webkit-scrollbar-thumb { background: var(--border, #2a313c); border-radius: 2px; }
   }
-  .hexrow { display: flex; gap: 12px; font-size: 10px; line-height: 1.55; white-space: pre; font-variant-numeric: tabular-nums; }
+  .hexrow { display: flex; gap: 12px; font-size: 12px; line-height: 1.55; white-space: pre; font-variant-numeric: tabular-nums; }
   .hx-off { color: var(--faint, #6e7681); }
   .hx-hex { color: var(--text-dim, #c9d1d9); }
   .hx-asc { color: var(--accent, #58a6ff); }
@@ -368,15 +368,15 @@ sheet.replaceSync(`
     background: var(--bg, #0b0e14);
     border: 1px solid var(--border-soft, #21262d);
 
-    & .lbl { justify-self: start; color: var(--faint, #6e7681); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
-    & .num { justify-self: center; color: var(--text, #e6edf3); font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
-    & .sub { justify-self: end; text-align: right; color: var(--muted, #8b949e); font-size: 10px; font-variant-numeric: tabular-nums; }
+    & .lbl { justify-self: start; color: var(--faint, #6e7681); font-size: 11px; font-weight: var(--fw-bold); text-transform: uppercase; letter-spacing: 0.06em; }
+    & .num { justify-self: center; color: var(--text, #e6edf3); font-size: 20px; font-weight: var(--fw-bold); font-variant-numeric: tabular-nums; }
+    & .sub { justify-self: end; text-align: right; color: var(--muted, #8b949e); font-size: 12px; font-variant-numeric: tabular-nums; }
   }
   .gldraw__grid {
     display: grid;
     grid-template-columns: auto 1fr;
     gap: 2px 10px;
-    font-size: 10px;
+    font-size: 12px;
     align-items: baseline;
   }
   .gldraw__grid dt { color: var(--faint, #6e7681); text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; }
@@ -389,7 +389,7 @@ sheet.replaceSync(`
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .gldraw__grid dd b { color: var(--text, #e6edf3); font-weight: 600; }
+  .gldraw__grid dd b { color: var(--text, #e6edf3); font-weight: var(--fw-medium); }
   .gldraw__grid dd .mut { color: var(--muted, #8b949e); }
   .gldraw__grid dt.sync { color: var(--warn, #d29922); }
 
@@ -405,10 +405,10 @@ sheet.replaceSync(`
     background: var(--bg, #0b0e14);
     border: 1px solid var(--border-soft, #21262d);
 
-    & span { color: var(--faint, #6e7681); font-size: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
-    & b { color: var(--text, #e6edf3); font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    & span { color: var(--faint, #6e7681); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+    & b { color: var(--text, #e6edf3); font-size: 15px; font-weight: var(--fw-bold); font-variant-numeric: tabular-nums; }
   }
-  .ge__fields { display: grid; grid-template-columns: 56px 1fr; gap: 3px 8px; font-size: 10px; align-items: baseline; }
+  .ge__fields { display: grid; grid-template-columns: 56px 1fr; gap: 3px 8px; font-size: 12px; align-items: baseline; }
   .ge__fields dt { color: var(--faint, #6e7681); text-transform: uppercase; letter-spacing: 0.04em; }
   .ge__fields dd {
     color: var(--text-dim, #c9d1d9);
@@ -418,7 +418,7 @@ sheet.replaceSync(`
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .ge__fields dd b { color: var(--text, #e6edf3); font-weight: 600; }
+  .ge__fields dd b { color: var(--text, #e6edf3); font-weight: var(--fw-medium); }
   .ge__fields dd .sep { color: var(--faint, #6e7681); margin: 0 4px; }
 
   .scrollbox {
@@ -428,7 +428,7 @@ sheet.replaceSync(`
     border: 1px solid var(--border-soft, #21262d);
     border-radius: 6px;
     padding: 4px;
-    font-size: 10px;
+    font-size: 12px;
     scrollbar-width: thin;
     scrollbar-color: var(--border, #2a313c) transparent;
 
@@ -446,7 +446,7 @@ sheet.replaceSync(`
     border-radius: 5px;
 
     & .stub__name  { color: var(--text-dim, #c9d1d9); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    & .stub__count { color: var(--warn, #d29922); font-weight: 700; font-variant-numeric: tabular-nums; }
+    & .stub__count { color: var(--warn, #d29922); font-weight: var(--fw-bold); font-variant-numeric: tabular-nums; }
   }
 
   /* Save data */
@@ -455,7 +455,7 @@ sheet.replaceSync(`
   .save__meta  { color: var(--muted, #8b949e); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
   /* Log — the namespace itself is a level-colored pill */
-  .log { display: flex; flex-direction: column; gap: 2px; max-height: 160px; }
+  .log { display: flex; flex-direction: column; gap: 2px; max-height: 320px; }
   .logline {
     display: flex;
     flex-direction: column;
@@ -467,10 +467,10 @@ sheet.replaceSync(`
   }
   .logline + .logline { border-top: 1px solid var(--border-soft, #21262d); }
   .logline__head { display: flex; align-items: center; gap: 6px; }
-  .logline__time { color: var(--faint, #6e7681); font-size: 9px; font-variant-numeric: tabular-nums; }
+  .logline__time { color: var(--faint, #6e7681); font-size: 11px; font-variant-numeric: tabular-nums; }
   .logline__ns {
-    font-size: 9px;
-    font-weight: 700;
+    font-size: 11px;
+    font-weight: var(--fw-bold);
     letter-spacing: 0.02em;
     padding: 1px 5px;
     border-radius: 4px;
