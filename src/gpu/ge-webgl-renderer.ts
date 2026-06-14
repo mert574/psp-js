@@ -61,6 +61,31 @@ export interface GEDrawState {
   shadeMode: number;  // 0=flat, 1=gouraud
 }
 
+/** Per-frame counters for the GPU-cost drivers (profiler). All cumulative since
+ *  boot; the renderer also keeps a per-frame delta in geGlStatsFrame. Reading
+ *  these answers "what is the host GPU actually doing each frame": how many draw
+ *  calls + verts, how often the render target switches (each switch makes a tiled
+ *  GPU load/store the whole target), how many texture bytes are uploaded, and how
+ *  many readPixels readbacks happen (each is a hard CPU<->GPU sync). */
+export interface GeGlStats {
+  drawCalls: number; drawVerts: number;
+  fboBinds: number;                    // render-target switches to a VFB
+  texUploads: number; texUploadBytes: number;   // texImage2D (new/changed textures)
+  subUploads: number; subUploadBytes: number;   // texSubImage2D (block-transfer + present fallback)
+  readbacks: number; readbackBytes: number;     // readPixels FBO->RAM (hard GPU sync each)
+  presentCalls: number; blitCalls: number;
+  texHits: number; texMiss: number; texFromVFB: number;
+}
+
+function zeroGlStats(): GeGlStats {
+  return {
+    drawCalls: 0, drawVerts: 0, fboBinds: 0,
+    texUploads: 0, texUploadBytes: 0, subUploads: 0, subUploadBytes: 0,
+    readbacks: 0, readbackBytes: 0, presentCalls: 0, blitCalls: 0,
+    texHits: 0, texMiss: 0, texFromVFB: 0,
+  };
+}
+
 /** Cache key for textures — identifies unique texture configurations. */
 function texCacheKey(s: GETextureState): string {
   return `${s.texAddr0}:${s.texBufWidth0}:${s.texWidth0}:${s.texHeight0}:${s.texFormat}:${s.texSwizzle ? 1 : 0}:${s.clutAddr}:${s.clutFormat}:${s.clutShift}:${s.clutMask}:${s.clutStart}`;
@@ -294,6 +319,12 @@ export class WebGLGERenderer {
   private vramRef: Uint8Array | null = null;
   private fallbackConvBuf: Uint8Array | null = null; // 16-bit→RGBA scratch
 
+  // Per-frame GPU-cost counters (profiler). geGlStats is cumulative since boot;
+  // geGlStatsFrame holds the just-finished frame's delta (computed in onFrameStart).
+  readonly geGlStats: GeGlStats = zeroGlStats();
+  geGlStatsFrame: GeGlStats = zeroGlStats();
+  private geGlStatsAtFrameStart: GeGlStats = zeroGlStats();
+
   // Debug info
   _dbgDisplayPath = "none";
   _dbgBlitCount = 0;
@@ -306,6 +337,21 @@ export class WebGLGERenderer {
   private vertexData = new Float32Array(MAX_VERTS * FLOATS_PER_VERT);
   private vertexCount = 0;
   private glBuffer: WebGLBuffer;
+
+  // Open batch: consecutive primitives that share identical draw state accumulate
+  // into vertexData and are drawn with a single bufferSubData + drawArrays in
+  // flush(). Overwriting the one shared VBO between every draw forced an implicit
+  // GPU sync (~366ms/frame on GoW). Batching cuts that to one upload+draw per
+  // state run. batchState holds the live GEDrawState of the open batch (it is a
+  // fresh object per drawPrimitives call, so holding the reference is safe); the
+  // other batch* fields are the discriminators compared in sameBatchState.
+  private batchOpen = false;
+  private batchState: GEDrawState | null = null;
+  private batchTex: WebGLTexture | null = null;
+  private batchTexParamKey = 0;
+  private batchGlPrim = 0;
+  private batchDoCull = false;
+  private batchRenderAddr = 0;
 
 
   // Texture cache. hash is a sparse content sample — PPSSPP re-hashes texture
@@ -470,9 +516,116 @@ export class WebGLGERenderer {
     if (frag.stencilRef !== U.stencilReplaceValue) { gl.uniform1f(L.u_stencilReplaceValue, frag.stencilRef / 255); U.stencilReplaceValue = frag.stencilRef; }
   }
 
+  /** Flush the open batch: upload its accumulated vertices and issue one
+   *  drawArrays. No-op when nothing is open or no vertices were appended, so
+   *  every teardown/readback path can call it unconditionally. */
+  private flush(): void {
+    if (!this.batchOpen || this.vertexCount === 0) {
+      this.batchOpen = false;
+      return;
+    }
+    const gl = this.gl;
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+      this.vertexData.subarray(0, this.vertexCount * FLOATS_PER_VERT));
+    gl.drawArrays(this.batchGlPrim, 0, this.vertexCount);
+    this.geGlStats.drawCalls++;
+    this.geGlStats.drawVerts += this.vertexCount;
+    this.vertexCount = 0;
+    this.batchOpen = false;
+  }
+
+  /** True when the given draw can append into the currently open batch. Returns
+   *  false on the first difference. Only the fields that change GL/program state
+   *  in the apply*State helpers and applyGeUniforms matter; per-vertex baked
+   *  fields (UV scale/offset, fog end/slope, shade mode, tex size) do not. */
+  private sameBatchState(
+    state: GEDrawState, tex: WebGLTexture, texParamKey: number,
+    glPrim: number, doCull: boolean, renderAddr: number,
+  ): boolean {
+    const b = this.batchState;
+    if (!b) return false;
+    if (renderAddr !== this.batchRenderAddr) return false;
+    if (glPrim !== this.batchGlPrim) return false;
+    if (doCull !== this.batchDoCull) return false;
+    // When culling, the winding face (applyCullState reads cullCW) must match too,
+    // or the second draw's triangles get culled with the wrong face.
+    if (doCull && state.cullCW !== b.cullCW) return false;
+    if (state.fbFormat !== b.fbFormat || state.fbWidth !== b.fbWidth) return false;
+    if (state.texEnable !== b.texEnable) return false;
+    if (state.texEnable) {
+      if (tex !== this.batchTex) return false;
+      if (texParamKey !== this.batchTexParamKey) return false;
+      // UV normalization (setupUVNormalization) bakes per-vertex UVs from these,
+      // but runs once at batch open, so all members must share them. Through mode
+      // derives the scale from texWidth0/Height0 (already in the texture handle),
+      // so it needs no extra check.
+      if (!state.throughMode) {
+        const ts = state.texState, bts = b.texState;
+        if (ts.texMapMode !== bts.texMapMode) return false;
+        if (ts.texMapMode === 0) {
+          if (ts.texScaleU !== bts.texScaleU || ts.texScaleV !== bts.texScaleV) return false;
+          if (ts.texOffsetU !== bts.texOffsetU || ts.texOffsetV !== bts.texOffsetV) return false;
+        }
+      }
+    }
+
+    const f = state.fragState, bf = b.fragState;
+    // Fragment uniforms (applyGeUniforms)
+    if (f.texFunc !== bf.texFunc) return false;
+    if (f.texFuncAlpha !== bf.texFuncAlpha) return false;
+    if (f.texEnvColor !== bf.texEnvColor) return false;
+    if (f.alphaTestEnable !== bf.alphaTestEnable) return false;
+    if (f.alphaTestFunc !== bf.alphaTestFunc) return false;
+    if (f.alphaTestRef !== bf.alphaTestRef) return false;
+    if (f.colorTestEnable !== bf.colorTestEnable) return false;
+    if (f.colorTestFunc !== bf.colorTestFunc) return false;
+    if (f.colorTestRef !== bf.colorTestRef) return false;
+    if (f.colorTestMask !== bf.colorTestMask) return false;
+    if (f.stencilTestEnable !== bf.stencilTestEnable) return false;
+    if (f.stencilZPass !== bf.stencilZPass) return false;
+    if (f.stencilRef !== bf.stencilRef) return false;
+    if (state.colorDoubling !== b.colorDoubling) return false;
+    if (state.fogEnable !== b.fogEnable) return false;
+    if (state.fogColor !== b.fogColor) return false;
+    if (state.throughMode !== b.throughMode) return false;
+
+    // Blend (applyBlendState / applyBlendFuncEq)
+    if (f.alphaBlendEnable !== bf.alphaBlendEnable) return false;
+    if (f.blendSrc !== bf.blendSrc) return false;
+    if (f.blendDst !== bf.blendDst) return false;
+    if (f.blendOp !== bf.blendOp) return false;
+    if (f.blendFixedA !== bf.blendFixedA) return false;
+    if (f.blendFixedB !== bf.blendFixedB) return false;
+
+    // Depth (applyDepthState)
+    if (state.depthTestEnable !== b.depthTestEnable) return false;
+    if (state.depthFunc !== b.depthFunc) return false;
+    if (state.depthWriteDisable !== b.depthWriteDisable) return false;
+
+    // Scissor (applyScissorState)
+    if (state.scissorX1 !== b.scissorX1 || state.scissorY1 !== b.scissorY1) return false;
+    if (state.scissorX2 !== b.scissorX2 || state.scissorY2 !== b.scissorY2) return false;
+
+    // Stencil GL (applyStencilState)
+    if (f.stencilFunc !== bf.stencilFunc) return false;
+    if (f.stencilMask !== bf.stencilMask) return false;
+    if (f.stencilSFail !== bf.stencilSFail) return false;
+    if (f.stencilZFail !== bf.stencilZFail) return false;
+
+    // Color mask (applyColorMask)
+    if (f.maskRgb !== bf.maskRgb) return false;
+    if (f.maskAlpha !== bf.maskAlpha) return false;
+
+    return true;
+  }
+
   /**
    * Draw decoded vertices with the given GE state.
    * Called from GEProcessor.doPrim() instead of software rasterization.
+   *
+   * Appends into the open batch when this draw matches its state, else flushes
+   * the batch and opens a new one. The actual bufferSubData + drawArrays happen
+   * in flush() when state changes or the buffer fills.
    */
   drawPrimitives(
     primType: number,
@@ -482,30 +635,95 @@ export class WebGLGERenderer {
   ): void {
     const gl = this.gl;
 
-    // Bind the VFB for this draw's framebuffer address
-    this.bindRenderTarget(state.fbPtr, state.fbFormat, state.fbWidth);
-    gl.viewport(0, 0, this.fbW, this.fbH);
+    const renderAddr = this.normFb(state.fbPtr);
+    let glPrim: number;
+    if (primType === 1 || primType === 2) {
+      glPrim = gl.LINES;
+    } else if (primType === 0) {
+      glPrim = gl.POINTS;
+    } else {
+      glPrim = gl.TRIANGLES;
+    }
+    // Matches applyCullState: cull only real triangles, never lines/points/sprites/clear.
+    const doCull = state.cullEnable && !state.clearMode && primType >= 3 && primType <= 5;
 
-    // Set up per-draw-call state
-    this.setupUVNormalization(state);
-    this.flatColor = -1; // default gouraud
-
-    // Apply GE state
-    this.applyBlendState(gl, state.fragState);
-    this.applyDepthState(gl, state);
-    this.applyScissorState(gl, state);
-    this.applyCullState(gl, state, primType);
-    this.applyStencilState(gl, state.fragState);
-    this.applyColorMask(gl, state.fragState);
-
-    // Texture
+    // Resolve the texture now: getOrUploadTexture has side effects (decodes VRAM,
+    // may create/evict GL textures, depends on currentRenderAddr) so it must run
+    // at append time, not at flush. The resolved handle is part of the batch key.
     let tex = this.dummyTex;
+    let texParamKey = 0;
     if (state.texEnable) {
       tex = this.getOrUploadTexture(state.texState, bus);
+      const ts = state.texState;
+      texParamKey = (ts.texMagFilter === 1 ? 1 : 0) | ((ts.texMinFilter & 1) ? 2 : 0)
+        | (ts.texWrapU === 1 ? 4 : 0) | (ts.texWrapV === 1 ? 8 : 0);
     }
 
-    // Build vertex data
-    this.vertexCount = 0;
+    // How many vertices this prim expands to, so we can flush before overflowing.
+    const n = vertices.length;
+    let needed: number;
+    if (primType === 6) needed = Math.floor(n / 2) * 6;
+    else if (primType === 3) needed = Math.floor(n / 3) * 3;
+    else if (primType === 4) needed = Math.max(0, n - 2) * 3;
+    else if (primType === 5) needed = Math.max(0, n - 1) * 3;
+    else if (primType === 1) needed = Math.floor(n / 2) * 2;
+    else if (primType === 2) needed = Math.max(0, n - 1) * 2;
+    else needed = n; // points
+
+    if (this.batchOpen &&
+        (!this.sameBatchState(state, tex, texParamKey, glPrim, doCull, renderAddr)
+         || this.vertexCount + needed > MAX_VERTS)) {
+      this.flush();
+    }
+
+    if (!this.batchOpen) {
+      // Open a new batch: do the one-time-per-run GL setup. All appended prims in
+      // this batch share the same state, so this runs once per state change.
+      this.bindRenderTarget(state.fbPtr, state.fbFormat, state.fbWidth);
+      gl.viewport(0, 0, this.fbW, this.fbH);
+      this.setupUVNormalization(state);
+
+      this.applyBlendState(gl, state.fragState);
+      this.applyDepthState(gl, state);
+      this.applyScissorState(gl, state);
+      this.applyCullState(gl, state, primType);
+      this.applyStencilState(gl, state.fragState);
+      this.applyColorMask(gl, state.fragState);
+
+      // Bind the GE draw pipeline (program + interleaved attribute layout) once.
+      this.bindGePipeline();
+
+      // Bind texture to unit 0
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+
+      // Apply texture filtering/wrap, but only when the bound texture or its
+      // sampler state actually changed since the last applied texparam.
+      if (state.texEnable) {
+        if (tex !== this.lastTexParamTex || texParamKey !== this.lastTexParamKey) {
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, (texParamKey & 1) ? gl.LINEAR : gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, (texParamKey & 2) ? gl.LINEAR : gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, (texParamKey & 4) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, (texParamKey & 8) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
+          this.lastTexParamTex = tex;
+          this.lastTexParamKey = texParamKey;
+        }
+      }
+
+      this.applyGeUniforms(state);
+
+      this.batchOpen = true;
+      this.batchState = state;
+      this.batchTex = tex;
+      this.batchTexParamKey = texParamKey;
+      this.batchGlPrim = glPrim;
+      this.batchDoCull = doCull;
+      this.batchRenderAddr = renderAddr;
+    }
+
+    // Append this prim's expanded vertices into the running buffer (vertexCount
+    // persists across appends; flush() resets it).
+    this.flatColor = -1; // default gouraud
     const flat = state.shadeMode === 0; // PPSSPP SoftwareTransformCommon.cpp:701-712
 
     if (primType === 6) {
@@ -568,54 +786,8 @@ export class WebGLGERenderer {
         this.pushVertex(v);
       }
     }
-
-    if (this.vertexCount === 0) return;
-
-    // Bind the GE draw pipeline (program + interleaved attribute layout) once and
-    // reuse it across draws — re-binding it per draw was the single biggest cost
-    // on draw-heavy scenes. The vertex buffer stays bound as the ARRAY_BUFFER.
-    this.bindGePipeline();
-
-    // Upload this draw's vertices into the (already bound) GE vertex buffer.
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
-      this.vertexData.subarray(0, this.vertexCount * FLOATS_PER_VERT));
-
-    // Bind texture to unit 0
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-
-    // Apply texture filtering/wrap from GE state, but only when the bound texture
-    // or its sampler state actually changed. A run of draws sharing one texture
-    // (e.g. all glyphs of a font) then skips the 4 texParameteri calls.
-    if (state.texEnable) {
-      const ts = state.texState;
-      const texParamKey = (ts.texMagFilter === 1 ? 1 : 0) | ((ts.texMinFilter & 1) ? 2 : 0)
-        | (ts.texWrapU === 1 ? 4 : 0) | (ts.texWrapV === 1 ? 8 : 0);
-      if (tex !== this.lastTexParamTex || texParamKey !== this.lastTexParamKey) {
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, (texParamKey & 1) ? gl.LINEAR : gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, (texParamKey & 2) ? gl.LINEAR : gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, (texParamKey & 4) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, (texParamKey & 8) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
-        this.lastTexParamTex = tex;
-        this.lastTexParamKey = texParamKey;
-      }
-    }
-
-    this.applyGeUniforms(state);
-
-    // Draw
-    let glPrimType: number;
-    if (primType === 1 || primType === 2) {
-      glPrimType = gl.LINES;
-    } else if (primType === 0) {
-      glPrimType = gl.POINTS;
-    } else {
-      glPrimType = gl.TRIANGLES;
-    }
-
-    gl.drawArrays(glPrimType, 0, this.vertexCount);
-    // Attribute arrays stay enabled across GE draws (the pipeline persists).
-    // present()/blitVFB() rebind their own program + attributes via twgl.
+    // Nothing more to do here — the draw happens in flush() when state changes
+    // or a teardown/readback path needs the geometry on the FBO.
   }
 
   /**
@@ -630,6 +802,7 @@ export class WebGLGERenderer {
     fbStride = 512,
     clearDepth = 1,
   ): void {
+    this.flush(); // draw any pending geometry before changing target/state
     const gl = this.gl;
     const normAddr = this.normFb(fbPtr);
     if (this._dbgClearLog < 5) {
@@ -683,7 +856,19 @@ export class WebGLGERenderer {
   /**
    * Present the GE FBO to the screen canvas.
    */
+  /** Force the GPU to finish this frame's work (profiler only). WebGL draws are
+   *  async, and gl.finish() isn't a reliable fence; a 1x1 readPixels from the
+   *  presented framebuffer stalls until all rendering it depends on completes.
+   *  This serializes CPU<->GPU, so the wall-time it adds IS the host-GPU render
+   *  time for the frame — that's how the profiler measures present/GPU cost. */
+  finishGpu(): void {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+  }
+
   presentToScreen(): void {
+    this.flush(); // draw any pending geometry before presenting
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     // The GL framebuffer binding no longer matches any VFB; without this the
@@ -768,12 +953,15 @@ export class WebGLGERenderer {
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Math.min(stride, 512), PSP_HEIGHT,
         gl.RGBA, gl.UNSIGNED_BYTE, pixels);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+      this.geGlStats.subUploads++;
+      this.geGlStats.subUploadBytes += pixels.length;
     } else {
       return; // nothing to present
     }
 
     gl.uniform1i(presTexLoc, 0);
     twgl.drawBufferInfo(gl, this.presentBuffer);
+    this.geGlStats.presentCalls++;
   }
 
 
@@ -782,6 +970,7 @@ export class WebGLGERenderer {
    *  PPSSPP uses hash-based invalidation with backoff; we invalidate per-frame for correctness.
    *  Games modify texture data in RAM between frames (animations, dynamic textures). */
   invalidateTextures(): void {
+    this.flush(); // draw any pending geometry before deleting textures it may use
     const gl = this.gl;
     for (const entry of this.texCache.values()) {
       gl.deleteTexture(entry.tex);
@@ -792,6 +981,14 @@ export class WebGLGERenderer {
   /** Called at frame start. Textures are only invalidated on block transfers now,
    *  not per-frame — PPSSPP uses hash-based invalidation, not per-frame flush. */
   onFrameStart(): void {
+    this.flush(); // draw any geometry left open at the frame boundary
+    // Snapshot the just-finished frame's GL work as a per-frame delta, then reset
+    // the per-frame baseline. geGlStats stays cumulative.
+    const cur = this.geGlStats, prev = this.geGlStatsAtFrameStart, f = this.geGlStatsFrame;
+    for (const k of Object.keys(cur) as (keyof GeGlStats)[]) {
+      f[k] = cur[k] - prev[k];
+      prev[k] = cur[k];
+    }
     this.frameCount++;
     this.decimateVFBs(); // PPSSPP BeginFrame → DecimateFBOs
   }
@@ -850,6 +1047,7 @@ export class WebGLGERenderer {
     const vfb = this.getOrCreateVFB(addr, format, stride);
     this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, vfb.fbo);
     this.currentRenderAddr = key;
+    this.geGlStats.fboBinds++;
   }
 
   /** Find VFB at address, or null. PPSSPP GetVFBAt. */
@@ -881,6 +1079,7 @@ export class WebGLGERenderer {
     dstStride: number, dstX: number, dstY: number,
     width: number, height: number, bpp: number,
   ): boolean {
+    this.flush(); // draw any pending geometry before writing into the target VFB
     const base = this.findVFBBaseContaining(dstAddr);
     if (base < 0) return false;
     const vfb = this.vfbs.get(base)!;
@@ -932,6 +1131,8 @@ export class WebGLGERenderer {
         for (let sy = 1; sy < s; sy++) outS.copyWithin(sy * rowBytes, 0, rowBytes);
         gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.px * s, (PSP_HEIGHT - 1 - pos.py) * s,
           wpx * s, s, gl.RGBA, gl.UNSIGNED_BYTE, outS);
+        this.geGlStats.subUploads++;
+        this.geGlStats.subUploadBytes += outS.length;
       }
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
       vfb.lastFrameUsed = this.frameCount;
@@ -950,6 +1151,8 @@ export class WebGLGERenderer {
       }
       gl.texSubImage2D(gl.TEXTURE_2D, 0, px, PSP_HEIGHT - (py + rows), wpx, rows,
         gl.RGBA, gl.UNSIGNED_BYTE, out);
+      this.geGlStats.subUploads++;
+      this.geGlStats.subUploadBytes += out.length;
     } else {
       const out = new Uint8Array(wpx * 4);
       for (let r = 0; r < height; r++) {
@@ -960,6 +1163,8 @@ export class WebGLGERenderer {
         decodeFbRowToRGBA(vram, src, wpx, vfb.format, out, 0);
         gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.px, PSP_HEIGHT - 1 - pos.py, wpx, 1,
           gl.RGBA, gl.UNSIGNED_BYTE, out);
+        this.geGlStats.subUploads++;
+        this.geGlStats.subUploadBytes += out.length;
       }
     }
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
@@ -970,6 +1175,7 @@ export class WebGLGERenderer {
   /** Read FBO pixels back to VRAM in the VFB's own pixel format and stride.
    *  PPSSPP ReadFramebufferToMemory. */
   readbackToVRAM(vram: Uint8Array, addr: number): void {
+    this.flush(); // draw any pending geometry before reading the FBO back
     const key = this.normFb(addr);
     const vfb = this.vfbs.get(key);
     if (!vfb) return;
@@ -985,6 +1191,8 @@ export class WebGLGERenderer {
     const readHs = PSP_HEIGHT * s;
     const buf = new Uint8Array(readWs * readHs * 4);
     gl.readPixels(0, 0, readWs, readHs, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    this.geGlStats.readbacks++;
+    this.geGlStats.readbackBytes += readWs * readHs * 4;
     const phys = key - 0x04000000;
     if (phys < 0) return;
     const bpp = vfb.format === 3 ? 4 : 2;
@@ -1019,12 +1227,14 @@ export class WebGLGERenderer {
   /** GPU blit from one VFB to another. PPSSPP BlitFramebuffer.
    *  Used for block transfers where both src and dst are VFBs — no CPU roundtrip needed. */
   blitVFB(srcAddr: number, dstAddr: number): boolean {
+    this.flush(); // draw any pending geometry before the GPU blit
     const srcKey = this.normFb(srcAddr);
     const dstKey = this.normFb(dstAddr);
     const srcVfb = this.vfbs.get(srcKey);
     const dstVfb = this.vfbs.get(dstKey);
     if (!srcVfb || !dstVfb || srcKey === dstKey) return false;
     this._dbgBlitCount++;
+    this.geGlStats.blitCalls++;
     if (this._dbgBlitCount <= 3) {
       console.log(`[VFB] Blit 0x${srcKey.toString(16)} → 0x${dstKey.toString(16)}`);
     }
@@ -1257,6 +1467,7 @@ export class WebGLGERenderer {
     const texAddrNorm = this.normFb(texState.texAddr0);
     const texVfb = this.vfbs.get(texAddrNorm);
     if (texVfb && texAddrNorm !== this.currentRenderAddr) {
+      this.geGlStats.texFromVFB++;
       return texVfb.tex;
     }
 
@@ -1265,16 +1476,19 @@ export class WebGLGERenderer {
     const hash = this.hashTexture(texState, bus);
     const cached = this.texCache.get(key);
     if (cached) {
-      if (cached.hash === hash) return cached.tex;
+      if (cached.hash === hash) { this.geGlStats.texHits++; return cached.tex; }
       gl.deleteTexture(cached.tex); // content changed in place — re-upload
       this.texCache.delete(key);
     }
+    this.geGlStats.texMiss++;
 
     const { data, width, height } = decodeTexture(bus, texState);
 
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    this.geGlStats.texUploads++;
+    this.geGlStats.texUploadBytes += width * height * 4;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
