@@ -80,7 +80,7 @@ function kirk47GetKey(keyType: number): Uint8Array | null {
 
 // ── CMD11: SHA1 hash ─────────────────────────────────────────────────
 
-function kirkCMD11(kirk: KirkState, outbuff: Uint8Array, outOff: number, inbuff: Uint8Array, inOff: number, inSize: number): number {
+function kirkCMD11(_kirk: KirkState, outbuff: Uint8Array, outOff: number, inbuff: Uint8Array, inOff: number, inSize: number): number {
   // KIRK_SHA1_HEADER: u32 data_size at offset 0
   const dataSize = readI32LE(inbuff, inOff);
   if (dataSize === 0 || inSize === 0) return KIRK_DATA_SIZE_ZERO;

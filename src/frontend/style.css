@@ -1,3 +1,12 @@
+/* Hide custom elements until their definitions upgrade and render once, so they
+   don't flash as unstyled/empty content first (Lit's first render is async). */
+game-library:not(:defined),
+debug-panel:not(:defined),
+savedata-overlay:not(:defined),
+savedata-list:not(:defined) {
+  display: none;
+}
+
 :root {
   --bg:          #0b0e14;
   --bg-elev:     #11161f;

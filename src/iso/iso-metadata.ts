@@ -8,7 +8,7 @@
 
 import type { IsoFile, IsoVolume } from "./iso9660.js";
 import { readFile } from "./iso9660.js";
-import { parseSfo, extractGameInfo, type GameInfo } from "./sfo.js";
+import { parseSfo, extractGameInfo } from "./sfo.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 

@@ -1,4 +1,3 @@
-import "./style.css";
 import { Logger } from "../utils/logger.js";
 import { parseIso, parseIsoFromFile, readFile, readFileFromIso, type IsoVolume, type IsoFile } from "../iso/iso9660.js";
 import type { PspFileSystem } from "../kernel/psp-filesystem.js";
@@ -14,8 +13,10 @@ import { FramebufferRenderer } from "../gpu/framebuffer-renderer.js";
 import { WebGLGERenderer } from "../gpu/ge-webgl-renderer.js";
 import "./debug-panel.js"; // registers the <debug-panel> custom element
 import type { DebugPanel } from "./debug-panel.js";
-import { SavedataOverlay } from "./savedata-overlay.js";
-import { SavedataList } from "./savedata-list.js";
+import "./savedata-overlay.js"; // registers <savedata-overlay>
+import type { SavedataOverlay } from "./savedata-overlay.js";
+import "./savedata-list.js"; // registers <savedata-list>
+import type { SavedataList } from "./savedata-list.js";
 import "./game-library.js";
 
 declare global {
@@ -264,7 +265,7 @@ function bootGame(): void {
       };
     }
     if (list && emulator) {
-      emulator.hle.onSavedataListSelect = (action, slots) => list.show(action, slots);
+      emulator.hle.onSavedataListSelect = (action, gameTitle, slots) => list.show(action, gameTitle, slots);
     }
   });
 
@@ -604,7 +605,7 @@ function setPaused(paused: boolean): void {
   _paused = paused;
   const pauseBtn = document.getElementById("pause-btn");
   const stepBtn = document.getElementById("step-btn") as HTMLButtonElement | null;
-  if (pauseBtn) pauseBtn.textContent = _paused ? "▶" : "⏸";
+  if (pauseBtn) pauseBtn.textContent = _paused ? "Resume" : "Pause";
   if (stepBtn) stepBtn.disabled = !_paused;
   if (!_paused && rafHandle === 0) {
     _lastFrameTime = performance.now();
@@ -693,7 +694,7 @@ function runOneFrame(): void {
     if (_hudPc)    _hudPc.textContent    = emulator.cpu.regs.pc.toString(16);
   }
 
-  debugPanel?.update(emulator, cpuMs, presentMs);
+  debugPanel?.tick(emulator, cpuMs, presentMs);
 
   if (emulator.halted) {
     stopRafLoop();

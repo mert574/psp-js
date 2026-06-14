@@ -13,7 +13,6 @@ import { Logger } from "./utils/logger.js";
 const log = Logger.get("EMU");
 const hleLog = Logger.get("HLE");
 
-const MAGIC_ELF     = 0x7f454c46; // "\x7fELF" big-endian
 const MAGIC_PSP_ENC = 0x7e505350; // "~PSP"   big-endian — Kirk-encrypted
 
 /** Module names we HLE — skip decrypt/decompress for these (matches PPSSPP ShouldHLEModule). */

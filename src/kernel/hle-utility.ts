@@ -171,8 +171,10 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
         }));
       })).then(slots => {
         if (kernel.onSavedataListSelect) {
-          // Show UI — wait for user selection
-          kernel.onSavedataListSelect(action, slots).then(selected => {
+          // Show UI — wait for user selection. The SFO title (paramAddr + 128) is
+          // the human-readable game/save name; fall back to the savedata folder.
+          const gameTitle = readFixedStr(bus, paramAddr + 128, 128) || gameName;
+          kernel.onSavedataListSelect(action, gameTitle, slots).then(selected => {
             if (selected) {
               // Write selected name back to saveName in param struct (PPSSPP behavior)
               const enc = new TextEncoder().encode(selected);

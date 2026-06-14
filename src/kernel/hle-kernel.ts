@@ -33,7 +33,6 @@ const log = Logger.get("HLE");
 // PPSSPP sceGe.cpp: list IDs are XOR'd with this magic before being returned to
 // user code, and unmasked on every inbound syscall that takes a list ID.
 const GE_LIST_ID_MAGIC = 0x35000000;
-const pspLog = Logger.get("PSP");
 
 /**
  * HLEKernel
@@ -244,7 +243,7 @@ export class HLEKernel {
 
   /** Optional callback for save slot selection UI (LISTLOAD/LISTSAVE modes).
    *  Called with action + slot info, returns a Promise resolving to the selected name or null. */
-  onSavedataListSelect: ((action: "Load" | "Save", slots: Array<{ name: string; hasData: boolean; sizeKB: number; title: string }>) => Promise<string | null>) | null = null;
+  onSavedataListSelect: ((action: "Load" | "Save", gameTitle: string, slots: Array<{ name: string; hasData: boolean; sizeKB: number; title: string }>) => Promise<string | null>) | null = null;
 
   /** PSP kernel callbacks — PPSSPP kernelObjects for PSPCallback type */
   readonly pspCallbacks = new Map<number, PSPCallback>();
@@ -379,10 +378,6 @@ export class HLEKernel {
   /** Map font handle → pgfFonts index */
   private fontHandleMap = new Map<number, number>();
   private nextFontHandle = 2;
-
-  /** Open file descriptors: fd → { path, data, position, asyncResult } */
-  private readonly openFiles = new Map<number, { path: string; data: Uint8Array; position: number; asyncResult: number }>();
-  private nextFd = 3; // 0/1/2 reserved for stdin/stdout/stderr
 
 
   /** Next available syscall code for dynamically loaded modules (set after main EBOOT load). */
@@ -2055,7 +2050,7 @@ export class HLEKernel {
 
     // sceGeSaveContext(ctxAddr) — PPSSPP sceGe.cpp:531-545, GPUState.cpp:122-168
     // Saves GE command state (256 cmds + matrices) to memory.
-    this.register(GE.sceGeSaveContext, (regs, bus) => {
+    this.register(GE.sceGeSaveContext, (regs, _bus) => {
       const ctxAddr = regs.getGpr(4);
       // Headless mode: process pending lists to update cmdmem/addresses
       if (!this.geDispatcher) this._processGeQueue();

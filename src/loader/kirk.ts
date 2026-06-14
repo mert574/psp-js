@@ -269,7 +269,6 @@ export async function kirk4(data: Uint8Array, keyId: number): Promise<Uint8Array
 
 // KIRK_CMD1_HEADER offsets
 const CMD1_MODE = 0x60;
-const CMD1_ECDSA_HASH = 0x64;
 const CMD1_DATA_SIZE = 0x70;
 const CMD1_DATA_OFFSET = 0x74;
 const HEADER_SIZE = 0x90;
@@ -290,7 +289,6 @@ export async function kirkCMD1(inbuf: Uint8Array): Promise<Uint8Array> {
 
   const header = inbuf.slice(0, HEADER_SIZE);
   const mode = readU32LE(header, CMD1_MODE);
-  const ecdsaHash = header[CMD1_ECDSA_HASH];
   const dataSize = readU32LE(header, CMD1_DATA_SIZE);
   const dataOffset = readU32LE(header, CMD1_DATA_OFFSET);
 

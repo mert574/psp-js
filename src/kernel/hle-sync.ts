@@ -328,7 +328,6 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   const mutexes = new Map<number, MutexState>();
   const SCE_MUTEX_ERROR_NO_SUCH_MUTEX = 0x800201c3 >>> 0;
   const SCE_MUTEX_ERROR_NOT_LOCKED    = 0x800201c5 >>> 0;
-  const SCE_MUTEX_ERROR_ALREADY_LOCKED = 0x800201c7 >>> 0;
   const SCE_MUTEX_ERROR_LOCK_OVERFLOW  = 0x800201c8 >>> 0;
   const SCE_MUTEX_ERROR_UNLOCK_UNDERFLOW = 0x800201c9 >>> 0;
   const PSP_MUTEX_ATTR_ALLOW_RECURSIVE = 0x200;

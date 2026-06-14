@@ -7,7 +7,6 @@ import { describe, it, expect } from "vitest";
 import { shaInit, shaUpdate, shaFinal } from "./sha1.js";
 import { aesCreateCtx, aesSetKey, aesEncryptBlock, aesDecryptBlock, aesCbcEncrypt, aesCbcDecrypt, aesCmac } from "./aes.js";
 import { kirkCreate, kirkInit } from "./kirk.js";
-import { pgdOpen, pgdDecryptBlock } from "./amctrl.js";
 
 // ── SHA1 tests (RFC 3174 test vectors) ───────────────────────────────
 
