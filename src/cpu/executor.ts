@@ -1194,9 +1194,25 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
     return;
   }
 
-  // vcmov (rs=21) — conditional move
+  // vcmov (rs=21) — conditional move on the VFPU condition code. PPSSPP
+  // MIPSIntVFPU.cpp Int_Vcmov: tf picks move-if-false vs move-if-true; imm3<6
+  // tests one CC bit for the whole vector, imm3==6 tests per-lane.
   if (rs === 21) {
-    // TODO: implement conditional move
+    const tf = (raw >>> 19) & 1;
+    const imm3 = (raw >>> 16) & 7;
+    const s = readVecS(r, vs, sz);
+    const d = readVecT(r, vd, sz); // dest read (with T prefix), then conditionally overwritten
+    const want = tf ? 0 : 1;
+    if (imm3 < 6) {
+      if (((r.vfpuCc >> imm3) & 1) === want) {
+        for (let j = 0; j < sz; j++) d[j] = s[j]!;
+      }
+    } else if (imm3 === 6) {
+      for (let j = 0; j < sz; j++) {
+        if (((r.vfpuCc >> j) & 1) === want) d[j] = s[j]!;
+      }
+    }
+    writeVecD(r, vd, sz, d);
     r.vpfxsEnabled = false; r.vpfxtEnabled = false; r.vpfxdEnabled = false;
     return;
   }
@@ -1663,6 +1679,16 @@ function execCOP2(cpu: AllegrexCPU, i: Instruction): void {
       }
       break;
     }
+    case 0x08: { // bvf/bvt/bvfl/bvtl — branch on the VFPU condition code.
+      // PPSSPP MIPSInt.cpp Int_VBranch: bits 18-20 select the CC bit
+      // (x/y/z/w/any/all), bits 16-17 select bvf(0)/bvt(1)/bvfl(2)/bvtl(3).
+      const ccBit = (r.vfpuCc >> ((i.raw >>> 18) & 7)) & 1;
+      const subType = (i.raw >>> 16) & 3;
+      const taken = (subType & 1) ? ccBit === 1 : ccBit === 0;
+      if (subType >= 2) branchLikely(cpu, i, taken);
+      else branch(cpu, i, taken);
+      return; // branches don't consume pending VFPU prefixes
+    }
     default:
       // fmt 0/4 = mfc2/mtc2 — PPSSPP treats them as generic no-ops.
       break;
@@ -1683,6 +1709,21 @@ function execVFPU0(cpu: AllegrexCPU, i: Instruction): void {
   const vs = (raw >>> 8) & 0x7F;
   const vt = (raw >>> 16) & 0x7F;
   const sz = vfpuVecSize(raw);
+  if (sub === 2) { // vsbn: replace s[0]'s exponent with 127 + (t[0] as int);
+    // other lanes copied unchanged. PPSSPP MIPSIntVFPU.cpp Int_Vsbn.
+    const sBits = vfpuReadVecBits(r, vs, sz);
+    const tBits = vfpuReadVecBits(r, vt, sz);
+    const exp = (127 + (tBits[0]! | 0)) & 0xFF;
+    const out = new Uint32Array(sz);
+    const prevExp = sBits[0]! & 0x7F800000;
+    out[0] = (prevExp !== 0 && prevExp !== 0x7F800000)
+      ? ((sBits[0]! & ~0x7F800000) | (exp << 23)) >>> 0
+      : sBits[0]!;
+    for (let j = 1; j < sz; j++) out[j] = sBits[j]!;
+    vfpuWriteVecBits(r, vd, sz, out);
+    r.vpfxsEnabled = false; r.vpfxtEnabled = false; r.vpfxdEnabled = false;
+    return;
+  }
   const s = readVecS(r, vs, sz);
   const t = readVecT(r, vt, sz);
   const d = new Float32Array(sz);
@@ -2019,10 +2060,13 @@ function execVFPU6(cpu: AllegrexCPU, i: Instruction): void {
       writeVecD(r, vd, 4, d);
     }
   } else if (sub5 === 28) {
-    // VFPUMatrix1: vmidt, vmzero, vmone
+    // VFPUMatrix1: vmmov, vmidt, vmzero, vmone
     const rt = (raw >>> 16) & 0x1F;
     const dM = new Float32Array(n * 4);
     switch (rt) {
+      case 0: // vmmov — copy source matrix (PPSSPP Int_Vmmov)
+        dM.set(vfpuReadMatrix(r, vs, n));
+        break;
       case 3: // vmidt — identity
         for (let c = 0; c < n; c++)
           for (let row = 0; row < n; row++)

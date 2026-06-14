@@ -243,7 +243,7 @@ function decodeDXT1Pixel(bus: MemoryBus, blockAddr: number, px: number, py: numb
 
 function decodeDXT3Pixel(bus: MemoryBus, blockAddr: number, px: number, py: number): number {
   const alphaWord = bus.readU16(blockAddr + py * 2);
-  const alpha = ((alphaWord >> (px * 4)) & 0xF) * 17;
+  const alpha = ((alphaWord >> (px * 4)) & 0xF) << 4; // PPSSPP WriteColorsDXT3: nibble<<4
   const color = decodeDXT1Pixel(bus, blockAddr + 8, px, py);
   return (color & 0x00FFFFFF) | (alpha << 24);
 }
