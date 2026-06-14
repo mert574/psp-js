@@ -15,6 +15,11 @@ const CPU_RAM_END = MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE;
 const CPU_SCRATCH_START = MemoryRegion.SCRATCHPAD_START;
 const CPU_SCRATCH_END = MemoryRegion.SCRATCHPAD_START + MemoryRegion.SCRATCHPAD_SIZE;
 
+// Caller-saved GPRs clobbered to 0xDEADBEEF after a syscall (PPSSPP hleFinishSyscall):
+// $at, $a0-$a3, $t0-$t7, $t8-$t9. Skips $v0/$v1 (returns), $s0-$s7, $gp/$sp/$fp/$ra/$k0-$k1.
+// Module-level so the syscall path doesn't re-allocate the array each call.
+const CALLER_SAVED_REGS = [1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25];
+
 /**
  * AllegrexCPU
  *
@@ -78,7 +83,10 @@ export class AllegrexCPU {
   /** Optional PC watchpoint for debugging — set to non-zero to log registers at that PC. */
   watchPC: number = 0;
 
-  /** Execute a single instruction. Returns false if an unrecoverable error occurs. */
+  /** Execute a single instruction. Returns false if an unrecoverable error occurs.
+   *  Kept small so V8 keeps it optimized — the cold paths (fault dumps, watchPC log,
+   *  syscall register clobber) live in separate methods. A big cold block inside this
+   *  per-instruction function measured ~3.7x slower (V8 stops optimizing the bloated fn). */
   step(): boolean {
     this.stepFaulted = false;
     const pc = this.regs.pc;
@@ -86,15 +94,7 @@ export class AllegrexCPU {
     this.traceBuffer[this.traceIdx & 511] = pc;
     this.traceIdx++;
 
-    if (this.watchPC && pc === this.watchPC) {
-      const r = this.regs;
-      const ra = r.getGpr(31);
-      const sp = r.getGpr(29);
-      // Log all calls at the crash frame or with bad ra
-      if (ra === 0 || sp === 0xbfdf090) {
-        log.info(`WATCH PC=0x${pc.toString(16)} a0=0x${r.getGpr(4).toString(16)} a1=0x${r.getGpr(5).toString(16)} a2=0x${r.getGpr(6).toString(16)} a3=0x${r.getGpr(7).toString(16)} s0=0x${r.getGpr(16).toString(16)} s1=0x${r.getGpr(17).toString(16)} ra=0x${ra.toString(16)} sp=0x${sp.toString(16)} tid=${this.hle?.currentThreadId ?? -1}`);
-      }
-    }
+    if (this.watchPC && pc === this.watchPC) this.logWatch(pc);
 
     // Catch execution outside valid code regions.
     // PPSSPP: PSP_GetKernelMemoryBase()=RAM_START, PSP_GetUserMemoryEnd()=RAM_START+g_MemorySize.
@@ -104,44 +104,7 @@ export class AllegrexCPU {
     const inRAM = phys >= CPU_RAM_START && phys < CPU_RAM_END;
     if (!inRAM) {
       const inScratch = phys >= CPU_SCRATCH_START && phys < CPU_SCRATCH_END;
-      if (!inScratch) {
-        const ra = this.regs.getGpr(31);
-        const trace = [];
-        for (let i = Math.max(0, this.traceIdx - 64); i < this.traceIdx; i++) {
-          trace.push('0x' + this.traceBuffer[i & 511]!.toString(16));
-        }
-        const tid = this.hle?.currentThreadId ?? -1;
-        log.error(`Bad PC=0x${pc.toString(16)} ra=0x${ra.toString(16)} sp=0x${this.regs.getGpr(29).toString(16)} thread=${tid}`);
-        log.error(`Regs: v0=0x${this.regs.getGpr(2).toString(16)} v1=0x${this.regs.getGpr(3).toString(16)} a0=0x${this.regs.getGpr(4).toString(16)} a1=0x${this.regs.getGpr(5).toString(16)} a2=0x${this.regs.getGpr(6).toString(16)} a3=0x${this.regs.getGpr(7).toString(16)} s0=0x${this.regs.getGpr(16).toString(16)} s1=0x${this.regs.getGpr(17).toString(16)} gp=0x${this.regs.getGpr(28).toString(16)}`);
-        log.error(`Last PCs: ${trace.join(' → ')}`);
-
-        // Dump stack memory around sp to find corrupted $ra
-        const sp = this.regs.getGpr(29);
-        const spPhys = sp & 0x1FFFFFFF;
-        if (spPhys >= MemoryRegion.RAM_START && spPhys < MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE) {
-          // Dump from sp-0x60 to sp+0x60 to catch both the pre-epilogue and
-          // post-epilogue frames. The ASCII column makes stack-string corruption
-          // (e.g. a path overrunning a local buffer onto the saved $ra) obvious.
-          const rows: Record<string, { hex: string; ascii: string }> = {};
-          for (let off = -0x60; off <= 0x60; off += 4) {
-            try {
-              const val = this.bus.readU32(sp + off) >>> 0;
-              const label = off >= 0 ? `sp+${off.toString(16).padStart(2,'0')}` : `sp-${(-off).toString(16).padStart(2,'0')}`;
-              const ascii = [val & 0xff, (val >>> 8) & 0xff, (val >>> 16) & 0xff, (val >>> 24) & 0xff]
-                .map((b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : ".")).join("");
-              rows[label] = { hex: `0x${val.toString(16).padStart(8, "0")}`, ascii };
-            } catch { /* skip invalid */ }
-          }
-          log.error(`Stack dump (sp=0x${sp.toString(16)}):`);
-          console.table(rows);
-        }
-
-        // Try to recover by killing the current thread and rescheduling.
-        // This mirrors how PPSSPP handles fatal thread errors — the thread dies
-        // but the emulator continues with remaining threads.
-        this.stepFaulted = true;
-        return false;
-      }
+      if (!inScratch) { this.reportBadPc(pc); return false; }
     }
 
     // Fetch — the PC was validated above, so RAM fetches can skip the bus's
@@ -163,13 +126,7 @@ export class AllegrexCPU {
     } catch (e) {
       // Only real faults reach here now — SYSCALL uses cpu.pendingSyscall, not a
       // throw, so the common case never pays exception-unwinding cost.
-      const trace = [];
-      for (let i = Math.max(0, this.traceIdx - 128); i < this.traceIdx; i++) {
-        trace.push('0x' + this.traceBuffer[i & 127]!.toString(16));
-      }
-      log.error(`Execute fault at PC=0x${pc.toString(16)}: ${e}`);
-      log.error(`Recent PCs: ${trace.join(' → ')}`);
-      this.stepFaulted = true;
+      this.reportExecuteFault(pc, e);
       return false;
     }
 
@@ -186,29 +143,7 @@ export class AllegrexCPU {
         const callerThreadId = this.hle.currentThreadId;
         this.hle.dispatch(code, this.regs);
         if (this.stepFaulted) return false;
-        // Clobber caller-saved registers to 0xDEADBEEF after syscall,
-        // matching PPSSPP's hleFinishSyscall behavior.
-        // Skip $v0/$v1 (return values), $s0-$s7 (callee-saved), $k0-$k1/$gp/$sp/$fp/$ra.
-        // Don't clobber when a MipsCall is active — the syscall handler set up
-        // $a0-$a2 for the callback, and clobbering would destroy them.
-        const DEADBEEF = 0xDEADBEEF;
-        const callerRegs = [1, 4,5,6,7, 8,9,10,11,12,13,14,15, 24,25];
-        if (this.hle.hasMipsCall) {
-          // MipsCall dispatched — callback args are live, don't clobber
-        } else if (this.hle.currentThreadId === callerThreadId) {
-          // No thread switch — clobber live registers directly
-          for (const r of callerRegs) this.regs.setGpr(r, DEADBEEF);
-          this.regs.hi = DEADBEEF;
-          this.regs.lo = DEADBEEF;
-        } else {
-          // Thread switch occurred — clobber the saved context of the calling thread
-          const callerThread = this.hle.threads.get(callerThreadId);
-          if (callerThread) {
-            for (const r of callerRegs) callerThread.context.gpr[r] = DEADBEEF;
-            callerThread.context.hi = DEADBEEF;
-            callerThread.context.lo = DEADBEEF;
-          }
-        }
+        this.clobberCallerRegs(callerThreadId);
       } else {
         log.warn(`SYSCALL 0x${code.toString(16)} with no HLE kernel attached`);
         this.regs.setGpr(2, 0x80020001);
@@ -223,6 +158,94 @@ export class AllegrexCPU {
     }
 
     return true;
+  }
+
+  /** Clobber caller-saved registers to 0xDEADBEEF after a syscall (PPSSPP
+   *  hleFinishSyscall). Cold-ish (once per syscall, not per instruction) and kept
+   *  out of step() so its loops don't bloat the hot path. When a MipsCall is active
+   *  the callback args ($a0-$a2) are live, so skip. */
+  private clobberCallerRegs(callerThreadId: number): void {
+    const hle = this.hle!;
+    if (hle.hasMipsCall) return;
+    if (hle.currentThreadId === callerThreadId) {
+      // No thread switch — clobber live registers directly
+      for (const r of CALLER_SAVED_REGS) this.regs.setGpr(r, 0xDEADBEEF);
+      this.regs.hi = 0xDEADBEEF;
+      this.regs.lo = 0xDEADBEEF;
+    } else {
+      // Thread switch occurred — clobber the saved context of the calling thread
+      const callerThread = hle.threads.get(callerThreadId);
+      if (callerThread) {
+        for (const r of CALLER_SAVED_REGS) callerThread.context.gpr[r] = 0xDEADBEEF;
+        callerThread.context.hi = 0xDEADBEEF;
+        callerThread.context.lo = 0xDEADBEEF;
+      }
+    }
+  }
+
+  /** watchPC debug log — extracted from step() so the per-instruction hot path
+   *  carries only the cheap `pc === watchPC` test, not this string-building block. */
+  private logWatch(pc: number): void {
+    const r = this.regs;
+    const ra = r.getGpr(31);
+    const sp = r.getGpr(29);
+    // Log all calls at the crash frame or with bad ra
+    if (ra === 0 || sp === 0xbfdf090) {
+      log.info(`WATCH PC=0x${pc.toString(16)} a0=0x${r.getGpr(4).toString(16)} a1=0x${r.getGpr(5).toString(16)} a2=0x${r.getGpr(6).toString(16)} a3=0x${r.getGpr(7).toString(16)} s0=0x${r.getGpr(16).toString(16)} s1=0x${r.getGpr(17).toString(16)} ra=0x${ra.toString(16)} sp=0x${sp.toString(16)} tid=${this.hle?.currentThreadId ?? -1}`);
+    }
+  }
+
+  /** Bad-PC fault reporter — execution left valid code regions. Extracted from
+   *  step() (the dump + console.table block bloated the hot function ~3.7x). Sets
+   *  stepFaulted; the run loop turns that into a thread kill + reschedule. */
+  private reportBadPc(pc: number): void {
+    const ra = this.regs.getGpr(31);
+    const trace = [];
+    for (let i = Math.max(0, this.traceIdx - 64); i < this.traceIdx; i++) {
+      trace.push('0x' + this.traceBuffer[i & 511]!.toString(16));
+    }
+    const tid = this.hle?.currentThreadId ?? -1;
+    log.error(`Bad PC=0x${pc.toString(16)} ra=0x${ra.toString(16)} sp=0x${this.regs.getGpr(29).toString(16)} thread=${tid}`);
+    log.error(`Regs: v0=0x${this.regs.getGpr(2).toString(16)} v1=0x${this.regs.getGpr(3).toString(16)} a0=0x${this.regs.getGpr(4).toString(16)} a1=0x${this.regs.getGpr(5).toString(16)} a2=0x${this.regs.getGpr(6).toString(16)} a3=0x${this.regs.getGpr(7).toString(16)} s0=0x${this.regs.getGpr(16).toString(16)} s1=0x${this.regs.getGpr(17).toString(16)} gp=0x${this.regs.getGpr(28).toString(16)}`);
+    log.error(`Last PCs: ${trace.join(' → ')}`);
+
+    // Dump stack memory around sp to find corrupted $ra
+    const sp = this.regs.getGpr(29);
+    const spPhys = sp & 0x1FFFFFFF;
+    if (spPhys >= MemoryRegion.RAM_START && spPhys < MemoryRegion.RAM_START + MemoryRegion.RAM_SIZE) {
+      // Dump from sp-0x60 to sp+0x60 to catch both the pre-epilogue and
+      // post-epilogue frames. The ASCII column makes stack-string corruption
+      // (e.g. a path overrunning a local buffer onto the saved $ra) obvious.
+      const rows: Record<string, { hex: string; ascii: string }> = {};
+      for (let off = -0x60; off <= 0x60; off += 4) {
+        try {
+          const val = this.bus.readU32(sp + off) >>> 0;
+          const label = off >= 0 ? `sp+${off.toString(16).padStart(2,'0')}` : `sp-${(-off).toString(16).padStart(2,'0')}`;
+          const ascii = [val & 0xff, (val >>> 8) & 0xff, (val >>> 16) & 0xff, (val >>> 24) & 0xff]
+            .map((b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : ".")).join("");
+          rows[label] = { hex: `0x${val.toString(16).padStart(8, "0")}`, ascii };
+        } catch { /* skip invalid */ }
+      }
+      log.error(`Stack dump (sp=0x${sp.toString(16)}):`);
+      console.table(rows);
+    }
+
+    // Try to recover by killing the current thread and rescheduling.
+    // This mirrors how PPSSPP handles fatal thread errors — the thread dies
+    // but the emulator continues with remaining threads.
+    this.stepFaulted = true;
+  }
+
+  /** Execute-fault reporter — a handler threw (a real fault, not a syscall).
+   *  Extracted from step()'s catch so the try body stays lean. Sets stepFaulted. */
+  private reportExecuteFault(pc: number, e: unknown): void {
+    const trace = [];
+    for (let i = Math.max(0, this.traceIdx - 128); i < this.traceIdx; i++) {
+      trace.push('0x' + this.traceBuffer[i & 127]!.toString(16));
+    }
+    log.error(`Execute fault at PC=0x${pc.toString(16)}: ${e}`);
+    log.error(`Recent PCs: ${trace.join(' → ')}`);
+    this.stepFaulted = true;
   }
 
   /**
