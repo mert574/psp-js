@@ -2,6 +2,9 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  // GitHub Pages serves project sites under /<repo>/, so the CI build needs a
+  // matching base. Local dev/build stays at "/" so nothing changes day to day.
+  base: process.env.GITHUB_ACTIONS ? "/psp-js/" : "/",
   build: {
     outDir: "dist-web",
     target: "esnext",
