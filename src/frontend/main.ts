@@ -92,7 +92,7 @@ void (async () => {
     "ltn8","ltn9","ltn10","ltn11","ltn12","ltn13","ltn14","ltn15",
   ];
   const results = await Promise.allSettled(
-    names.map(n => fetch(`/flash0/font/${n}.pgf`).then(r => r.arrayBuffer()).then(b => ({ n, b })))
+    names.map(n => fetch(`${import.meta.env.BASE_URL}flash0/font/${n}.pgf`).then(r => r.arrayBuffer()).then(b => ({ n, b })))
   );
   for (const r of results) {
     if (r.status === "fulfilled") {
@@ -163,11 +163,11 @@ void (async () => {
   const hb = new URLSearchParams(location.search).get("homebrew");
   if (!hb) return;
   try {
-    const manifest = await (await fetch(`/${hb}/_manifest.json`)).json() as string[];
+    const manifest = await (await fetch(`${import.meta.env.BASE_URL}${hb}/_manifest.json`)).json() as string[];
     const dirFiles = new Map<string, Uint8Array>();
     let ebootBuf: Uint8Array<ArrayBuffer> | null = null;
     for (const rel of manifest) {
-      const resp = await fetch(`/${hb}/${rel}`);
+      const resp = await fetch(`${import.meta.env.BASE_URL}${hb}/${rel}`);
       if (!resp.ok) { log.warn(`?homebrew: skip ${rel} (HTTP ${resp.status})`); continue; }
       const bytes = new Uint8Array(await resp.arrayBuffer());
       dirFiles.set(`disc0:/${rel}`, bytes);
