@@ -6,7 +6,14 @@ const href = import.meta.env.BASE_URL.replace(/docs\/?$/, "");
 </script>
 
 <template>
-  <a class="emulator-link" :href="href">Open emulator</a>
+  <!--
+    target="_blank" is load-bearing here, not just a UX choice. VitePress's
+    router intercepts same-origin extensionless links (like "/psp-js/") and
+    tries to route them inside the docs SPA, where the app route doesn't exist,
+    so a plain link just silently does nothing on click. The router skips
+    _blank links, so this does a real browser navigation. rel guards the opener.
+  -->
+  <a class="emulator-link" :href="href" target="_blank" rel="noopener">Open emulator</a>
 </template>
 
 <style scoped>
