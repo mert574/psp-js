@@ -321,27 +321,39 @@ export function getBlendFactor(
   return out;
 }
 
-/** Read a pixel from VRAM as ABGR8888. */
+/** Swap the R and B bytes of an ABGR8888 value (bits 0-7 <-> bits 16-23). */
+function swapRB(c: number): number {
+  return (c & 0xFF00FF00) | ((c & 0xFF) << 16) | ((c >>> 16) & 0xFF);
+}
+
+/** Read a pixel from VRAM into the fragment pipeline's internal color.
+ *  VRAM stores pixels in PSP/hardware order (byte0 = R, matching WebGL), but the
+ *  fragment pipeline works in an R/B-swapped space (see applyTexFunc), so swap on
+ *  the way in. writePixel swaps back on the way out. */
 export function readPixel(vram: Uint8Array, off: number, fbFormat: number): number {
   if (fbFormat === 3) {
     if (off + 3 >= vram.length) return 0;
-    return vram[off]! | (vram[off + 1]! << 8) | (vram[off + 2]! << 16) | (vram[off + 3]! << 24);
+    return swapRB(vram[off]! | (vram[off + 1]! << 8) | (vram[off + 2]! << 16) | (vram[off + 3]! << 24));
   }
   if (off + 1 >= vram.length) return 0;
   const px = vram[off]! | (vram[off + 1]! << 8);
   switch (fbFormat) {
-    case 0: return color5650to8888(px);
-    case 1: return color5551to8888(px);
-    case 2: return color4444to8888(px);
+    case 0: return swapRB(color5650to8888(px));
+    case 1: return swapRB(color5551to8888(px));
+    case 2: return swapRB(color4444to8888(px));
     default: return 0;
   }
 }
 
-/** Write a pixel (r,g,b,a in 0-255) to VRAM at byte offset, respecting fbFormat. */
+/** Write a pixel (r,g,b,a in 0-255) to VRAM at byte offset, respecting fbFormat.
+ *  The pipeline's r/b are R/B-swapped (r holds blue, b holds red, see
+ *  applyTexFunc); swap them here so VRAM stores hardware order (byte0 = red),
+ *  the same as WebGL writes and what the present path expects (no shader swizzle). */
 export function writePixel(
   vram: Uint8Array, off: number, r: number, g: number, b: number, a: number,
   fbFormat: number, maskRgb: number, maskAlpha: number,
 ): void {
+  const t = r; r = b; b = t; // pipeline r=blue, b=red -> store byte0=red
   if (fbFormat === 3) {
     // ABGR8888
     if (off + 3 < vram.length) {
