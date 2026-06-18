@@ -978,6 +978,22 @@ export class WebGLGERenderer {
     this.texCache.clear();
   }
 
+  /** Drop every cached GPU framebuffer (the per-address VFB render targets).
+   *  Used after a save-state restore: the restored VRAM is the source of truth,
+   *  so the old GPU framebuffers are stale and must be rebuilt from VRAM on the
+   *  next draw. invalidateTextures() only clears sampled textures, not these. */
+  clearVFBs(): void {
+    this.flush(); // draw any pending geometry before deleting its render target
+    const gl = this.gl;
+    for (const vfb of this.vfbs.values()) {
+      gl.deleteFramebuffer(vfb.fbo);
+      gl.deleteTexture(vfb.tex);
+      gl.deleteRenderbuffer(vfb.depthRb);
+    }
+    this.vfbs.clear();
+    this.currentRenderAddr = 0; // nothing is bound now; next draw re-creates a target
+  }
+
   /** Called at frame start. Textures are only invalidated on block transfers now,
    *  not per-frame — PPSSPP uses hash-based invalidation, not per-frame flush. */
   onFrameStart(): void {

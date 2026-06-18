@@ -1,6 +1,6 @@
 import type { MemoryBus } from "../memory/memory-bus.js";
 import { MemoryRegion } from "../memory/memory-map.js";
-import { BlockAllocator } from "../memory/block-allocator.js";
+import { BlockAllocator, type BlockAllocatorState } from "../memory/block-allocator.js";
 import type { AllegrexRegisters } from "../cpu/registers.js";
 import type { AllegrexCPU } from "../cpu/cpu.js";
 import type { CoreTiming, EventTypeId } from "../timing/core-timing.js";
@@ -216,8 +216,133 @@ export interface Thread {
 }
 
 
+/**
+ * A per-module save-state port. Each HLE register function (hle-io, hle-audio,
+ * etc.) keeps its runtime state in closure locals; it hands the kernel a port so
+ * those locals can be saved and restored without moving them out of the closure.
+ */
+export interface StateModulePort {
+  /** Return a JSON-round-trippable snapshot of this module's closure state. */
+  save(): unknown;
+  /** Restore this module's closure state from a snapshot made by save(). */
+  load(data: unknown): void;
+  /** Optional: reasons this module is not safe to snapshot right now (empty/none = safe). */
+  blockers?(): string[];
+}
+
+/** Saved form of one Thread (see the Thread interface). The CPU context's typed
+ *  arrays are stored as plain number arrays; pendingWakeCallback is skipped. */
+export interface ThreadStateV1 {
+  id: number;
+  entry: number;
+  stackSize: number;
+  stackBase: number;
+  stackTop: number;
+  k0: number;
+  priority: number;
+  state: number;
+  waitType: number;
+  context: {
+    gpr: number[]; hi: number; lo: number; pc: number;
+    fpr: number[]; fcr31: number;
+    vfpr: number[]; vfpuCtrl: number[]; vfpuCc: number;
+    vpfxs: number; vpfxt: number; vpfxd: number;
+    vpfxsEnabled: boolean; vpfxtEnabled: boolean; vpfxdEnabled: boolean;
+  };
+  wakeupCount: number;
+  callbacks: number[];
+  isProcessingCallbacks: boolean;
+  waitSemaId: number; waitSemaCount: number;
+  waitEvfId: number; waitEvfBits: number; waitEvfMode: number; waitEvfOutPtr: number;
+  waitGeListId: number; waitDeadlineVbl: number; waitWakeTimeMs: number;
+  waitThreadEndId: number;
+  waitMutexId: number; waitMutexCount: number;
+  waitFplId: number; waitFplDataPtr: number;
+  waitVplId: number; waitVplSize: number; waitVplAddrPtr: number;
+  cbPromotedFromWaitType: number;
+}
+
+/**
+ * Save-state of the HLEKernel. A plain object that round-trips through JSON:
+ * every Map is stored as an entry array, every typed array as a number array or
+ * base64 string, and every guest-address number stays a number. Functions, host
+ * objects, and the mounted game files are not part of this; a normal boot
+ * rebuilds them. `modules` holds each registered StateModulePort's saved data
+ * keyed by module name.
+ */
+export interface KernelStateV1 {
+  version: 1;
+  threads: ThreadStateV1[];
+  nextThreadId: number;
+  currentThreadId: number;
+  pendingThreadEntry: { entry: number; arglen: number; argp: number; sp: number; k0: number } | null;
+  pendingAtracWakes: number[];
+  pspCallbacks: Array<[number, PSPCallback]>;
+  nextPspCallbackId: number;
+  activeMipsCall: HLEKernel["activeMipsCall"];
+  userMemory: BlockAllocatorState;
+  ramSize: number;
+  memBlocks: Array<[number, { addr: number; size: number; name: string }]>;
+  nextBlockId: number;
+  fplPools: Array<[number, { base: number; blockSize: number; numBlocks: number; nextBlock: number }]>;
+  semaphores: Array<[number, { name: string; attr: number; initCount: number; count: number; maxCount: number }]>;
+  eventFlags: Array<[number, { pattern: number; attr: number }]>;
+  subIntrs: Array<[number, { handler: number; arg: number; enabled: boolean }]>;
+  sasGrainSize: number;
+  nextGeListSlot: number;
+  geLists: Array<[number, GeListEntry]>;
+  geListQueue: number[];
+  geCallbacks: Array<[number, { signalFunc: number; signalArg: number; finishFunc: number; finishArg: number }]>;
+  activeGeCbId: number;
+  geCommandMem: number[];
+  geCommandMemReady: boolean;
+  geVertexAddr: number;
+  geIndexAddr: number;
+  geOffsetAddr: number;
+  gePendingSignalCb: { token: number; cbId: number; a2: number } | null;
+  gePendingInterrupts: Array<{ func: number; a0: number; a1: number; listState?: number }>;
+  geEdramTranslation: number;
+  geIsBreak: boolean;
+  suppressReschedule: boolean;
+  vblankCount: number;
+  cycleCount: number;
+  ioOpsCount: number;
+  geTimeMs: number;
+  currentButtons: number;
+  framebufAddr: number;
+  framebufWidth: number;
+  framebufFormat: number;
+  stubCalls: Array<[string, number]>;
+  idleBreak: boolean;
+  compiledSdkVersion: number;
+  interruptsEnabled: boolean;
+  dispatchEnabled: boolean;
+  pendingAlarmFires: number[];
+  // Display state
+  displayHasSetMode: boolean;
+  displayMode: number;
+  displayWidth: number;
+  displayHeight: number;
+  isVblank: boolean;
+  frameStartTicks: number;
+  hCountBase: number;
+  displayResumeMode: number;
+  displayHoldMode: number;
+  displayBrightnessLevel: number;
+  loadedModules: Array<[number, LoadedModule]>;
+  nextSyscallCode: number;
+  fontHandleMap: Array<[number, number]>;
+  nextFontHandle: number;
+  threadReturnAddr: number;
+  cbReturnTrampolineWritten: boolean;
+  /** Per-module closure state, keyed by the name passed to registerStateModule. */
+  modules: Record<string, unknown>;
+}
+
 export class HLEKernel {
   private readonly handlers = new Map<number, HLEHandler>();
+  /** Per-module save-state ports registered by the HLE register functions. */
+  private readonly stateModules = new Map<string, StateModulePort>();
   /** Reverse map: syscall code → NID (for debug logging) */
   private syscallToNid = new Map<number, number>();
   private warnedSyscalls = new Set<number>();
@@ -1435,6 +1560,309 @@ export class HLEKernel {
         this.processThreadCallbacks(regs, call.forceCallbacks);
       }
     }
+  }
+
+  // ── Save-state serialization ───────────────────────────────────────────────
+
+  /** Register a per-module save-state port. Called once by each HLE register
+   *  function so the kernel can save and restore that module's closure state. */
+  registerStateModule(name: string, port: StateModulePort): void {
+    this.stateModules.set(name, port);
+  }
+
+  /** Reasons the kernel is NOT safe to snapshot right now. Empty = safe.
+   *  Covers threads mid-ATRAC-decode (a JS callback we can't serialize) plus
+   *  whatever each registered module reports through its blockers(). */
+  snapshotBlockers(): string[] {
+    const reasons: string[] = [];
+    for (const t of this.threads.values()) {
+      if (t.pendingWakeCallback) {
+        reasons.push(`thread ${t.id} has a pending wake callback (ATRAC decode in flight)`);
+      }
+    }
+    for (const [name, port] of this.stateModules) {
+      const moduleReasons = port.blockers?.();
+      if (moduleReasons) {
+        for (const r of moduleReasons) reasons.push(`${name}: ${r}`);
+      }
+    }
+    return reasons;
+  }
+
+  /** Capture a single thread's restorable state. The CPU context's typed arrays
+   *  become plain number arrays; pendingWakeCallback is intentionally dropped. */
+  private _serializeThread(t: Thread): ThreadStateV1 {
+    const c = t.context;
+    return {
+      id: t.id, entry: t.entry,
+      stackSize: t.stackSize, stackBase: t.stackBase, stackTop: t.stackTop,
+      k0: t.k0, priority: t.priority, state: t.state, waitType: t.waitType,
+      context: {
+        gpr: Array.from(c.gpr), hi: c.hi, lo: c.lo, pc: c.pc,
+        fpr: Array.from(c.fpr), fcr31: c.fcr31,
+        // vfpr is float, but store its raw bits so NaN/-0 in uninitialized VFPU
+        // registers survive JSON (NaN would otherwise become null then 0).
+        vfpr: Array.from(new Uint32Array(c.vfpr.buffer, c.vfpr.byteOffset, c.vfpr.length)),
+        vfpuCtrl: Array.from(c.vfpuCtrl), vfpuCc: c.vfpuCc,
+        vpfxs: c.vpfxs, vpfxt: c.vpfxt, vpfxd: c.vpfxd,
+        vpfxsEnabled: c.vpfxsEnabled, vpfxtEnabled: c.vpfxtEnabled, vpfxdEnabled: c.vpfxdEnabled,
+      },
+      wakeupCount: t.wakeupCount,
+      callbacks: t.callbacks.slice(),
+      isProcessingCallbacks: t.isProcessingCallbacks,
+      waitSemaId: t.waitSemaId, waitSemaCount: t.waitSemaCount,
+      waitEvfId: t.waitEvfId, waitEvfBits: t.waitEvfBits, waitEvfMode: t.waitEvfMode, waitEvfOutPtr: t.waitEvfOutPtr,
+      waitGeListId: t.waitGeListId, waitDeadlineVbl: t.waitDeadlineVbl, waitWakeTimeMs: t.waitWakeTimeMs,
+      waitThreadEndId: t.waitThreadEndId,
+      waitMutexId: t.waitMutexId, waitMutexCount: t.waitMutexCount,
+      waitFplId: t.waitFplId, waitFplDataPtr: t.waitFplDataPtr,
+      waitVplId: t.waitVplId, waitVplSize: t.waitVplSize, waitVplAddrPtr: t.waitVplAddrPtr,
+      cbPromotedFromWaitType: t.cbPromotedFromWaitType,
+    };
+  }
+
+  /** Rebuild a live Thread from its saved form, restoring the typed-array context. */
+  private _deserializeThread(s: ThreadStateV1): Thread {
+    const c = s.context;
+    const context: ThreadContext = {
+      gpr: Uint32Array.from(c.gpr), hi: c.hi, lo: c.lo, pc: c.pc,
+      fpr: Uint32Array.from(c.fpr), fcr31: c.fcr31,
+      vfpr: new Float32Array(Uint32Array.from(c.vfpr).buffer), vfpuCtrl: Uint32Array.from(c.vfpuCtrl), vfpuCc: c.vfpuCc,
+      vpfxs: c.vpfxs, vpfxt: c.vpfxt, vpfxd: c.vpfxd,
+      vpfxsEnabled: c.vpfxsEnabled, vpfxtEnabled: c.vpfxtEnabled, vpfxdEnabled: c.vpfxdEnabled,
+    };
+    return {
+      id: s.id, entry: s.entry,
+      stackSize: s.stackSize, stackBase: s.stackBase, stackTop: s.stackTop,
+      k0: s.k0, priority: s.priority, state: s.state, waitType: s.waitType,
+      context,
+      wakeupCount: s.wakeupCount,
+      callbacks: s.callbacks.slice(),
+      isProcessingCallbacks: s.isProcessingCallbacks,
+      waitSemaId: s.waitSemaId, waitSemaCount: s.waitSemaCount,
+      waitEvfId: s.waitEvfId, waitEvfBits: s.waitEvfBits, waitEvfMode: s.waitEvfMode, waitEvfOutPtr: s.waitEvfOutPtr,
+      waitGeListId: s.waitGeListId, waitDeadlineVbl: s.waitDeadlineVbl, waitWakeTimeMs: s.waitWakeTimeMs,
+      waitThreadEndId: s.waitThreadEndId,
+      waitMutexId: s.waitMutexId, waitMutexCount: s.waitMutexCount,
+      waitFplId: s.waitFplId, waitFplDataPtr: s.waitFplDataPtr,
+      waitVplId: s.waitVplId, waitVplSize: s.waitVplSize, waitVplAddrPtr: s.waitVplAddrPtr,
+      pendingWakeCallback: undefined,
+      cbPromotedFromWaitType: s.cbPromotedFromWaitType,
+    };
+  }
+
+  /** Snapshot the whole kernel into a JSON-round-trippable object. Maps become
+   *  entry arrays, typed arrays become number arrays, and each registered module
+   *  port contributes its own closure state under `modules`. The mounted game
+   *  files (fileData) and host objects are not captured; a normal boot rebuilds
+   *  them. Check snapshotBlockers() first if you need a consistent point. */
+  serialize(): KernelStateV1 {
+    const modules: Record<string, unknown> = {};
+    for (const [name, port] of this.stateModules) {
+      modules[name] = port.save();
+    }
+    return {
+      version: 1,
+      threads: Array.from(this.threads.values(), t => this._serializeThread(t)),
+      nextThreadId: this.nextThreadId,
+      currentThreadId: this.currentThreadId,
+      pendingThreadEntry: this.pendingThreadEntry ? { ...this.pendingThreadEntry } : null,
+      pendingAtracWakes: Array.from(this.pendingAtracWakes),
+      pspCallbacks: Array.from(this.pspCallbacks, ([k, v]) => [k, { ...v }]),
+      nextPspCallbackId: this.nextPspCallbackId,
+      activeMipsCall: this.activeMipsCall ? { ...this.activeMipsCall } : null,
+      userMemory: this.userMemory.serialize(),
+      ramSize: this.ramSize,
+      memBlocks: Array.from(this.memBlocks, ([k, v]) => [k, { ...v }]),
+      nextBlockId: this.nextBlockId,
+      fplPools: Array.from(this.fplPools, ([k, v]) => [k, { ...v }]),
+      semaphores: Array.from(this.semaphores, ([k, v]) => [k, { ...v }]),
+      eventFlags: Array.from(this.eventFlags, ([k, v]) => [k, { ...v }]),
+      subIntrs: Array.from(this.subIntrs, ([k, v]) => [k, { ...v }]),
+      sasGrainSize: this.sasGrainSize,
+      nextGeListSlot: this.nextGeListSlot,
+      geLists: Array.from(this.geLists, ([k, v]) => [k, this._cloneGeListEntry(v)]),
+      geListQueue: this.geListQueue.slice(),
+      geCallbacks: Array.from(this.geCallbacks, ([k, v]) => [k, { ...v }]),
+      activeGeCbId: this.activeGeCbId,
+      geCommandMem: Array.from(this.geCommandMem),
+      geCommandMemReady: this.geCommandMemReady,
+      geVertexAddr: this.geVertexAddr,
+      geIndexAddr: this.geIndexAddr,
+      geOffsetAddr: this.geOffsetAddr,
+      gePendingSignalCb: this.gePendingSignalCb ? { ...this.gePendingSignalCb } : null,
+      gePendingInterrupts: this.gePendingInterrupts.map(i => ({ ...i })),
+      geEdramTranslation: this.geEdramTranslation,
+      geIsBreak: this.geIsBreak,
+      suppressReschedule: this.suppressReschedule,
+      vblankCount: this.vblankCount,
+      cycleCount: this.cycleCount,
+      ioOpsCount: this.ioOpsCount,
+      geTimeMs: this.geTimeMs,
+      currentButtons: this.currentButtons,
+      framebufAddr: this.framebufAddr,
+      framebufWidth: this.framebufWidth,
+      framebufFormat: this.framebufFormat,
+      stubCalls: Array.from(this.stubCalls),
+      idleBreak: this.idleBreak,
+      compiledSdkVersion: this.compiledSdkVersion,
+      interruptsEnabled: this.interruptsEnabled,
+      dispatchEnabled: this.dispatchEnabled,
+      pendingAlarmFires: this.pendingAlarmFires.slice(),
+      displayHasSetMode: this.displayHasSetMode,
+      displayMode: this.displayMode,
+      displayWidth: this.displayWidth,
+      displayHeight: this.displayHeight,
+      isVblank: this.isVblank,
+      frameStartTicks: this.frameStartTicks,
+      hCountBase: this.hCountBase,
+      displayResumeMode: this.displayResumeMode,
+      displayHoldMode: this.displayHoldMode,
+      displayBrightnessLevel: this.displayBrightnessLevel,
+      loadedModules: Array.from(this.loadedModules, ([k, v]) => [k, { ...v }]),
+      nextSyscallCode: this.nextSyscallCode,
+      fontHandleMap: Array.from(this.fontHandleMap),
+      nextFontHandle: this.nextFontHandle,
+      threadReturnAddr: this.threadReturnAddr,
+      cbReturnTrampolineWritten: this.cbReturnTrampolineWritten,
+      modules,
+    };
+  }
+
+  /** Deep-copy a GE list entry (the callStack holds plain objects). */
+  private _cloneGeListEntry(e: GeListEntry): GeListEntry {
+    return { ...e, callStack: e.callStack.map(s => ({ ...s })) };
+  }
+
+  /** Restore the whole kernel from a snapshot made by serialize(). Replaces
+   *  current state: Maps are rebuilt from entry arrays, typed arrays from their
+   *  stored form, the BlockAllocator from its own flat form, and each registered
+   *  module port is handed its matching saved data (a missing entry is tolerated). */
+  deserialize(s: KernelStateV1): void {
+    this.threads.clear();
+    for (const ts of s.threads) this.threads.set(ts.id, this._deserializeThread(ts));
+    this.nextThreadId = s.nextThreadId;
+    this.currentThreadId = s.currentThreadId;
+    this.pendingThreadEntry = s.pendingThreadEntry ? { ...s.pendingThreadEntry } : null;
+
+    this.pendingAtracWakes.clear();
+    for (const tid of s.pendingAtracWakes) this.pendingAtracWakes.add(tid);
+
+    this.pspCallbacks.clear();
+    for (const [k, v] of s.pspCallbacks) this.pspCallbacks.set(k, { ...v });
+    this.nextPspCallbackId = s.nextPspCallbackId;
+    this.activeMipsCall = s.activeMipsCall ? { ...s.activeMipsCall } : null;
+
+    this.userMemory.deserialize(s.userMemory);
+    this.ramSize = s.ramSize;
+
+    this.memBlocks.clear();
+    for (const [k, v] of s.memBlocks) this.memBlocks.set(k, { ...v });
+    this.nextBlockId = s.nextBlockId;
+
+    this.fplPools.clear();
+    for (const [k, v] of s.fplPools) this.fplPools.set(k, { ...v });
+
+    this.semaphores.clear();
+    for (const [k, v] of s.semaphores) this.semaphores.set(k, { ...v });
+
+    this.eventFlags.clear();
+    for (const [k, v] of s.eventFlags) this.eventFlags.set(k, { ...v });
+
+    this.subIntrs.clear();
+    for (const [k, v] of s.subIntrs) this.subIntrs.set(k, { ...v });
+
+    this.sasGrainSize = s.sasGrainSize;
+
+    this.nextGeListSlot = s.nextGeListSlot;
+    this.geLists.clear();
+    for (const [k, v] of s.geLists) this.geLists.set(k, this._cloneGeListEntry(v));
+    this.geListQueue = s.geListQueue.slice();
+
+    this.geCallbacks.clear();
+    for (const [k, v] of s.geCallbacks) this.geCallbacks.set(k, { ...v });
+    this.activeGeCbId = s.activeGeCbId;
+
+    this.geCommandMem.set(s.geCommandMem);
+    this.geCommandMemReady = s.geCommandMemReady;
+    this.geVertexAddr = s.geVertexAddr;
+    this.geIndexAddr = s.geIndexAddr;
+    this.geOffsetAddr = s.geOffsetAddr;
+    this.gePendingSignalCb = s.gePendingSignalCb ? { ...s.gePendingSignalCb } : null;
+    this.gePendingInterrupts = s.gePendingInterrupts.map(i => ({ ...i }));
+    this.geEdramTranslation = s.geEdramTranslation;
+    this.geIsBreak = s.geIsBreak;
+    this.suppressReschedule = s.suppressReschedule;
+
+    this.vblankCount = s.vblankCount;
+    this.cycleCount = s.cycleCount;
+    this.ioOpsCount = s.ioOpsCount;
+    this.geTimeMs = s.geTimeMs;
+    this.currentButtons = s.currentButtons;
+    this.framebufAddr = s.framebufAddr;
+    this.framebufWidth = s.framebufWidth;
+    this.framebufFormat = s.framebufFormat;
+
+    this.stubCalls.clear();
+    for (const [k, v] of s.stubCalls) this.stubCalls.set(k, v);
+    this.idleBreak = s.idleBreak;
+    this.compiledSdkVersion = s.compiledSdkVersion;
+    this.interruptsEnabled = s.interruptsEnabled;
+    this.dispatchEnabled = s.dispatchEnabled;
+    this.pendingAlarmFires.length = 0;
+    this.pendingAlarmFires.push(...s.pendingAlarmFires);
+
+    this.displayHasSetMode = s.displayHasSetMode;
+    this.displayMode = s.displayMode;
+    this.displayWidth = s.displayWidth;
+    this.displayHeight = s.displayHeight;
+    this.isVblank = s.isVblank;
+    this.frameStartTicks = s.frameStartTicks;
+    this.hCountBase = s.hCountBase;
+    this.displayResumeMode = s.displayResumeMode;
+    this.displayHoldMode = s.displayHoldMode;
+    this.displayBrightnessLevel = s.displayBrightnessLevel;
+
+    this.loadedModules.clear();
+    for (const [k, v] of s.loadedModules) this.loadedModules.set(k, { ...v });
+    this.nextSyscallCode = s.nextSyscallCode;
+
+    this.fontHandleMap.clear();
+    for (const [k, v] of s.fontHandleMap) this.fontHandleMap.set(k, v);
+    this.nextFontHandle = s.nextFontHandle;
+    // pgfFonts (the loaded PGF objects) aren't serialized; they're large and
+    // deterministic. If the game had fonts open, reload the standard flash0 set
+    // so the restored fontHandleMap indices resolve again. Fonts opened from a
+    // game path via sceFontOpenUserFile are not recovered (rare).
+    if (this.fontHandleMap.size > 0) this._loadStandardFonts();
+
+    this.threadReturnAddr = s.threadReturnAddr;
+    this.cbReturnTrampolineWritten = s.cbReturnTrampolineWritten;
+
+    // Hand each registered module its saved data. A module with no saved entry
+    // (e.g. state written by an older build) is left at its current state.
+    for (const [name, port] of this.stateModules) {
+      if (Object.prototype.hasOwnProperty.call(s.modules, name)) {
+        port.load(s.modules[name]);
+      }
+    }
+  }
+
+  /** Load the standard flash0 PGF fonts into pgfFonts (idempotent). Shared by the
+   *  sceFontNewLib handler and save-state restore. */
+  private _loadStandardFonts(): void {
+    if (this.pgfFonts.length > 0) return;
+    const names = [
+      "ltn0.pgf","ltn1.pgf","ltn2.pgf","ltn3.pgf","ltn4.pgf","ltn5.pgf",
+      "ltn6.pgf","ltn7.pgf","ltn8.pgf","ltn9.pgf","ltn10.pgf","ltn11.pgf",
+      "ltn12.pgf","ltn13.pgf","ltn14.pgf",
+    ];
+    for (const name of names) {
+      const data = this.pspFs.getFileData(`flash0:/font/${name}`, 0);
+      this.pgfFonts.push(data ? new PGF(data.buffer as ArrayBuffer) : null);
+    }
+    const loaded = this.pgfFonts.filter(Boolean).length;
+    log.info(`Font system: ${loaded}/${names.length} PGF fonts loaded`);
   }
 
   // ── Built-in module registrations ──────────────────────────────────────────
@@ -2935,25 +3363,9 @@ export class HLEKernel {
     };
 
     // Load all available PGF fonts from flash0:/font/ltn*.pgf
-    const loadPgfFonts = () => {
-      if (this.pgfFonts.length > 0) return; // already loaded
-      const names = [
-        "ltn0.pgf","ltn1.pgf","ltn2.pgf","ltn3.pgf","ltn4.pgf","ltn5.pgf",
-        "ltn6.pgf","ltn7.pgf","ltn8.pgf","ltn9.pgf","ltn10.pgf","ltn11.pgf",
-        "ltn12.pgf","ltn13.pgf","ltn14.pgf",
-      ];
-      for (const name of names) {
-        const data = this.pspFs.getFileData(`flash0:/font/${name}`, 0);
-        if (data) {
-          const pgf = new PGF(data.buffer as ArrayBuffer);
-          this.pgfFonts.push(pgf);
-        } else {
-          this.pgfFonts.push(null);
-        }
-      }
-      const loaded = this.pgfFonts.filter(Boolean).length;
-      log.info(`Font system: ${loaded}/${names.length} PGF fonts loaded`);
-    };
+    // Standard flash0 fonts; hoisted to _loadStandardFonts so save-state restore
+    // can reload them too (the PGF objects themselves aren't serialized).
+    const loadPgfFonts = () => this._loadStandardFonts();
 
     // sceFontNewLib(params, errorCodePtr) → lib handle 1
     this.register(FONT.sceFontNewLib, (regs, bus) => {

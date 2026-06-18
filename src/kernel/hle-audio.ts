@@ -16,6 +16,7 @@ import type { HLEKernel, HLEHandler } from "./hle-kernel.js";
 import { parseAtracHeader, decodeAtrac, getCachedAtrac, getCachedAtracBySize, type AtracInfo } from "../audio/atrac-decoder.js";
 import { Mp3FrameAccumulator, decodeAudioFrame } from "../audio/frame-decoder.js";
 import { AUDIO, ATRAC, AAC, AUDIOCODEC, VAUDIO, MP3, MP4 } from "./nids.js";
+import { int16ToB64, b64ToInt16 } from "../state/binutil.js";
 
 const log = Logger.get("HLE-AUDIO");
 const atracDecodeCallCount = new Map<number, number>();
@@ -1192,6 +1193,57 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   kernel.stub(MP4.sceMp4TrackSampleBufPut);
   kernel.stub(MP4.sceMp4TrackSampleBufQueryMemSize);
   kernel.stub(MP4.sceMp4UnregistTrack);
+
+  // Save-state: the ATRAC contexts (decodedPcm is an Int16Array, stored as
+  // base64; everything else in AtracContext and AtracInfo is plain), the per-id
+  // wait lists and counters, and the sceAudiocodec contexts. The mp3Accum field
+  // is a live stateful decoder instance we can't serialize, so it's dropped on
+  // save and rebuilt by the next decode (an in-flight mp3 frame restarts).
+  kernel.registerStateModule("audio", {
+    save() {
+      return {
+        atracContexts: [...atracContexts.entries()].map(([k, v]) => [k, {
+          ...v,
+          decodedPcm: v.decodedPcm ? int16ToB64(v.decodedPcm) : null,
+        }]),
+        atracContextTypes: atracContextTypes.slice(),
+        atracWaiters: [...atracWaiters.entries()].map(([k, v]) => [k, v.slice()]),
+        outputCallCount: [...outputCallCount.entries()],
+        fakeNextCh,
+        audiocodecContexts: [...audiocodecContexts.entries()].map(([k, v]) => [k, {
+          codec: v.codec, channels: v.channels, sampleRate: v.sampleRate,
+        }]),
+      };
+    },
+    load(data) {
+      const d = data as {
+        atracContexts: [number, Omit<AtracContext, "decodedPcm"> & { decodedPcm: string | null }][];
+        atracContextTypes: number[];
+        atracWaiters: [number, number[]][];
+        outputCallCount: [number, number][];
+        fakeNextCh: number;
+        audiocodecContexts: [number, { codec: number; channels: number; sampleRate: number }][];
+      };
+      atracContexts.clear();
+      for (const [k, v] of d.atracContexts) {
+        atracContexts.set(k, {
+          ...v,
+          decodedPcm: v.decodedPcm !== null ? b64ToInt16(v.decodedPcm) : null,
+        });
+      }
+      atracContextTypes.length = 0;
+      atracContextTypes.push(...d.atracContextTypes);
+      atracWaiters.clear();
+      for (const [k, v] of d.atracWaiters) atracWaiters.set(k, v.slice());
+      outputCallCount.clear();
+      for (const [k, v] of d.outputCallCount) outputCallCount.set(k, v);
+      fakeNextCh = d.fakeNextCh;
+      audiocodecContexts.clear();
+      for (const [k, v] of d.audiocodecContexts) {
+        audiocodecContexts.set(k, { ...v, mp3Accum: null });
+      }
+    },
+  });
 
   log.info("Audio HLE handlers registered");
 }

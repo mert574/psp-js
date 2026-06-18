@@ -949,5 +949,44 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
   kernel.stub(SIRCS.sceSircsReceive);
   kernel.stub(SIRCS.sceSircsSend);
 
+  // Save-state: the savedata/msgdialog/osk/netconf dialog state machines (plain
+  // scalars) plus the heaps allocator table. HeapState holds only numbers,
+  // booleans, and a plain block array, so the Map stores as entry arrays.
+  kernel.registerStateModule("utility", {
+    save() {
+      return {
+        savedataStatus, savedataParamAddr, savedataResult, savedataIoComplete,
+        savedataMode, savedataUpdateCount,
+        msgDialogStatus, msgDialogParamAddr,
+        oskStatus, oskParamAddr,
+        netconfStatus,
+        heaps: [...heaps.entries()],
+      };
+    },
+    load(data) {
+      const d = data as {
+        savedataStatus: number; savedataParamAddr: number; savedataResult: number;
+        savedataIoComplete: boolean; savedataMode: number; savedataUpdateCount: number;
+        msgDialogStatus: number; msgDialogParamAddr: number;
+        oskStatus: number; oskParamAddr: number;
+        netconfStatus: number;
+        heaps: [number, HeapState][];
+      };
+      savedataStatus = d.savedataStatus;
+      savedataParamAddr = d.savedataParamAddr;
+      savedataResult = d.savedataResult;
+      savedataIoComplete = d.savedataIoComplete;
+      savedataMode = d.savedataMode;
+      savedataUpdateCount = d.savedataUpdateCount;
+      msgDialogStatus = d.msgDialogStatus;
+      msgDialogParamAddr = d.msgDialogParamAddr;
+      oskStatus = d.oskStatus;
+      oskParamAddr = d.oskParamAddr;
+      netconfStatus = d.netconfStatus;
+      heaps.clear();
+      for (const [k, v] of d.heaps) heaps.set(k, v);
+    },
+  });
+
   log.info("Utility HLE handlers registered");
 }

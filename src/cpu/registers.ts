@@ -119,4 +119,59 @@ export class AllegrexRegisters {
   getGpr(index: number): number {
     return this.gpr[index]! >>> 0;
   }
+
+  // ── save-state support ────────────────────────────────────────────────────
+
+  /**
+   * Pack the four register files (gpr, fpr, vfpr, vfpuCtrl) into one byte blob.
+   * These are bulk data so they go in a binary section, not the JSON. Order and
+   * sizes must match {@link loadRegBuffers}.
+   */
+  dumpRegBuffers(): Uint8Array {
+    const out = new Uint8Array(
+      this.gpr.byteLength + this.fpr.byteLength + this.vfpr.byteLength + this.vfpuCtrl.byteLength,
+    );
+    let off = 0;
+    out.set(new Uint8Array(this.gpr.buffer), off);      off += this.gpr.byteLength;
+    out.set(new Uint8Array(this.fpr.buffer), off);      off += this.fpr.byteLength;
+    out.set(new Uint8Array(this.vfpr.buffer), off);     off += this.vfpr.byteLength;
+    out.set(new Uint8Array(this.vfpuCtrl.buffer), off);
+    return out;
+  }
+
+  /** Restore the register files written by {@link dumpRegBuffers}. */
+  loadRegBuffers(bytes: Uint8Array): void {
+    let off = 0;
+    new Uint8Array(this.gpr.buffer).set(bytes.subarray(off, off + this.gpr.byteLength));      off += this.gpr.byteLength;
+    new Uint8Array(this.fpr.buffer).set(bytes.subarray(off, off + this.fpr.byteLength));      off += this.fpr.byteLength;
+    new Uint8Array(this.vfpr.buffer).set(bytes.subarray(off, off + this.vfpr.byteLength));    off += this.vfpr.byteLength;
+    new Uint8Array(this.vfpuCtrl.buffer).set(bytes.subarray(off, off + this.vfpuCtrl.byteLength));
+  }
+
+  /** The scalar registers that aren't in the bulk buffers, for the JSON blob. */
+  serializeScalars(): RegisterScalars {
+    return {
+      pc: this.pc, hi: this.hi, lo: this.lo, fcr31: this.fcr31,
+      vfpuCc: this.vfpuCc,
+      vpfxs: this.vpfxs, vpfxt: this.vpfxt, vpfxd: this.vpfxd,
+      vpfxsEnabled: this.vpfxsEnabled, vpfxtEnabled: this.vpfxtEnabled, vpfxdEnabled: this.vpfxdEnabled,
+      cp0Status: this.cp0Status, cp0Cause: this.cp0Cause, cp0EPC: this.cp0EPC,
+    };
+  }
+
+  deserializeScalars(s: RegisterScalars): void {
+    this.pc = s.pc; this.hi = s.hi; this.lo = s.lo; this.fcr31 = s.fcr31;
+    this.vfpuCc = s.vfpuCc;
+    this.vpfxs = s.vpfxs; this.vpfxt = s.vpfxt; this.vpfxd = s.vpfxd;
+    this.vpfxsEnabled = s.vpfxsEnabled; this.vpfxtEnabled = s.vpfxtEnabled; this.vpfxdEnabled = s.vpfxdEnabled;
+    this.cp0Status = s.cp0Status; this.cp0Cause = s.cp0Cause; this.cp0EPC = s.cp0EPC;
+  }
+}
+
+export interface RegisterScalars {
+  pc: number; hi: number; lo: number; fcr31: number;
+  vfpuCc: number;
+  vpfxs: number; vpfxt: number; vpfxd: number;
+  vpfxsEnabled: boolean; vpfxtEnabled: boolean; vpfxdEnabled: boolean;
+  cp0Status: number; cp0Cause: number; cp0EPC: number;
 }

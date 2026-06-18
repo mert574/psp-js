@@ -9,6 +9,10 @@
  *  - Callbacks that reschedule will NOT re-fire in the same advance() pass
  */
 
+import { Logger } from "../utils/logger.js";
+
+const log = Logger.get("CORETIMING");
+
 export type EventTypeId = number;
 export type TimedCallback = (cyclesLate: number, userdata: number) => void;
 
@@ -21,6 +25,12 @@ interface ScheduledEvent {
   time: number;       // absolute cycle count
   typeId: EventTypeId;
   userdata: number;
+}
+
+export interface CoreTimingState {
+  globalTimer: number;
+  cpuHz: number;
+  events: { time: number; name: string; userdata: number }[];
 }
 
 export class CoreTiming {
@@ -114,6 +124,56 @@ export class CoreTiming {
 
   cyclesToUs(cycles: number): number {
     return Math.floor(cycles * 1_000_000 / this.CPU_HZ);
+  }
+
+  // ── save-state support ────────────────────────────────────────────────────
+
+  /** Name of a registered event type, or null if the id isn't registered. */
+  eventTypeName(typeId: EventTypeId): string | null {
+    return this.eventTypes[typeId]?.name ?? null;
+  }
+
+  /** Find a registered event type id by name, or -1. */
+  findEventTypeByName(name: string): EventTypeId {
+    return this.eventTypes.findIndex(t => t.name === name);
+  }
+
+  /**
+   * Serialize the timer and queue. Events are stored by their event-type NAME,
+   * not the numeric typeId: some types register lazily (e.g. IoAsyncNotify only
+   * on first async IO) so the same logical event can have a different id after a
+   * fresh boot. {@link deserialize} remaps names back to current ids.
+   */
+  serialize(): CoreTimingState {
+    return {
+      globalTimer: this.globalTimer,
+      cpuHz: this.CPU_HZ,
+      events: this.queue.map(ev => ({
+        time: ev.time,
+        name: this.eventTypes[ev.typeId]?.name ?? "",
+        userdata: ev.userdata,
+      })),
+    };
+  }
+
+  deserialize(s: CoreTimingState): void {
+    this.globalTimer = s.globalTimer;
+    this.CPU_HZ = s.cpuHz;
+    this.queue = [];
+    for (const ev of s.events) {
+      const typeId = this.findEventTypeByName(ev.name);
+      if (typeId < 0) {
+        // The event type isn't registered on this boot (a lazily-registered type
+        // that hasn't been used yet). Dropping it could stall whatever was
+        // waiting on it, so make it loud rather than silent.
+        log.warn(`save state had a pending "${ev.name}" event but that type isn't registered; dropping it`);
+        continue;
+      }
+      this.queue.push({ time: ev.time, typeId, userdata: ev.userdata });
+    }
+    // The source queue was already sorted ascending by time; remapping ids
+    // preserves order, but sort defensively in case an event type was dropped.
+    this.queue.sort((a, b) => a.time - b.time);
   }
 
   // ── Private ──────────────────────────────────────────────────────────────

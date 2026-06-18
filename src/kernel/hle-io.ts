@@ -11,6 +11,7 @@ import { IO, NP_DRM, USB, USB_ACC, USB_GPS, USB_MIC } from "./nids.js";
 import type { PspFileInfo } from "./psp-filesystem.js";
 import { kirkCreate, kirkInit, type KirkState } from "../crypto/kirk.js";
 import { pgdOpen, pgdDecryptBlock, type PgdDesc } from "../crypto/amctrl.js";
+import { bytesToB64, b64ToBytes } from "../state/binutil.js";
 
 const log = Logger.get("HLE-IO");
 const pspLog = Logger.get("PSP");
@@ -1224,7 +1225,7 @@ export function registerIoHLE(kernel: HLEKernel): void {
   // ── NP_DRM — PPSSPP scePspNpDrm_user.cpp ───────────────────────────
 
   // Module-level state for DRM licensee key (PPSSPP scePspNpDrm_user.cpp:11-13)
-  let licenseeKey = new Uint8Array(16);
+  let licenseeKey: Uint8Array = new Uint8Array(16);
   let isLicenseeKeySet = false;
   // Computed: return licensee key for pgd_open, or null if not set
   // Used by IoCtl 0x04100001 handler
@@ -1341,6 +1342,116 @@ export function registerIoHLE(kernel: HLEKernel): void {
   kernel.register(NP_DRM.sceNpDrmOpen, (regs) => {
     log.warn("sceNpDrmOpen: unimplemented");
     regs.setGpr(2, 0);
+  });
+
+  // ── Save-state ──────────────────────────────────────────────────────
+  // openFiles holds live file handles, some with a writable savedata buffer in
+  // `data` (a Uint8Array we store as base64). pgdInfo is a PgdDesc with three
+  // small Uint8Arrays (vkey/dkey/blockBuf), also base64. pendingOp is a closure
+  // that runs the deferred body of an async read/write — it can't be serialized,
+  // so we drop it and report a blocker when any file still has one in flight.
+  // The mounted disc/game files (kernel.fileData) are NOT captured here; a normal
+  // boot re-mounts them. kirk (the crypto engine) and ioAsyncEventId (a CoreTiming
+  // registration handle) are also skipped — both are rebuilt on a normal boot.
+
+  type SavedPgd = Omit<PgdDesc, "vkey" | "dkey" | "blockBuf"> & {
+    vkey: string; dkey: string; blockBuf: string;
+  };
+  // data is base64 of the file's bytes, OR null when the bytes are reloadable
+  // from the mounted filesystem on restore (a plain read-only disc/ms0 file).
+  // Skipping those bytes keeps a streamed read-only asset (e.g. a big video the
+  // game is reading) out of the save state, where it would just duplicate what
+  // the ISO already holds.
+  type SavedFile = Omit<FileNode, "data" | "pgdInfo" | "pendingOp"> & {
+    data: string | null; pgdInfo: SavedPgd | null;
+  };
+
+  function savePgd(p: PgdDesc): SavedPgd {
+    return {
+      ...p,
+      vkey: bytesToB64(p.vkey),
+      dkey: bytesToB64(p.dkey),
+      blockBuf: bytesToB64(p.blockBuf),
+    };
+  }
+  function loadPgd(p: SavedPgd): PgdDesc {
+    return {
+      ...p,
+      vkey: b64ToBytes(p.vkey),
+      dkey: b64ToBytes(p.dkey),
+      blockBuf: b64ToBytes(p.blockBuf),
+    };
+  }
+  /** True when the file's bytes can be re-read from the mounted fs on restore,
+   *  so we don't need to store them. Writable/dirty files may have unflushed
+   *  writes, and PGD files hold decrypted bytes that differ from disk, so those
+   *  always store their data. The length check guards against the rare case
+   *  where the in-memory buffer diverged from the mounted source. */
+  function isReloadable(f: FileNode): boolean {
+    if (f.writable || f.dirty || f.npdrm || f.pgdInfo) return false;
+    const cur = kernel.pspFs.getFileData(f.path, kernel.currentThreadId);
+    return !!cur && cur.length === f.data.length;
+  }
+  function saveFile(f: FileNode): SavedFile {
+    const { data, pgdInfo, pendingOp: _drop, ...rest } = f;
+    return {
+      ...rest,
+      data: isReloadable(f) ? null : bytesToB64(data),
+      pgdInfo: pgdInfo ? savePgd(pgdInfo) : null,
+    };
+  }
+  function loadFile(f: SavedFile): FileNode {
+    const { data, pgdInfo, ...rest } = f;
+    const bytes = data !== null
+      ? b64ToBytes(data)
+      : kernel.pspFs.getFileData(rest.path, kernel.currentThreadId) ?? new Uint8Array(0);
+    return { ...rest, data: bytes, pgdInfo: pgdInfo ? loadPgd(pgdInfo) : null, pendingOp: null };
+  }
+
+  kernel.registerStateModule("io", {
+    save() {
+      return {
+        openFiles: [...openFiles.entries()].map(([fd, f]) => [fd, saveFile(f)]),
+        nextFd,
+        openDirs: [...openDirs.entries()].map(([fd, d]) => [fd, { entries: d.entries, index: d.index }]),
+        licenseeKey: bytesToB64(licenseeKey),
+        isLicenseeKeySet,
+        licenseeKeyForPgd: licenseeKeyForPgd ? bytesToB64(licenseeKeyForPgd) : null,
+      };
+    },
+    load(data) {
+      const d = data as {
+        openFiles: [number, SavedFile][];
+        nextFd: number;
+        openDirs: [number, DirListing][];
+        licenseeKey: string;
+        isLicenseeKeySet: boolean;
+        licenseeKeyForPgd: string | null;
+      };
+      openFiles.clear();
+      for (const [fd, f] of d.openFiles) openFiles.set(fd, loadFile(f));
+      nextFd = d.nextFd;
+      openDirs.clear();
+      for (const [fd, dir] of d.openDirs) openDirs.set(fd, { entries: dir.entries, index: dir.index });
+      licenseeKey = b64ToBytes(d.licenseeKey);
+      isLicenseeKeySet = d.isLicenseeKeySet;
+      licenseeKeyForPgd = d.licenseeKeyForPgd !== null ? b64ToBytes(d.licenseeKeyForPgd) : null;
+    },
+    blockers() {
+      const reasons: string[] = [];
+      for (const [fd, f] of openFiles) {
+        // pendingAsyncResult covers every async op (read/write set pendingOp too,
+        // but lseek/open/close only set pendingAsyncResult). The completion is
+        // driven by a CoreTiming event that won't survive across a fresh boot,
+        // so we refuse the save until the op finishes (it completes within a few
+        // microseconds of emulated time, so a frame boundary is almost always
+        // already clear).
+        if (f.pendingOp || f.pendingAsyncResult) {
+          reasons.push(`fd ${fd} (${f.path}) has an async op in flight`);
+        }
+      }
+      return reasons;
+    },
   });
 
   log.info("IO HLE handlers registered");

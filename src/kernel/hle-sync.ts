@@ -1470,5 +1470,35 @@ export function registerSyncHLE(kernel: HLEKernel): void {
   kernel.register(SYSMEM.sceKernelIcacheInvalidateAll, (regs) => { regs.setGpr(2, 0); });
   kernel.stub(SYSMEM.sceKernelIcacheInvalidateRange);
 
+  // Save-state: vpls/mutexes/lwMutexes/fpls hold only plain JSON values
+  // (numbers, strings, booleans, and arrays of those), so we can store the Maps
+  // as entry arrays and rebuild them as-is.
+  kernel.registerStateModule("sync", {
+    save() {
+      return {
+        vpls: [...vpls.entries()],
+        mutexes: [...mutexes.entries()],
+        lwMutexes: [...lwMutexes.entries()],
+        fpls: [...fpls.entries()],
+      };
+    },
+    load(data) {
+      const d = data as {
+        vpls: [number, VplState][];
+        mutexes: [number, MutexState][];
+        lwMutexes: [number, LwMutexState][];
+        fpls: [number, FplState][];
+      };
+      vpls.clear();
+      for (const [k, v] of d.vpls) vpls.set(k, v);
+      mutexes.clear();
+      for (const [k, v] of d.mutexes) mutexes.set(k, v);
+      lwMutexes.clear();
+      for (const [k, v] of d.lwMutexes) lwMutexes.set(k, v);
+      fpls.clear();
+      for (const [k, v] of d.fpls) fpls.set(k, v);
+    },
+  });
+
   log.info("Sync/Mem HLE handlers registered");
 }
