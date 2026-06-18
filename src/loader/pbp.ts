@@ -21,11 +21,25 @@
  */
 
 const PBP_MAGIC   = 0x50425000; // bytes [00 50 42 50] as little-endian uint32
+const PARAM_SFO_IDX = 0;        // index of PARAM.SFO in the offset table
 const DATA_PSP_IDX = 6;         // index of data.psp in the offset table
 
 export interface PbpContents {
   /** The raw data.psp bytes (ELF or PRX executable). */
   dataPsp: Uint8Array;
+  /** The PARAM.SFO bytes, or null if the PBP has none. Homebrew keeps its disc
+   *  id / title here rather than at disc0:/PSP_GAME/PARAM.SFO. */
+  paramSfo: Uint8Array | null;
+  /** ICON0.PNG — the static game icon, or null. */
+  icon0: Uint8Array | null;
+  /** ICON1.PMF — the animated icon video, or null. */
+  icon1Pmf: Uint8Array | null;
+  /** PIC0.PNG — the logo overlay, or null. */
+  pic0: Uint8Array | null;
+  /** PIC1.PNG — the background art, or null. */
+  pic1: Uint8Array | null;
+  /** SND0.AT3 — the menu audio, or null. */
+  snd0: Uint8Array | null;
 }
 
 /**
@@ -66,7 +80,21 @@ export function parsePbp(data: Uint8Array): PbpContents {
     throw new Error("PBP data.psp region is empty or out of bounds.");
   }
 
+  // Extract an optional section by index (start = offset[i], end = offset[i+1]).
+  const section = (i: number): Uint8Array | null => {
+    const start = offsets[i]!;
+    const end   = offsets[i + 1] ?? data.byteLength;
+    const size  = end - start;
+    return size > 0 && start + size <= data.byteLength ? data.slice(start, start + size) : null;
+  };
+
   return {
     dataPsp: data.slice(dataPspOffset, dataPspOffset + dataPspSize),
+    paramSfo: section(PARAM_SFO_IDX),
+    icon0:    section(1),
+    icon1Pmf: section(2),
+    pic0:     section(3),
+    pic1:     section(4),
+    snd0:     section(5),
   };
 }

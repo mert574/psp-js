@@ -8,7 +8,7 @@ import { isPbp, parsePbp } from "./loader/pbp.js";
 import { pspDecryptPRX } from "./loader/prx-decrypter.js";
 import { createSavedataStore } from "./storage/savedata-store.js";
 import { createFileStore } from "./storage/file-store.js";
-import { packContainer, unpackContainer, fnv1a, type StateSection } from "./state/state-container.js";
+import { packContainer, unpackContainer, fnv1a, STATE_VERSION, type StateSection } from "./state/state-container.js";
 import { SECTION, SAVESTATE_FORMAT_VERSION, SUPPORTED_FORMAT_VERSIONS, type SnapshotJson } from "./state/save-state.js";
 import { Logger } from "./utils/logger.js";
 
@@ -121,6 +121,25 @@ function skipGzipHeader(data: Uint8Array): Uint8Array {
   return data.subarray(off);
 }
 
+/** Game id from a PARAM.SFO: the disc id, or a slug of the title for homebrew
+ *  that has no disc id. Returns "" if the SFO can't be read. */
+function gameIdFromSfo(sfoBytes: Uint8Array): string {
+  try {
+    const sfo = parseSfo(sfoBytes.slice().buffer as ArrayBuffer);
+    const discId = String(sfo["DISC_ID"] ?? "").trim();
+    if (discId) return discId;
+    const title = String(sfo["TITLE"] ?? "").trim();
+    return title ? slugify(title) : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Turn a free-form title into a short filename-safe slug. */
+function slugify(title: string): string {
+  return title.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+}
+
 /**
  * PSPEmulator
  *
@@ -183,11 +202,11 @@ export class PSPEmulator {
   }
 
   async loadElfBinary(data: Uint8Array, bootFilename = "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN"): Promise<void> {
-    // Bind any future save state to this game. The disc id is read from the
-    // already-mounted PARAM.SFO; homebrew without an SFO gets "". The EBOOT hash
-    // is computed further down, after unwrap/decrypt, so it matches no matter
-    // whether the caller passed raw or pre-decrypted bytes.
-    this.gameId = this._extractGameId();
+    // Bind any future save state to this game. The id comes from the disc's
+    // PARAM.SFO for ISO games, or the PBP's embedded PARAM.SFO for homebrew. The
+    // EBOOT hash is computed further down, after unwrap/decrypt, so it matches
+    // no matter whether the caller passed raw or pre-decrypted bytes.
+    this.gameId = this._extractGameId(data);
 
     // Initialize persistent save data storage
     this.hle.savedataStore = await createSavedataStore();
@@ -563,15 +582,21 @@ export class PSPEmulator {
 
   // ── save states ────────────────────────────────────────────────────────────
 
-  /** Read the disc id from the mounted PARAM.SFO, or "" for homebrew. */
-  private _extractGameId(): string {
+  /** Identify the game for save-state binding/filenames. Prefers the disc id;
+   *  falls back to a slug of the title. Reads the ISO's PARAM.SFO, or the PBP's
+   *  embedded PARAM.SFO for homebrew. Returns "" only when neither is found. */
+  private _extractGameId(data: Uint8Array): string {
     for (const [key, fileData] of this.hle.fileData) {
       if (key.toLowerCase().endsWith("psp_game/param.sfo")) {
-        try {
-          const sfo = parseSfo(fileData.slice().buffer as ArrayBuffer);
-          return String(sfo["DISC_ID"] ?? "");
-        } catch { return ""; }
+        const id = gameIdFromSfo(fileData);
+        if (id) return id;
       }
+    }
+    if (isPbp(data)) {
+      try {
+        const sfo = parsePbp(data).paramSfo;
+        if (sfo) return gameIdFromSfo(sfo);
+      } catch { /* fall through to "" */ }
     }
     return "";
   }
@@ -651,6 +676,11 @@ export class PSPEmulator {
    */
   async loadState(blob: Uint8Array, opts: { ignoreGameMismatch?: boolean; allowBuildMismatch?: boolean } = {}): Promise<void> {
     const parsed = await unpackContainer(blob);
+    // Reject a container whose byte framing we don't understand (a future change
+    // to the magic/header/section layout) before reading any header fields.
+    if (parsed.version !== STATE_VERSION) {
+      throw new Error(`save state container version ${parsed.version} is not supported (this build uses ${STATE_VERSION})`);
+    }
     // Game-title (disc id) mismatch is a hard stop: the state's guest addresses
     // belong to a different game entirely.
     if (!opts.ignoreGameMismatch && parsed.gameId !== this.gameId) {

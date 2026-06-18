@@ -992,6 +992,12 @@ export class WebGLGERenderer {
     }
     this.vfbs.clear();
     this.currentRenderAddr = 0; // nothing is bound now; next draw re-creates a target
+    // A VFB texture may have been the last-bound sampler source; those handles
+    // are now deleted, so clear the dirty-track caches and force a pipeline
+    // re-bind on the next draw (same resets present()/blitVFB() do).
+    this.lastTexParamTex = null;
+    this.batchTex = null;
+    this.gePipelineBound = false;
   }
 
   /** Called at frame start. Textures are only invalidated on block transfers now,

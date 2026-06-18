@@ -99,66 +99,6 @@ body {
   pointer-events: none;
 }
 
-/* ── App bar ──────────────────────────────────────────────────────────────── */
-.app-bar {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 12px 24px;
-  border-bottom: 1px solid var(--border);
-  background: rgba(13, 17, 23, 0.72);
-  backdrop-filter: blur(12px);
-  position: sticky;
-  top: 0;
-  z-index: 50;
-}
-
-.app-bar__logo {
-  font-size: 18px;
-  font-weight: var(--fw-black);
-  letter-spacing: 0.5px;
-  text-decoration: none;
-  display: inline-flex;
-  align-items: baseline;
-}
-.app-bar__mark { color: var(--text); }
-.app-bar__dot {
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.app-bar__tag {
-  font-size: 12px;
-  color: var(--muted);
-  padding-left: 14px;
-  border-left: 1px solid var(--border);
-}
-@media (max-width: 620px) { .app-bar__tag { display: none; } }
-
-.app-bar__spacer { flex: 1; }
-
-.app-bar__link {
-  font-size: 13px;
-  color: var(--muted);
-  text-decoration: none;
-  padding: 6px 12px;
-  border-radius: var(--radius-sm);
-  transition: color 0.15s, background 0.15s;
-}
-.app-bar__link:hover { color: var(--text); background: var(--surface-2); }
-
-/* PSP XMB-style clock (see clock.ts). Sits at the far right of the app bar. */
-.app-bar__clock {
-  font-size: 14px;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
-}
-
 /* ── Error banner ─────────────────────────────────────────────────────────── */
 #error-banner {
   display: none;

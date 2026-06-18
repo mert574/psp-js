@@ -688,6 +688,20 @@ export class HLEKernel {
         }
       }
     });
+
+    // Run deferred timing-init callbacks now that CoreTiming exists. Modules use
+    // this to register their event types eagerly (e.g. Alarm), so a save state's
+    // pending events of those types still remap by name after a fresh boot.
+    for (const cb of this._timingReadyCbs) cb();
+    this._timingReadyCbs.length = 0;
+  }
+
+  private _timingReadyCbs: Array<() => void> = [];
+  /** Run `cb` once CoreTiming is available (immediately if it already is). Used
+   *  by modules to register their CoreTiming event types eagerly at boot. */
+  onTimingReady(cb: () => void): void {
+    if (this.coreTiming) cb();
+    else this._timingReadyCbs.push(cb);
   }
 
   /** Return a lightweight snapshot of all thread states (for debug UI). */

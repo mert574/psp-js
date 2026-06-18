@@ -7,6 +7,7 @@ import { idbGet, idbSet } from "./lib/idb.js";
 import { type GameMeta, getCachedMeta, setCachedMeta, extractIsoMetadata } from "./lib/game-metadata.js";
 import { scanDirectory, type ScannedFile } from "./lib/iso-scan.js";
 import { ratingLabel } from "./ui.js";
+import { setWaveColor, getStoredWaveColor } from "./wave-background.js";
 
 // ── XMB category icons (inline SVG, no emoji per project rule) ────────────────
 
@@ -41,6 +42,30 @@ const ICON_ABOUT = html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColo
   <circle cx="12" cy="7.8" r="1.05" fill="currentColor" stroke="none"/>
 </svg>`;
 
+const ICON_PALETTE = html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+  <path d="M12 3a9 9 0 0 0 0 18c1 0 1.7-.8 1.7-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.8 1.8-1.8H16a5 5 0 0 0 5-5c0-3.9-4-7-9-7Z"/>
+  <circle cx="7.5" cy="11.5" r="1" fill="currentColor" stroke="none"/>
+  <circle cx="11" cy="7.5" r="1" fill="currentColor" stroke="none"/>
+  <circle cx="15.5" cy="8.5" r="1" fill="currentColor" stroke="none"/>
+</svg>`;
+
+// Preset wave colors offered in Settings. Names are plain so the card sub-label
+// reads nicely; the first one is the original white default.
+const WAVE_COLOR_PRESETS: Array<{ label: string; value: string }> = [
+  { label: "White", value: "#ffffff" },
+  { label: "Blue", value: "#58a6ff" },
+  { label: "Teal", value: "#2dd4bf" },
+  { label: "Green", value: "#56d364" },
+  { label: "Purple", value: "#a371f7" },
+  { label: "Pink", value: "#f778ba" },
+  { label: "Orange", value: "#f0883e" },
+];
+
+const ICON_DOCS = html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+  <path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H17a2 2 0 0 1 2 2v14a1.5 1.5 0 0 1-1.5 1.5H6.5A1.5 1.5 0 0 1 5 19V4.5Z"/>
+  <path d="M8.5 7.5h7M8.5 11h7M8.5 14.5h4.5" stroke-linecap="round"/>
+</svg>`;
+
 const ICON_GITHUB = html`<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
   <path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48l-.01-1.7c-2.78.6-3.37-1.34-3.37-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85l-.01 2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"/>
 </svg>`;
@@ -50,6 +75,8 @@ const ICON_GITHUB = html`<svg viewBox="0 0 24 24" fill="currentColor" aria-hidde
 type XmbItem =
   | { kind: "game"; game: GameMeta }
   | { kind: "action"; label: string; sub: string; icon: TemplateResult; run: () => void }
+  | { kind: "color"; label: string; sub: string; icon: TemplateResult }
+  | { kind: "info"; label: string; sub: string; icon: TemplateResult; body: TemplateResult }
   | { kind: "empty"; label: string; sub: string };
 
 interface XmbCategory {
@@ -202,6 +229,8 @@ export class GameLibrary extends LitElement {
       filter: drop-shadow(0 2px 9px rgba(0, 0, 0, 0.55));
     }
     .xmb-cat__label {
+      font-family: var(--ui);
+      font-stretch: var(--ui-condensed);
       font-size: 15px;
       letter-spacing: 0.07em;
       text-transform: uppercase;
@@ -292,6 +321,54 @@ export class GameLibrary extends LitElement {
     }
     .xmb-card--action,
     .xmb-card--empty { padding: 8px 0; }
+
+    /* About info card: a description, controls list, and a docs link below the
+       icon/title row. Wider than a plain action card. */
+    .xmb-card--info { width: min(560px, 60vw); }
+    .xmb-about__desc {
+      font-size: 14px;
+      color: var(--text-dim, #c9d1d9);
+      line-height: 1.5;
+      margin: 14px 0 0;
+      max-width: 500px;
+      font-stretch: var(--ui-condensed);
+      text-shadow: 0 1px 8px rgba(0, 0, 0, 0.5);
+    }
+    .xmb-about__controls { margin-top: 14px; gap: 4px 26px; }
+    .xmb-about__link {
+      display: inline-block;
+      margin-top: 16px;
+      color: var(--accent, #58a6ff);
+      font-size: 14px;
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.12s;
+    }
+    .xmb-about__link:hover { border-bottom-color: var(--accent, #58a6ff); }
+
+    /* Wave-color swatches in the Settings card. A small row of preset colors;
+       the active one gets an outline ring. */
+    .wave-swatches {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .wave-swatch {
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border-radius: 50%;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      cursor: pointer;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+      transition: transform 0.12s ease-out, box-shadow 0.12s ease-out;
+    }
+    .wave-swatch:hover { transform: scale(1.12); }
+    .wave-swatch.active {
+      outline: 2px solid var(--accent, #58a6ff);
+      outline-offset: 2px;
+    }
 
     /* PIC1 background on its own layer so opacity can fade in/out. */
     .xmb-card__bg {
@@ -480,6 +557,7 @@ export class GameLibrary extends LitElement {
     _catIndex: { state: true },
     _itemIndex: { state: true },
     _selMedia: { state: true },
+    _waveColor: { state: true },
   };
   declare view: "empty" | "spinner" | "grid";
   declare spinnerText: string;
@@ -487,6 +565,9 @@ export class GameLibrary extends LitElement {
   declare _sort: "title" | "size";
   declare _catIndex: number;
   declare _itemIndex: number;
+  /** Current XMB wave background color (hex). Drives which swatch is marked
+   *  active; changing it calls setWaveColor (live update + persist). */
+  declare _waveColor: string;
   /** Logo (PIC0) + background (PIC1) of the selected game, loaded lazily; null
    *  until the selection's media finishes loading (the card "fills in"). */
   declare _selMedia: { pic0Url: string | null; pic1Url: string | null } | null;
@@ -517,6 +598,14 @@ export class GameLibrary extends LitElement {
     this._catIndex = 0;
     this._itemIndex = 0;
     this._selMedia = null;
+    this._waveColor = getStoredWaveColor();
+  }
+
+  /** Pick a wave color: update the background live, persist it, and re-render so
+   *  the active swatch follows. */
+  private _setWaveColor(value: string): void {
+    setWaveColor(value);
+    this._waveColor = value;
   }
 
   override connectedCallback(): void {
@@ -588,8 +677,10 @@ export class GameLibrary extends LitElement {
     }
   }
 
-  /** Try to auto-select a game matching the given slug (discId or filename). */
-  autoSelectBySlug(slug: string): boolean {
+  /** Try to auto-select a game matching the given slug (discId or filename).
+   *  `mode` decides whether the selection boots or just opens the details view
+   *  (the #details route deep-links to details without booting). */
+  autoSelectBySlug(slug: string, mode: "boot" | "options" | "details" = "boot"): boolean {
     if (!slug) return false;
     const slugLower = slug.toLowerCase();
     for (const game of this.games) {
@@ -600,7 +691,7 @@ export class GameLibrary extends LitElement {
         void this._getFile(fileKey).then(file => {
           if (file) {
             this.dispatchEvent(new CustomEvent("game-select", {
-              bubbles: true, composed: true, detail: { file },
+              bubbles: true, composed: true, detail: { file, mode },
             }));
           }
         });
@@ -642,8 +733,29 @@ export class GameLibrary extends LitElement {
       sub: "Toggle game ordering", icon: ICON_SORT,
       run: (): void => { this._sort = this._sort === "title" ? "size" : "title"; },
     });
+    settingsItems.push({
+      kind: "color",
+      label: "Wave Color",
+      sub: "Color of the background waves",
+      icon: ICON_PALETTE,
+    });
 
+    // Docs deploy to /psp-js/docs/ in production (BASE_URL is /psp-js/ in CI). In
+    // /docs/ is the docs site: a real static dir in production, and in dev the
+    // Vite app server proxies /docs to the VitePress dev server (vite.config.ts),
+    // so run `npm run docs:dev` alongside `npm run dev` for local docs. Opened in
+    // a new tab below so the SPA router never intercepts it.
+    const docsUrl = `${import.meta.env.BASE_URL}docs/`;
     const aboutItems: XmbItem[] = [
+      {
+        kind: "info", label: "psp-js", sub: "A PSP HLE emulator in TypeScript",
+        icon: ICON_ABOUT, body: this.#aboutBody(docsUrl),
+      },
+      {
+        kind: "action", label: "Documentation", sub: "Open the full docs site",
+        icon: ICON_DOCS,
+        run: (): void => { window.open(docsUrl, "_blank", "noopener"); },
+      },
       {
         kind: "action", label: "GitHub", sub: "github.com/mert574/psp-js",
         icon: ICON_GITHUB,
@@ -694,8 +806,16 @@ export class GameLibrary extends LitElement {
   activateSelected(): boolean {
     const item = this._selectedItem();
     if (!item) return false;
-    if (item.kind === "game") { this._selectGame(item.game, "boot"); return true; }
+    if (item.kind === "game") { this._selectGame(item.game, "details"); return true; }
     if (item.kind === "action") { item.run(); return true; }
+    if (item.kind === "color") {
+      // No left/right within an item (those switch categories), so Enter cycles
+      // through the presets. Mouse users click a swatch directly.
+      const cur = WAVE_COLOR_PRESETS.findIndex(p => p.value.toLowerCase() === this._waveColor.toLowerCase());
+      const next = WAVE_COLOR_PRESETS[(cur + 1) % WAVE_COLOR_PRESETS.length]!;
+      this._setWaveColor(next.value);
+      return true;
+    }
     return false;
   }
 
@@ -762,7 +882,6 @@ export class GameLibrary extends LitElement {
           <div class="xmb-bar">
             ${cats.map((c, ci) => html`
               <button class="xmb-cat ${ci === catIndex ? "active" : ""}"
-                @mouseenter=${(e: MouseEvent): void => { if (this._pointerMoved(e)) this._selectCategory(ci); }}
                 @click=${(): void => this._selectCategory(ci)}>
                 <span class="xmb-cat__icon">${c.icon}</span>
                 <span class="xmb-cat__label">${c.label}</span>
@@ -785,20 +904,45 @@ export class GameLibrary extends LitElement {
   #itemKey(item: XmbItem): string {
     if (item.kind === "game") return `game:${item.game.fileName}:${item.game.fileSize}`;
     if (item.kind === "action") return `action:${item.label}`;
+    if (item.kind === "color") return `color:${item.label}`;
+    if (item.kind === "info") return `info:${item.label}`;
     return "empty";
+  }
+
+  /** Body of the About info card: a short description, the controls, and a link
+   *  to the full docs site. */
+  #aboutBody(docsUrl: string): TemplateResult {
+    const controls: Array<[string, string]> = [
+      ["D-pad", "Arrow keys"],
+      ["Cross / Circle", "Z / X"],
+      ["Square / Triangle", "J / K"],
+      ["L / R", "Q / E"],
+      ["Analog", "W A S D"],
+      ["Gamepad", "Supported"],
+    ];
+    return html`
+      <p class="xmb-about__desc">
+        A PSP high-level-emulation core in TypeScript that runs real games in the
+        browser, no BIOS needed. System calls are implemented directly in TS, and
+        the MIPS CPU and the GE render through WebGL or a software rasterizer.
+      </p>
+      <dl class="xmb-item__meta xmb-about__controls" aria-label="Controls">
+        ${controls.map(([k, v]) => html`<div class="meta-pair"><dt>${k}</dt><dd>${v}</dd></div>`)}
+      </dl>
+      <a class="xmb-about__link" href=${docsUrl} target="_blank" rel="noopener">Open the full documentation</a>`;
   }
 
   /** Compact icon-only row shown in the scrolling column (unselected items). */
   #compactTpl(item: XmbItem, index: number): TemplateResult {
+    const glyph = item.kind === "action" || item.kind === "color" || item.kind === "info" ? item.icon : ICON_GAMES;
     const icon = item.kind === "game"
       ? (item.game.iconDataUrl
           ? html`<img class="card__thumb" src=${item.game.iconDataUrl} alt="" />`
           : html`<div class="card__fallback"></div>`)
-      : html`<div class="xmb-compact__glyph">${item.kind === "action" ? item.icon : ICON_GAMES}</div>`;
+      : html`<div class="xmb-compact__glyph">${glyph}</div>`;
     const label = item.kind === "game" ? item.game.title : item.label;
     return html`
       <div class="xmb-compact" role="button" aria-label=${label}
-        @mouseenter=${(e: MouseEvent): void => { if (this._pointerMoved(e)) this._selectItem(index); }}
         @click=${(): void => this._selectItem(index)}>
         <div class="xmb-compact__icon">${icon}</div>
       </div>`;
@@ -829,7 +973,7 @@ export class GameLibrary extends LitElement {
       return html`
         <div class="xmb-card xmb-card--game" role="button"
           aria-label=${game.title}
-          @click=${(): void => this._selectGame(game, "boot")}>
+          @click=${(): void => this._selectGame(game, "details")}>
           <div class="xmb-card__bg" style=${bgStyle}></div>
           ${media?.pic0Url ? html`<img class="xmb-card__logo" src=${media.pic0Url} alt="" />` : ""}
           <div class="xmb-card__title">${game.title}</div>
@@ -864,6 +1008,41 @@ export class GameLibrary extends LitElement {
           </div>
         </div>`;
     }
+    if (item.kind === "color") {
+      const active = this._waveColor.toLowerCase();
+      return html`
+        <div class="xmb-card xmb-card--action" aria-label=${item.label}>
+          <div class="xmb-card__row">
+            <div class="xmb-item__glyph">${item.icon}</div>
+            <div class="xmb-item__text">
+              <div class="xmb-item__title">${item.label}</div>
+              <div class="xmb-item__sub">${item.sub}</div>
+              <div class="wave-swatches" role="group" aria-label="Wave color">
+                ${WAVE_COLOR_PRESETS.map(p => html`
+                  <button
+                    class="wave-swatch ${p.value.toLowerCase() === active ? "active" : ""}"
+                    style="background:${p.value}"
+                    title=${p.label} aria-label=${p.label}
+                    aria-pressed=${p.value.toLowerCase() === active}
+                    @click=${(): void => this._setWaveColor(p.value)}></button>`)}
+              </div>
+            </div>
+          </div>
+        </div>`;
+    }
+    if (item.kind === "info") {
+      return html`
+        <div class="xmb-card xmb-card--action xmb-card--info" aria-label=${item.label}>
+          <div class="xmb-card__row">
+            <div class="xmb-item__glyph">${item.icon}</div>
+            <div class="xmb-item__text">
+              <div class="xmb-item__title">${item.label}</div>
+              <div class="xmb-item__sub">${item.sub}</div>
+            </div>
+          </div>
+          ${item.body}
+        </div>`;
+    }
     return html`
       <div class="xmb-card xmb-card--empty">
         <div class="xmb-card__row">
@@ -891,18 +1070,6 @@ export class GameLibrary extends LitElement {
 
   private _selectItem(index: number): void {
     this._itemIndex = index;
-  }
-
-  // True only on a genuine pointer move. The sliding column fires mouseenter on
-  // whatever ends up under a still cursor; those carry the same coordinates as
-  // the last real move, so we ignore them to avoid hover-selection oscillating.
-  private _lastHoverX = -1;
-  private _lastHoverY = -1;
-  private _pointerMoved(e: MouseEvent): boolean {
-    if (e.clientX === this._lastHoverX && e.clientY === this._lastHoverY) return false;
-    this._lastHoverX = e.clientX;
-    this._lastHoverY = e.clientY;
-    return true;
   }
 
   // After each render: slide the category bar to its focus point, size the
@@ -961,7 +1128,7 @@ export class GameLibrary extends LitElement {
     this._previewKey = null;
   }
 
-  private _selectGame(game: GameMeta, mode: "boot" | "options"): void {
+  private _selectGame(game: GameMeta, mode: "boot" | "options" | "details"): void {
     this._resetPreview();
     const fileKey = `${game.fileName}:${game.fileSize}`;
     void this._getFile(fileKey).then(file => {
@@ -1030,9 +1197,10 @@ export class GameLibrary extends LitElement {
 
     // If the URL hash references a specific game, auto-select it
     const hash = location.hash.replace(/^#/, "");
-    const match = hash.match(/^(?:game|play)\/(.+)$/);
+    const match = hash.match(/^(game|play|details)\/(.+)$/);
     if (match) {
-      this.autoSelectBySlug(match[1]!);
+      // #details deep-links to the details view without booting.
+      this.autoSelectBySlug(match[2]!, match[1] === "details" ? "details" : "boot");
     }
   }
 
@@ -1122,6 +1290,18 @@ export class GameLibrary extends LitElement {
 
         cached = { pmfData: media.pmf, at3Url, pic1Url, pic0Url };
         this._mediaCache.set(fileKey, cached);
+        // Cap the cache so browsing a large library doesn't accumulate AT3 audio
+        // and image blob URLs forever; evict the oldest entry and revoke its URLs.
+        if (this._mediaCache.size > 16) {
+          const oldestKey = this._mediaCache.keys().next().value;
+          if (oldestKey !== undefined && oldestKey !== fileKey) {
+            const old = this._mediaCache.get(oldestKey)!;
+            if (old.at3Url) URL.revokeObjectURL(old.at3Url);
+            if (old.pic1Url) URL.revokeObjectURL(old.pic1Url);
+            if (old.pic0Url) URL.revokeObjectURL(old.pic0Url);
+            this._mediaCache.delete(oldestKey);
+          }
+        }
       } catch {
         return;
       } finally {
