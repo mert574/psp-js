@@ -1,6 +1,8 @@
 node_modules/
 dist/
 dist-web/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
 .claude/
 test/fixtures/
 public/*.iso
