@@ -2,6 +2,8 @@
 
 The options screen (open a game's gear from the library, or the options before booting) has these settings. The renderer choice and resolution apply at boot; the renderer can also be changed live from the [debug panel](/user/debug-panel).
 
+All four boot options (renderer, resolution, disable audio, profiler) are saved in your browser and restored on the next visit, so you only set them once.
+
 ![The boot-options screen](/screenshots/options.png)
 
 ## Renderer
