@@ -1994,10 +1994,15 @@ export class GEProcessor {
     // If neither color nor alpha writes are enabled, nothing to draw
     if (!this.clearColorWrite && !this.clearAlphaWrite) return;
 
-    const x0 = Math.max(0, Math.min(v0.x, v1.x) | 0);
-    const y0 = Math.max(0, Math.min(v0.y, v1.y) | 0);
-    const x1 = Math.min(480, Math.max(v0.x, v1.x) | 0);
-    const y1 = Math.min(272, Math.max(v0.y, v1.y) | 0);
+    // Clamp to the scissor rect, not just the screen. Games place textures
+    // (CLUTs, sprite atlases) in VRAM right below the visible rows of a buffer
+    // and rely on the scissor to keep clears off them. Clamping only to 480x272
+    // lets a tall clear rect overrun past the scissor and wipe that data.
+    // Matches drawSprite's clamp and PPSSPP (clears respect the scissor).
+    const x0 = Math.max(Math.max(0, this.scissorX1), Math.min(v0.x, v1.x) | 0);
+    const y0 = Math.max(Math.max(0, this.scissorY1), Math.min(v0.y, v1.y) | 0);
+    const x1 = Math.min(Math.min(480, this.scissorX2 + 1), Math.max(v0.x, v1.x) | 0);
+    const y1 = Math.min(Math.min(272, this.scissorY2 + 1), Math.max(v0.y, v1.y) | 0);
 
     // Vertex color is ABGR8888 packed as (A<<24)|(B<<16)|(G<<8)|R
     const col = v1.color;
