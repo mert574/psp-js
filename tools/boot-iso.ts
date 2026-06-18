@@ -3,7 +3,7 @@
  * Usage: npx tsx tools/boot-iso.ts <iso-path> [frames=300]
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { parseIso, readFile, type IsoFile } from "../src/iso/iso9660.js";
 import { isPbp, parsePbp } from "../src/loader/pbp.js";
 import { pspDecryptPRX } from "../src/loader/prx-decrypter.js";
@@ -13,6 +13,15 @@ import { Logger } from "../src/utils/logger.js";
 
 const isoPath = process.argv[2];
 const maxFrames = parseInt(process.argv[3] ?? "300", 10);
+
+function flagValue(name: string): string | undefined {
+  const i = process.argv.indexOf(name);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+// --load-state <file>: overlay a save state right after boot, then keep running.
+// --save-state <file>: write a save state after the run loop finishes.
+const loadStatePath = flagValue("--load-state");
+const saveStatePath = flagValue("--save-state");
 
 if (!isoPath || !existsSync(isoPath)) {
   console.error("Usage: npx tsx tools/boot-iso.ts <iso-path> [frames]");
@@ -91,6 +100,11 @@ async function main() {
   await emu.loadElfBinary(data);
   console.log(`Entry: 0x${emu.cpu.regs.pc.toString(16)}`);
 
+  if (loadStatePath) {
+    await emu.loadState(new Uint8Array(readFileSync(loadStatePath)));
+    console.log(`Loaded save state from ${loadStatePath} (PC now 0x${emu.cpu.regs.pc.toString(16)}, vblank ${emu.hle.vblankCount})`);
+  }
+
   // Dump syscall-to-NID mapping for debugging
   if (process.argv.includes("--dump-nids")) {
     for (let sc = 0; sc <= 0x80; sc++) {
@@ -112,6 +126,12 @@ async function main() {
 
   const elapsed = Date.now() - startTime;
   const pc = emu.cpu.regs.pc;
+
+  if (saveStatePath) {
+    const blob = await emu.saveState({ frames, tool: "boot-iso" });
+    writeFileSync(saveStatePath, blob);
+    console.log(`Saved state to ${saveStatePath} (${blob.byteLength} bytes) at frame ${frames}`);
+  }
 
   console.log(`\n--- Results ---`);
   console.log(`Frames: ${frames}/${maxFrames}`);

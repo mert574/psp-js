@@ -8,6 +8,8 @@ import { isPbp, parsePbp } from "./loader/pbp.js";
 import { pspDecryptPRX } from "./loader/prx-decrypter.js";
 import { createSavedataStore } from "./storage/savedata-store.js";
 import { createFileStore } from "./storage/file-store.js";
+import { packContainer, unpackContainer, fnv1a, type StateSection } from "./state/state-container.js";
+import { SECTION, SAVESTATE_FORMAT_VERSION, SUPPORTED_FORMAT_VERSIONS, type SnapshotJson } from "./state/save-state.js";
 import { Logger } from "./utils/logger.js";
 
 const log = Logger.get("EMU");
@@ -141,6 +143,13 @@ export class PSPEmulator {
   readonly coreTiming = new CoreTiming();
   halted: boolean = false;
 
+  /** Disc id of the loaded game (from PARAM.SFO), captured at boot. Save states
+   *  are bound to this so a state only restores onto the same game. */
+  gameId: string = "";
+  /** FNV-1a hash of the EBOOT this game was booted from. A save state stores it
+   *  and refuses to load onto a different build of the game. */
+  ebootHash: number = 0;
+
   private _vblankFired = false;
   private _vblankEventId = -1;
   private _leaveVblankEventId = -1;
@@ -174,6 +183,12 @@ export class PSPEmulator {
   }
 
   async loadElfBinary(data: Uint8Array, bootFilename = "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN"): Promise<void> {
+    // Bind any future save state to this game. The disc id is read from the
+    // already-mounted PARAM.SFO; homebrew without an SFO gets "". The EBOOT hash
+    // is computed further down, after unwrap/decrypt, so it matches no matter
+    // whether the caller passed raw or pre-decrypted bytes.
+    this.gameId = this._extractGameId();
+
     // Initialize persistent save data storage
     this.hle.savedataStore = await createSavedataStore();
 
@@ -214,6 +229,9 @@ export class PSPEmulator {
         data = decrypted;
       }
     }
+
+    // Hash the final ELF (post unwrap/decrypt) to bind save states to this build.
+    this.ebootHash = fnv1a(data);
 
     const { entryPoint, moduleStartFunc, gp, nidBySyscall, loadedEnd, nextSyscallCode } = loadElf(data, this.bus);
     this.hle.setHeapBase(loadedEnd, this.detectLargeMemory());
@@ -541,5 +559,152 @@ export class PSPEmulator {
     if (this.cpu.stepFaulted) {
       this.halted = true;
     }
+  }
+
+  // ── save states ────────────────────────────────────────────────────────────
+
+  /** Read the disc id from the mounted PARAM.SFO, or "" for homebrew. */
+  private _extractGameId(): string {
+    for (const [key, fileData] of this.hle.fileData) {
+      if (key.toLowerCase().endsWith("psp_game/param.sfo")) {
+        try {
+          const sfo = parseSfo(fileData.slice().buffer as ArrayBuffer);
+          return String(sfo["DISC_ID"] ?? "");
+        } catch { return ""; }
+      }
+    }
+    return "";
+  }
+
+  /**
+   * Capture the whole machine into a portable save-state blob.
+   *
+   * Must be called at a frame boundary (after runFrame returns), when no async
+   * wake callbacks are in flight. The structured state is JSON, memory and CPU
+   * register files are raw/gzipped binary sections. The blob does NOT contain
+   * the game itself, only its disc id and EBOOT hash, so restoring needs the
+   * same game booted first.
+   */
+  /**
+   * Capture the whole machine synchronously, WITHOUT compressing. Returns the
+   * raw (uncompressed) container sections plus the game-binding info. This is
+   * the part that must run on the main thread because it reads live emulator
+   * state; it's fast (a few memcpys + JSON.stringify). The slow gzip is left to
+   * the caller (packContainer), which can run on a worker so the UI doesn't
+   * freeze. The memory buffers are copied here so a later runFrame can't tear
+   * the snapshot while compression is in flight.
+   */
+  captureSnapshot(meta: Record<string, unknown> = {}): {
+    gameId: string;
+    contentHash: number;
+    formatVersion: number;
+    meta: Record<string, unknown>;
+    sections: StateSection[];
+  } {
+    const blockers = this.hle.snapshotBlockers();
+    if (blockers.length > 0) {
+      throw new Error(`cannot save state right now: ${blockers.join("; ")}`);
+    }
+
+    const json: SnapshotJson = {
+      schema: SAVESTATE_FORMAT_VERSION,
+      cpu: this.cpu.serialize(),
+      regs: this.cpu.regs.serializeScalars(),
+      coreTiming: this.coreTiming.serialize(),
+      kernel: this.hle.serialize(),
+      ge: this.hle.geProcessor ? this.hle.geProcessor.serialize() : null,
+      emu: { halted: this.halted },
+    };
+    const stateBytes = new TextEncoder().encode(JSON.stringify(json));
+
+    return {
+      gameId: this.gameId,
+      contentHash: this.ebootHash,
+      formatVersion: SAVESTATE_FORMAT_VERSION,
+      meta,
+      sections: [
+        { name: SECTION.RAM,        codec: "gzip", bytes: this.bus.ramBuffer.slice() },
+        { name: SECTION.VRAM,       codec: "gzip", bytes: this.bus.vramBuffer.slice() },
+        { name: SECTION.SCRATCHPAD, codec: "raw",  bytes: this.bus.scratchpadBuffer.slice() },
+        { name: SECTION.CPUREGS,    codec: "raw",  bytes: this.cpu.regs.dumpRegBuffers() },
+        { name: SECTION.STATE,      codec: "gzip", bytes: stateBytes },
+      ],
+    };
+  }
+
+  async saveState(meta: Record<string, unknown> = {}): Promise<Uint8Array> {
+    const cap = this.captureSnapshot(meta);
+    return packContainer(
+      { gameId: cap.gameId, contentHash: cap.contentHash, formatVersion: cap.formatVersion, meta: cap.meta },
+      cap.sections,
+    );
+  }
+
+  /**
+   * Overlay a save-state blob onto THIS emulator. The caller must have already
+   * booted the matching game (loadElfBinary) so all handlers, trampolines, and
+   * CoreTiming event types are wired up. We then overwrite the mutable state.
+   *
+   * Throws if the blob is for a different game/build unless ignoreGameMismatch.
+   * After this returns, a browser caller should re-attach its GE renderer and
+   * invalidate its texture cache before drawing again.
+   */
+  async loadState(blob: Uint8Array, opts: { ignoreGameMismatch?: boolean; allowBuildMismatch?: boolean } = {}): Promise<void> {
+    const parsed = await unpackContainer(blob);
+    // Game-title (disc id) mismatch is a hard stop: the state's guest addresses
+    // belong to a different game entirely.
+    if (!opts.ignoreGameMismatch && parsed.gameId !== this.gameId) {
+      throw Object.assign(
+        new Error(`save state is for game "${parsed.gameId}", but "${this.gameId || "(none)"}" is loaded`),
+        { code: "GAME_MISMATCH" },
+      );
+    }
+    // Same game title but a different EBOOT build (different rip/patch/region):
+    // the code layout may differ, so this is risky. Block by default but let the
+    // caller force it when they know the builds are close enough.
+    if (!opts.ignoreGameMismatch && !opts.allowBuildMismatch && parsed.contentHash !== this.ebootHash) {
+      throw Object.assign(
+        new Error("save state was taken from a different build of this game (the EBOOT differs)"),
+        { code: "BUILD_MISMATCH" },
+      );
+    }
+
+    const section = (name: string): Uint8Array => {
+      const b = parsed.sections.get(name);
+      if (!b) throw new Error(`save state is missing the "${name}" section`);
+      return b;
+    };
+    // The header carries the format version (readable without the state section).
+    // Refuse anything not in the supported list; a future migrator would branch
+    // on parsed.formatVersion here to upgrade an older file before overlaying.
+    if (!SUPPORTED_FORMAT_VERSIONS.includes(parsed.formatVersion)) {
+      throw new Error(`save state format v${parsed.formatVersion} is not supported (this build reads: ${SUPPORTED_FORMAT_VERSIONS.join(", ")})`);
+    }
+    const json = JSON.parse(new TextDecoder().decode(section(SECTION.STATE))) as SnapshotJson;
+    if (json.schema !== parsed.formatVersion) {
+      throw new Error(`save state is inconsistent (header v${parsed.formatVersion}, content v${json.schema})`);
+    }
+
+    // Memory first.
+    this.bus.loadRam(section(SECTION.RAM));
+    this.bus.loadVram(section(SECTION.VRAM));
+    this.bus.loadScratchpad(section(SECTION.SCRATCHPAD));
+
+    // CPU register files + scalars.
+    this.cpu.regs.loadRegBuffers(section(SECTION.CPUREGS));
+    this.cpu.regs.deserializeScalars(json.regs);
+    this.cpu.deserialize(json.cpu);
+
+    // Timing before the kernel: the kernel's restored event ids line up with
+    // the freshly registered event types, and CoreTiming remaps its queue by
+    // event-type name.
+    this.coreTiming.deserialize(json.coreTiming);
+    this.hle.deserialize(json.kernel);
+
+    // GE render state. The WebGL renderer's caches are derived from VRAM + this
+    // state and rebuild on the next draw.
+    if (json.ge) this.hle.ensureGeProcessor().deserialize(json.ge);
+
+    this.halted = json.emu.halted;
   }
 }

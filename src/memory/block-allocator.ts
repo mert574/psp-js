@@ -13,6 +13,12 @@ interface Block {
   next: Block | null;
 }
 
+/** Flat, JSON-round-trippable form of a BlockAllocator (for save-states). */
+export interface BlockAllocatorState {
+  rangeSize: number;
+  blocks: Array<{ start: number; size: number; taken: boolean; tag: string }>;
+}
+
 export class BlockAllocator {
   private bottom: Block | null = null;
   private top: Block | null = null;
@@ -179,6 +185,31 @@ export class BlockAllocator {
   isBlockFree(position: number): boolean {
     const bp = this.getBlockFromAddress(position);
     return bp ? !bp.taken : false;
+  }
+
+  /** Flatten the block list (low address first) plus rangeSize for a save-state.
+   *  grain is not stored — it's fixed at construction and not restored. */
+  serialize(): BlockAllocatorState {
+    return { rangeSize: this.rangeSize, blocks: this.listBlocks() };
+  }
+
+  /** Rebuild the doubly-linked block list from a saved flat form, fixing up the
+   *  prev/next pointers and the bottom/top ends. Replaces current state. */
+  deserialize(state: BlockAllocatorState): void {
+    this.rangeSize = state.rangeSize;
+    this.bottom = null;
+    this.top = null;
+    let prev: Block | null = null;
+    for (const b of state.blocks) {
+      const block: Block = {
+        start: b.start, size: b.size, taken: b.taken, tag: b.tag,
+        prev, next: null,
+      };
+      if (prev) prev.next = block;
+      else this.bottom = block;
+      prev = block;
+    }
+    this.top = prev;
   }
 
   // ── Private helpers ─────────────────────────────────────────────────

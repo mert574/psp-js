@@ -27,6 +27,217 @@ const MAX_COMMANDS = 1_000_000;
 const CALL_STACK_DEPTH = 8;
 
 /**
+ * Plain, JSON-round-trippable snapshot of every mutable GE state field that
+ * affects rendering or command interpretation. Produced by serialize() and
+ * consumed by deserialize() for save states. Typed arrays are stored as plain
+ * number arrays; nested arrays (callStack/immBuffer) are deep-copied plain objects.
+ *
+ * Not captured (reconstructed elsewhere): signalCallback (a JS function),
+ * webglRenderer (host renderer, re-attached after restore), vram32 (a view over
+ * VRAM, rebuilt from the bus), and the bus reference itself.
+ */
+export interface GeProcessorState {
+  // Display-list control
+  baseAddr: number;
+  offsetAddr: number;
+  callStack: Array<{ pc: number; offsetAddr: number; baseAddr?: number }>;
+
+  // Framebuffer state
+  fbPtr: number;
+  fbWidth: number;
+  fbFormat: number;
+  lastDrawFbPtr: number;
+  lastDrawFbWidth: number;
+  lastDrawFbFormat: number;
+
+  // Vertex state
+  vtypeRaw: number;
+  vertexAddr: number;
+  indexAddr: number;
+
+  // Clear mode
+  clearMode: boolean;
+  clearColorWrite: boolean;
+  clearAlphaWrite: boolean;
+  clearDepthWrite: boolean;
+
+  // Texture LOD slope
+  texLodSlope: number;
+
+  // Texture state
+  texAddr0: number;
+  texBufWidth0: number;
+  texWidth0: number;
+  texHeight0: number;
+  texFormat: number;
+  texEnable: boolean;
+  texSwizzle: boolean;
+  texWrapU: number;
+  texWrapV: number;
+  texFunc: number;
+  texFuncAlpha: boolean;
+  colorDoubling: boolean;
+  texEnvColor: number;
+  texMinFilter: number;
+  texMagFilter: number;
+  texMapMode: number;
+  texProjMode: number;
+  texShadeLS0: number;
+  texShadeLS1: number;
+  tgenMat: number[];
+  lightPos: number[];
+  texScaleU: number;
+  texScaleV: number;
+  texOffsetU: number;
+  texOffsetV: number;
+
+  // CLUT
+  clutAddr: number;
+  clutFormat: number;
+  clutShift: number;
+  clutMask: number;
+  clutStart: number;
+
+  // Alpha blend
+  alphaBlendEnable: boolean;
+  blendSrc: number;
+  blendDst: number;
+  blendOp: number;
+  blendFixedA: number;
+  blendFixedB: number;
+
+  // Alpha test
+  alphaTestEnable: boolean;
+  alphaTestFunc: number;
+  alphaTestRef: number;
+  alphaTestMask: number;
+
+  // Scissor
+  scissorX1: number;
+  scissorY1: number;
+  scissorX2: number;
+  scissorY2: number;
+
+  // Depth
+  depthTestEnable: boolean;
+  depthWriteDisable: boolean;
+  depthFunc: number;
+
+  // Write masks
+  maskRgb: number;
+  maskAlpha: number;
+
+  // Stencil
+  stencilTestEnable: boolean;
+  stencilFunc: number;
+  stencilRef: number;
+  stencilMask: number;
+  stencilSFail: number;
+  stencilZFail: number;
+  stencilZPass: number;
+
+  // Color test
+  colorTestEnable: boolean;
+  colorTestFunc: number;
+  colorTestRef: number;
+  colorTestMask: number;
+
+  // Logic op
+  logicOpEnable: boolean;
+  logicOp: number;
+
+  // Dither
+  ditherEnable: boolean;
+  ditherMatrix: number[];
+
+  // Fog
+  fogEnable: boolean;
+  fogColor: number;
+  fogEnd: number;
+  fogSlope: number;
+
+  // Patch
+  patchDivU: number;
+  patchDivV: number;
+  patchPrimType: number;
+  patchFacing: boolean;
+
+  // Material
+  materialEmissive: number;
+  materialAmbient: number;
+  materialDiffuse: number;
+  materialSpecular: number;
+  materialAlpha: number;
+  materialSpecCoef: number;
+  materialUpdate: number;
+  shadeMode: number;
+  reverseNormals: boolean;
+
+  // Lighting
+  lightingEnable: boolean;
+  lightEnable: boolean[];
+  lightType: number[];
+  lightMode: number;
+  lightDir: number[];
+  lightAtt: number[];
+  lightSpotExp: number[];
+  lightSpotCutoff: number[];
+  lightAmbientColor: number[];
+  lightDiffuseColor: number[];
+  lightSpecularColor: number[];
+  ambientColor: number;
+  ambientAlpha: number;
+
+  // Cull
+  cullEnable: boolean;
+  cullCW: boolean;
+
+  // Block transfer
+  trSrc: number;
+  trSrcW: number;
+  trDst: number;
+  trDstW: number;
+  trSrcPos: number;
+  trDstPos: number;
+  trSize: number;
+  trBpp: number;
+
+  // Transform matrices
+  boneMats: number[];
+  boneMatIdx: number;
+  worldMat: number[];
+  viewMat: number[];
+  projMat: number[];
+  worldMatIdx: number;
+  viewMatIdx: number;
+  projMatIdx: number;
+  tgenMatIdx: number;
+
+  // Viewport
+  vpScaleX: number;
+  vpScaleY: number;
+  vpScaleZ: number;
+  vpCenterX: number;
+  vpCenterY: number;
+  vpCenterZ: number;
+  geOffsetX: number;
+  geOffsetY: number;
+
+  // Immediate-mode vertex state
+  immVscx: number;
+  immVscy: number;
+  immVscz: number;
+  immVtcs: number;
+  immVtct: number;
+  immVtcq: number;
+  immCv: number;
+  immFc: number;
+  immScv: number;
+  immBuffer: Vertex[];
+  immPrim: number;
+}
+
+/**
  * Minimal PSP Graphics Engine command list processor.
  *
  * Processes GE display lists submitted via sceGeListEnQueue.
@@ -69,7 +280,8 @@ export class GEProcessor {
   private clearDepthWrite = false; // bit 10: write depth
 
   // Texture LOD slope (0xD0) — PPSSPP ge_constants.h:217
-  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
+  // Parsed from the GE command but not consumed yet; kept to document the state
+  // and captured in save states.
   private texLodSlope = 0.0;
 
   // Texture state
@@ -185,7 +397,8 @@ export class GEProcessor {
   // Patch state (PPSSPP: GE_CMD_PATCHDIVISION=0x36, PATCHPRIMITIVE=0x37, PATCHFACING=0x38)
   private patchDivU = 0;
   private patchDivV = 0;
-  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
+  // Parsed from the GE command but not consumed yet; kept to document the state
+  // and captured in save states.
   private patchPrimType = 0; // 0=triangles,1=lines,2=points
   private patchFacing = false;
 
@@ -284,12 +497,13 @@ export class GEProcessor {
   private immVscz = 0;
   private immVtcs = 0;
   private immVtct = 0;
-  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
+  // Parsed from the GE command but not consumed yet; kept to document the state
+  // and captured in save states.
   private immVtcq = 0;
   private immCv = 0;   // vertex color RGB (24 bits)
-  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
+  // Parsed from the GE command but not consumed yet; captured in save states.
   private immFc = 0;   // fog coefficient
-  // @ts-expect-error parsed from the GE command but not consumed yet; kept to document the state
+  // Parsed from the GE command but not consumed yet; captured in save states.
   private immScv = 0;  // secondary color (specular)
   private immBuffer: Vertex[] = [];
   private immPrim = -1; // current immediate prim type (-1 = none)
@@ -2083,4 +2297,394 @@ export class GEProcessor {
   private clutShift = 0;
   private clutMask = 0xFF;
   private clutStart = 0;
+
+  // ── Save state ───────────────────────────────────────────────────────────
+
+  /** Deep-copy one immediate-mode vertex into a plain object (no aliasing). */
+  private static cloneVertex(v: Vertex): Vertex {
+    const out: Vertex = {
+      x: v.x, y: v.y, z: v.z,
+      u: v.u, v: v.v,
+      color: v.color,
+      nx: v.nx, ny: v.ny, nz: v.nz,
+      clipw: v.clipw, fogCoef: v.fogCoef,
+    };
+    if (v.weights) out.weights = [...v.weights];
+    return out;
+  }
+
+  /** Deep-copy a call-stack entry, keeping baseAddr optional. */
+  private static cloneCallEntry(
+    e: { pc: number; offsetAddr: number; baseAddr?: number },
+  ): { pc: number; offsetAddr: number; baseAddr?: number } {
+    const out: { pc: number; offsetAddr: number; baseAddr?: number } =
+      { pc: e.pc, offsetAddr: e.offsetAddr };
+    if (e.baseAddr !== undefined) out.baseAddr = e.baseAddr;
+    return out;
+  }
+
+  /**
+   * Capture every mutable GE state field into a plain JSON-round-trippable
+   * object. Typed arrays become number arrays; callStack/immBuffer become
+   * deep-copied plain objects so the snapshot never aliases live state.
+   *
+   * Skipped on purpose (rebuilt elsewhere, never serialized): signalCallback,
+   * webglRenderer, vram32, the bus reference, and the debug counters.
+   */
+  serialize(): GeProcessorState {
+    return {
+      baseAddr: this.baseAddr,
+      offsetAddr: this.offsetAddr,
+      callStack: this.callStack.map((e) => GEProcessor.cloneCallEntry(e)),
+
+      fbPtr: this.fbPtr,
+      fbWidth: this.fbWidth,
+      fbFormat: this.fbFormat,
+      lastDrawFbPtr: this.lastDrawFbPtr,
+      lastDrawFbWidth: this.lastDrawFbWidth,
+      lastDrawFbFormat: this.lastDrawFbFormat,
+
+      vtypeRaw: this.vtypeRaw,
+      vertexAddr: this.vertexAddr,
+      indexAddr: this.indexAddr,
+
+      clearMode: this.clearMode,
+      clearColorWrite: this.clearColorWrite,
+      clearAlphaWrite: this.clearAlphaWrite,
+      clearDepthWrite: this.clearDepthWrite,
+
+      texLodSlope: this.texLodSlope,
+
+      texAddr0: this.texAddr0,
+      texBufWidth0: this.texBufWidth0,
+      texWidth0: this.texWidth0,
+      texHeight0: this.texHeight0,
+      texFormat: this.texFormat,
+      texEnable: this.texEnable,
+      texSwizzle: this.texSwizzle,
+      texWrapU: this.texWrapU,
+      texWrapV: this.texWrapV,
+      texFunc: this.texFunc,
+      texFuncAlpha: this.texFuncAlpha,
+      colorDoubling: this.colorDoubling,
+      texEnvColor: this.texEnvColor,
+      texMinFilter: this.texMinFilter,
+      texMagFilter: this.texMagFilter,
+      texMapMode: this.texMapMode,
+      texProjMode: this.texProjMode,
+      texShadeLS0: this.texShadeLS0,
+      texShadeLS1: this.texShadeLS1,
+      tgenMat: Array.from(this.tgenMat),
+      lightPos: Array.from(this.lightPos),
+      texScaleU: this.texScaleU,
+      texScaleV: this.texScaleV,
+      texOffsetU: this.texOffsetU,
+      texOffsetV: this.texOffsetV,
+
+      clutAddr: this.clutAddr,
+      clutFormat: this.clutFormat,
+      clutShift: this.clutShift,
+      clutMask: this.clutMask,
+      clutStart: this.clutStart,
+
+      alphaBlendEnable: this.alphaBlendEnable,
+      blendSrc: this.blendSrc,
+      blendDst: this.blendDst,
+      blendOp: this.blendOp,
+      blendFixedA: this.blendFixedA,
+      blendFixedB: this.blendFixedB,
+
+      alphaTestEnable: this.alphaTestEnable,
+      alphaTestFunc: this.alphaTestFunc,
+      alphaTestRef: this.alphaTestRef,
+      alphaTestMask: this.alphaTestMask,
+
+      scissorX1: this.scissorX1,
+      scissorY1: this.scissorY1,
+      scissorX2: this.scissorX2,
+      scissorY2: this.scissorY2,
+
+      depthTestEnable: this.depthTestEnable,
+      depthWriteDisable: this.depthWriteDisable,
+      depthFunc: this.depthFunc,
+
+      maskRgb: this.maskRgb,
+      maskAlpha: this.maskAlpha,
+
+      stencilTestEnable: this.stencilTestEnable,
+      stencilFunc: this.stencilFunc,
+      stencilRef: this.stencilRef,
+      stencilMask: this.stencilMask,
+      stencilSFail: this.stencilSFail,
+      stencilZFail: this.stencilZFail,
+      stencilZPass: this.stencilZPass,
+
+      colorTestEnable: this.colorTestEnable,
+      colorTestFunc: this.colorTestFunc,
+      colorTestRef: this.colorTestRef,
+      colorTestMask: this.colorTestMask,
+
+      logicOpEnable: this.logicOpEnable,
+      logicOp: this.logicOp,
+
+      ditherEnable: this.ditherEnable,
+      ditherMatrix: Array.from(this.ditherMatrix),
+
+      fogEnable: this.fogEnable,
+      fogColor: this.fogColor,
+      fogEnd: this.fogEnd,
+      fogSlope: this.fogSlope,
+
+      patchDivU: this.patchDivU,
+      patchDivV: this.patchDivV,
+      patchPrimType: this.patchPrimType,
+      patchFacing: this.patchFacing,
+
+      materialEmissive: this.materialEmissive,
+      materialAmbient: this.materialAmbient,
+      materialDiffuse: this.materialDiffuse,
+      materialSpecular: this.materialSpecular,
+      materialAlpha: this.materialAlpha,
+      materialSpecCoef: this.materialSpecCoef,
+      materialUpdate: this.materialUpdate,
+      shadeMode: this.shadeMode,
+      reverseNormals: this.reverseNormals,
+
+      lightingEnable: this.lightingEnable,
+      lightEnable: [...this.lightEnable],
+      lightType: Array.from(this.lightType),
+      lightMode: this.lightMode,
+      lightDir: Array.from(this.lightDir),
+      lightAtt: Array.from(this.lightAtt),
+      lightSpotExp: Array.from(this.lightSpotExp),
+      lightSpotCutoff: Array.from(this.lightSpotCutoff),
+      lightAmbientColor: Array.from(this.lightAmbientColor),
+      lightDiffuseColor: Array.from(this.lightDiffuseColor),
+      lightSpecularColor: Array.from(this.lightSpecularColor),
+      ambientColor: this.ambientColor,
+      ambientAlpha: this.ambientAlpha,
+
+      cullEnable: this.cullEnable,
+      cullCW: this.cullCW,
+
+      trSrc: this.trSrc,
+      trSrcW: this.trSrcW,
+      trDst: this.trDst,
+      trDstW: this.trDstW,
+      trSrcPos: this.trSrcPos,
+      trDstPos: this.trDstPos,
+      trSize: this.trSize,
+      trBpp: this.trBpp,
+
+      boneMats: Array.from(this.boneMats),
+      boneMatIdx: this.boneMatIdx,
+      worldMat: Array.from(this.worldMat),
+      viewMat: Array.from(this.viewMat),
+      projMat: Array.from(this.projMat),
+      worldMatIdx: this.worldMatIdx,
+      viewMatIdx: this.viewMatIdx,
+      projMatIdx: this.projMatIdx,
+      tgenMatIdx: this.tgenMatIdx,
+
+      vpScaleX: this.vpScaleX,
+      vpScaleY: this.vpScaleY,
+      vpScaleZ: this.vpScaleZ,
+      vpCenterX: this.vpCenterX,
+      vpCenterY: this.vpCenterY,
+      vpCenterZ: this.vpCenterZ,
+      geOffsetX: this.geOffsetX,
+      geOffsetY: this.geOffsetY,
+
+      immVscx: this.immVscx,
+      immVscy: this.immVscy,
+      immVscz: this.immVscz,
+      immVtcs: this.immVtcs,
+      immVtct: this.immVtct,
+      immVtcq: this.immVtcq,
+      immCv: this.immCv,
+      immFc: this.immFc,
+      immScv: this.immScv,
+      immBuffer: this.immBuffer.map((v) => GEProcessor.cloneVertex(v)),
+      immPrim: this.immPrim,
+    };
+  }
+
+  /** Restore every field captured by serialize(). Fixed-size typed arrays are
+   *  written in place; plain-object arrays are rebuilt as fresh copies so the
+   *  restored state never aliases the saved snapshot. */
+  deserialize(s: GeProcessorState): void {
+    this.baseAddr = s.baseAddr;
+    this.offsetAddr = s.offsetAddr;
+    this.callStack = s.callStack.map((e) => GEProcessor.cloneCallEntry(e));
+
+    this.fbPtr = s.fbPtr;
+    this.fbWidth = s.fbWidth;
+    this.fbFormat = s.fbFormat;
+    this.lastDrawFbPtr = s.lastDrawFbPtr;
+    this.lastDrawFbWidth = s.lastDrawFbWidth;
+    this.lastDrawFbFormat = s.lastDrawFbFormat;
+
+    this.vtypeRaw = s.vtypeRaw;
+    this.vertexAddr = s.vertexAddr;
+    this.indexAddr = s.indexAddr;
+
+    this.clearMode = s.clearMode;
+    this.clearColorWrite = s.clearColorWrite;
+    this.clearAlphaWrite = s.clearAlphaWrite;
+    this.clearDepthWrite = s.clearDepthWrite;
+
+    this.texLodSlope = s.texLodSlope;
+
+    this.texAddr0 = s.texAddr0;
+    this.texBufWidth0 = s.texBufWidth0;
+    this.texWidth0 = s.texWidth0;
+    this.texHeight0 = s.texHeight0;
+    this.texFormat = s.texFormat;
+    this.texEnable = s.texEnable;
+    this.texSwizzle = s.texSwizzle;
+    this.texWrapU = s.texWrapU;
+    this.texWrapV = s.texWrapV;
+    this.texFunc = s.texFunc;
+    this.texFuncAlpha = s.texFuncAlpha;
+    this.colorDoubling = s.colorDoubling;
+    this.texEnvColor = s.texEnvColor;
+    this.texMinFilter = s.texMinFilter;
+    this.texMagFilter = s.texMagFilter;
+    this.texMapMode = s.texMapMode;
+    this.texProjMode = s.texProjMode;
+    this.texShadeLS0 = s.texShadeLS0;
+    this.texShadeLS1 = s.texShadeLS1;
+    this.tgenMat.set(s.tgenMat);
+    this.lightPos.set(s.lightPos);
+    this.texScaleU = s.texScaleU;
+    this.texScaleV = s.texScaleV;
+    this.texOffsetU = s.texOffsetU;
+    this.texOffsetV = s.texOffsetV;
+
+    this.clutAddr = s.clutAddr;
+    this.clutFormat = s.clutFormat;
+    this.clutShift = s.clutShift;
+    this.clutMask = s.clutMask;
+    this.clutStart = s.clutStart;
+
+    this.alphaBlendEnable = s.alphaBlendEnable;
+    this.blendSrc = s.blendSrc;
+    this.blendDst = s.blendDst;
+    this.blendOp = s.blendOp;
+    this.blendFixedA = s.blendFixedA;
+    this.blendFixedB = s.blendFixedB;
+
+    this.alphaTestEnable = s.alphaTestEnable;
+    this.alphaTestFunc = s.alphaTestFunc;
+    this.alphaTestRef = s.alphaTestRef;
+    this.alphaTestMask = s.alphaTestMask;
+
+    this.scissorX1 = s.scissorX1;
+    this.scissorY1 = s.scissorY1;
+    this.scissorX2 = s.scissorX2;
+    this.scissorY2 = s.scissorY2;
+
+    this.depthTestEnable = s.depthTestEnable;
+    this.depthWriteDisable = s.depthWriteDisable;
+    this.depthFunc = s.depthFunc;
+
+    this.maskRgb = s.maskRgb;
+    this.maskAlpha = s.maskAlpha;
+
+    this.stencilTestEnable = s.stencilTestEnable;
+    this.stencilFunc = s.stencilFunc;
+    this.stencilRef = s.stencilRef;
+    this.stencilMask = s.stencilMask;
+    this.stencilSFail = s.stencilSFail;
+    this.stencilZFail = s.stencilZFail;
+    this.stencilZPass = s.stencilZPass;
+
+    this.colorTestEnable = s.colorTestEnable;
+    this.colorTestFunc = s.colorTestFunc;
+    this.colorTestRef = s.colorTestRef;
+    this.colorTestMask = s.colorTestMask;
+
+    this.logicOpEnable = s.logicOpEnable;
+    this.logicOp = s.logicOp;
+
+    this.ditherEnable = s.ditherEnable;
+    this.ditherMatrix.set(s.ditherMatrix);
+
+    this.fogEnable = s.fogEnable;
+    this.fogColor = s.fogColor;
+    this.fogEnd = s.fogEnd;
+    this.fogSlope = s.fogSlope;
+
+    this.patchDivU = s.patchDivU;
+    this.patchDivV = s.patchDivV;
+    this.patchPrimType = s.patchPrimType;
+    this.patchFacing = s.patchFacing;
+
+    this.materialEmissive = s.materialEmissive;
+    this.materialAmbient = s.materialAmbient;
+    this.materialDiffuse = s.materialDiffuse;
+    this.materialSpecular = s.materialSpecular;
+    this.materialAlpha = s.materialAlpha;
+    this.materialSpecCoef = s.materialSpecCoef;
+    this.materialUpdate = s.materialUpdate;
+    this.shadeMode = s.shadeMode;
+    this.reverseNormals = s.reverseNormals;
+
+    this.lightingEnable = s.lightingEnable;
+    this.lightEnable = [...s.lightEnable];
+    this.lightType.set(s.lightType);
+    this.lightMode = s.lightMode;
+    this.lightDir.set(s.lightDir);
+    this.lightAtt.set(s.lightAtt);
+    this.lightSpotExp.set(s.lightSpotExp);
+    this.lightSpotCutoff.set(s.lightSpotCutoff);
+    this.lightAmbientColor.set(s.lightAmbientColor);
+    this.lightDiffuseColor.set(s.lightDiffuseColor);
+    this.lightSpecularColor.set(s.lightSpecularColor);
+    this.ambientColor = s.ambientColor;
+    this.ambientAlpha = s.ambientAlpha;
+
+    this.cullEnable = s.cullEnable;
+    this.cullCW = s.cullCW;
+
+    this.trSrc = s.trSrc;
+    this.trSrcW = s.trSrcW;
+    this.trDst = s.trDst;
+    this.trDstW = s.trDstW;
+    this.trSrcPos = s.trSrcPos;
+    this.trDstPos = s.trDstPos;
+    this.trSize = s.trSize;
+    this.trBpp = s.trBpp;
+
+    this.boneMats.set(s.boneMats);
+    this.boneMatIdx = s.boneMatIdx;
+    this.worldMat.set(s.worldMat);
+    this.viewMat.set(s.viewMat);
+    this.projMat.set(s.projMat);
+    this.worldMatIdx = s.worldMatIdx;
+    this.viewMatIdx = s.viewMatIdx;
+    this.projMatIdx = s.projMatIdx;
+    this.tgenMatIdx = s.tgenMatIdx;
+
+    this.vpScaleX = s.vpScaleX;
+    this.vpScaleY = s.vpScaleY;
+    this.vpScaleZ = s.vpScaleZ;
+    this.vpCenterX = s.vpCenterX;
+    this.vpCenterY = s.vpCenterY;
+    this.vpCenterZ = s.vpCenterZ;
+    this.geOffsetX = s.geOffsetX;
+    this.geOffsetY = s.geOffsetY;
+
+    this.immVscx = s.immVscx;
+    this.immVscy = s.immVscy;
+    this.immVscz = s.immVscz;
+    this.immVtcs = s.immVtcs;
+    this.immVtct = s.immVtct;
+    this.immVtcq = s.immVtcq;
+    this.immCv = s.immCv;
+    this.immFc = s.immFc;
+    this.immScv = s.immScv;
+    this.immBuffer = s.immBuffer.map((v) => GEProcessor.cloneVertex(v));
+    this.immPrim = s.immPrim;
+  }
 }

@@ -48,6 +48,13 @@ export class SyscallException {
   constructor(readonly code: number) {}
 }
 
+export interface CpuScalars {
+  inDelaySlot: boolean;
+  delaySlotTarget: number;
+  pendingSyscall: number;
+  stepFaulted: boolean;
+}
+
 export class AllegrexCPU {
   readonly regs = new AllegrexRegisters();
 
@@ -87,6 +94,24 @@ export class AllegrexCPU {
 
   /** Optional PC watchpoint for debugging — set to non-zero to log registers at that PC. */
   watchPC: number = 0;
+
+  /** Execution-affecting CPU scalars for a save state (registers serialize separately).
+   *  The trace buffer is write-only debug data and isn't captured. */
+  serialize(): CpuScalars {
+    return {
+      inDelaySlot: this.inDelaySlot,
+      delaySlotTarget: this.delaySlotTarget,
+      pendingSyscall: this.pendingSyscall,
+      stepFaulted: this.stepFaulted,
+    };
+  }
+
+  deserialize(s: CpuScalars): void {
+    this.inDelaySlot = s.inDelaySlot;
+    this.delaySlotTarget = s.delaySlotTarget;
+    this.pendingSyscall = s.pendingSyscall;
+    this.stepFaulted = s.stepFaulted;
+  }
 
   /** Execute a single instruction. Returns false if an unrecoverable error occurs.
    *  Kept small so V8 keeps it optimized — the cold paths (fault dumps, watchPC log,

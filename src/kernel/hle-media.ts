@@ -887,5 +887,41 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   kernel.stub(P3DA.sceP3daBridgeExit);
   kernel.stub(P3DA.sceP3daBridgeInit, 1);
 
+  // Save-state: SAS grain, the vtimer table, pending vtimer triggers, and the
+  // registry category handles. VTimerState is all numbers (handlerAddr/commonAddr
+  // are guest addresses, so they stay numbers). vtimerTrampolineWritten tracks
+  // whether the BREAK trampoline was already written to guest RAM.
+  kernel.registerStateModule("media", {
+    save() {
+      return {
+        sasGrainSize,
+        vtimers: [...vtimers.entries()],
+        vtimerTrampolineWritten,
+        pendingVTimerTriggers: pendingVTimerTriggers.slice(),
+        regCatHandleGen,
+        regOpenCategories: [...regOpenCategories.entries()],
+      };
+    },
+    load(data) {
+      const d = data as {
+        sasGrainSize: number;
+        vtimers: [number, VTimerState][];
+        vtimerTrampolineWritten: boolean;
+        pendingVTimerTriggers: number[];
+        regCatHandleGen: number;
+        regOpenCategories: [number, string][];
+      };
+      sasGrainSize = d.sasGrainSize;
+      vtimers.clear();
+      for (const [k, v] of d.vtimers) vtimers.set(k, v);
+      vtimerTrampolineWritten = d.vtimerTrampolineWritten;
+      pendingVTimerTriggers.length = 0;
+      pendingVTimerTriggers.push(...d.pendingVTimerTriggers);
+      regCatHandleGen = d.regCatHandleGen;
+      regOpenCategories.clear();
+      for (const [k, v] of d.regOpenCategories) regOpenCategories.set(k, v);
+    },
+  });
+
   log.info("Media HLE handlers registered");
 }

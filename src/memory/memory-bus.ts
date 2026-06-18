@@ -1,5 +1,14 @@
 import { MemoryRegion, toPhysical } from "./memory-map.js";
 
+/** Copy a save-state region into a memory array, refusing a size mismatch so a
+ *  truncated or wrong-layout state fails loudly instead of leaving stale bytes. */
+function loadExact(dst: Uint8Array, src: Uint8Array, name: string): void {
+  if (src.length !== dst.length) {
+    throw new Error(`save state ${name} is ${src.length} bytes, expected ${dst.length}`);
+  }
+  dst.set(src);
+}
+
 /**
  * MemoryBus
  *
@@ -81,6 +90,15 @@ export class MemoryBus {
 
   get ramBuffer(): Uint8Array { return this.ram; }
   get vramBuffer(): Uint8Array { return this.vram; }
+  get scratchpadBuffer(): Uint8Array { return this.scratchpad; }
+
+  // ── save-state bulk loads ───────────────────────────────────────────────
+  // Copy bytes into the existing arrays so the DataView/Uint32Array views stay
+  // valid (no need to rebuild them).
+
+  loadRam(bytes: Uint8Array): void { loadExact(this.ram, bytes, "RAM"); }
+  loadVram(bytes: Uint8Array): void { loadExact(this.vram, bytes, "VRAM"); }
+  loadScratchpad(bytes: Uint8Array): void { loadExact(this.scratchpad, bytes, "scratchpad"); }
 
   // ── address classification ─────────────────────────────────────────────
 

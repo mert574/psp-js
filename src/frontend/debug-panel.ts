@@ -9,6 +9,7 @@ import "./debug/threads-panel.js";
 import "./debug/memory-panel.js";
 import "./debug/ge-panel.js";
 import "./debug/savedata-panel.js";
+import "./debug/savestate-panel.js";
 import "./debug/stubs-panel.js";
 import "./debug/log-panel.js";
 import type { PerfPanel } from "./debug/perf-panel.js";
@@ -17,6 +18,7 @@ import type { ThreadsPanel } from "./debug/threads-panel.js";
 import type { MemoryPanel } from "./debug/memory-panel.js";
 import type { GePanel } from "./debug/ge-panel.js";
 import type { SavedataPanel } from "./debug/savedata-panel.js";
+import type { SavestatePanel } from "./debug/savestate-panel.js";
 import type { StubsPanel } from "./debug/stubs-panel.js";
 import type { LogPanel } from "./debug/log-panel.js";
 
@@ -53,7 +55,7 @@ sheet.replaceSync(`
   /* The section sub-components render in light DOM; contents makes their tag
      transparent so each <section> lays out directly in the panel's flex column. */
   perf-panel, gldraw-panel, threads-panel, memory-panel,
-  ge-panel, savedata-panel, stubs-panel, log-panel { display: contents; }
+  ge-panel, savedata-panel, savestate-panel, stubs-panel, log-panel { display: contents; }
 
   @media (max-width: 900px) {
     :host {
@@ -501,6 +503,7 @@ export class DebugPanel extends LitElement {
   #memory: MemoryPanel | null = null;
   #ge: GePanel | null = null;
   #savedata: SavedataPanel | null = null;
+  #savestate: SavestatePanel | null = null;
   #stubs: StubsPanel | null = null;
   #log: LogPanel | null = null;
 
@@ -524,6 +527,7 @@ export class DebugPanel extends LitElement {
       <memory-panel></memory-panel>
       <ge-panel></ge-panel>
       <savedata-panel></savedata-panel>
+      <savestate-panel></savestate-panel>
       <stubs-panel></stubs-panel>
       <log-panel></log-panel>
     `;
@@ -537,6 +541,7 @@ export class DebugPanel extends LitElement {
     this.#memory   = r.querySelector("memory-panel");
     this.#ge       = r.querySelector("ge-panel");
     this.#savedata = r.querySelector("savedata-panel");
+    this.#savestate = r.querySelector("savestate-panel");
     this.#stubs    = r.querySelector("stubs-panel");
     this.#log      = r.querySelector("log-panel");
     // Apply the profiler flag now that the children exist.
@@ -560,6 +565,7 @@ export class DebugPanel extends LitElement {
     this.#memory?.tick(emu, now);
     this.#ge?.tick(emu, now);
     this.#savedata?.tick(emu, now);
+    this.#savestate?.tick(emu, now);
     this.#stubs?.tick(emu, now);
     this.#log?.tick(now);
   }
@@ -581,6 +587,7 @@ export class DebugPanel extends LitElement {
     this.#memory?.reset();
     this.#ge?.reset();
     this.#savedata?.reset();
+    this.#savestate?.reset();
     this.#stubs?.reset();
     this.#log?.reset();
   }
