@@ -259,7 +259,7 @@ export class WebGLGERenderer {
   // ~140ms/frame on draw-heavy scenes (GoW's intro submits ~8k draws/frame). Cache
   // the attribute locations and bind the pipeline once; present()/blitVFB() switch
   // program+buffer, so they reset gePipelineBound.
-  private geAttribLocs: { pos: number; uv: number; col: number; fog: number } | null = null;
+  private geAttribLocs: { pos: number; uv: number; col: number; fog: number; clipw: number } | null = null;
   private gePipelineBound = false;
   // Last texture + sampler-state (filter/wrap) signature applied, so a run of draws
   // using the same texture and sampler skips the 4 per-draw texParameteri calls
@@ -312,6 +312,15 @@ export class WebGLGERenderer {
   private displayFbAddr = 0;
   private displayFbWidth = 512;
   private displayFbFormat = 3;
+  // Addresses that have been used as the scanout (display) buffer recently. Frame
+  // skip suppresses draws only to these — never to off-screen render targets, which
+  // feed later frames. Double/triple buffering rotates through a few addresses.
+  private scanoutAddrs: number[] = [];
+  // The scanout buffer that most recently received a real (non-skipped) draw. With
+  // double buffering the game draws the fresh frame to the back buffer and only
+  // makes it the display buffer next frame, so when frame-skipping we present this
+  // instead of the lagged display address (which may be a skipped, black frame).
+  private lastDrawnScanout = 0;
 
   // Fallback texture for presenting RAM/VRAM bytes when no VFB exists
   // PPSSPP FramebufferManagerCommon.cpp DrawFramebufferToOutput
@@ -437,14 +446,16 @@ export class WebGLGERenderer {
         uv: gl.getAttribLocation(p, "a_texcoord"),
         col: gl.getAttribLocation(p, "a_color"),
         fog: gl.getAttribLocation(p, "a_fogCoef"),
+        clipw: gl.getAttribLocation(p, "a_clipw"),
       };
     }
-    const stride = FLOATS_PER_VERT * 4; // 10 floats * 4 bytes = 40 bytes
+    const stride = FLOATS_PER_VERT * 4; // 11 floats * 4 bytes = 44 bytes
     const a = this.geAttribLocs;
     gl.enableVertexAttribArray(a.pos); gl.vertexAttribPointer(a.pos, 3, gl.FLOAT, false, stride, 0);
     if (a.uv >= 0)  { gl.enableVertexAttribArray(a.uv);  gl.vertexAttribPointer(a.uv, 2, gl.FLOAT, false, stride, 12); }
     if (a.col >= 0) { gl.enableVertexAttribArray(a.col); gl.vertexAttribPointer(a.col, 4, gl.FLOAT, false, stride, 20); }
     if (a.fog >= 0) { gl.enableVertexAttribArray(a.fog); gl.vertexAttribPointer(a.fog, 1, gl.FLOAT, false, stride, 36); }
+    if (a.clipw >= 0) { gl.enableVertexAttribArray(a.clipw); gl.vertexAttribPointer(a.clipw, 1, gl.FLOAT, false, stride, 40); }
     // Sampler always reads texture unit 0 (set once with the rest of the pipeline).
     gl.uniform1i(gl.getUniformLocation(this.geProgram.program, "u_texture"), 0);
     this.gePipelineBound = true;
@@ -632,10 +643,17 @@ export class WebGLGERenderer {
     vertices: Vertex[],
     state: GEDrawState,
     bus: MemoryBus,
+    skipScanout = false,
   ): void {
     const gl = this.gl;
 
     const renderAddr = this.normFb(state.fbPtr);
+    const isScanout = this.scanoutAddrs.includes(renderAddr);
+    // Frame skip: drop draws to the on-screen (scanout) buffer only. Draws to
+    // off-screen render targets still run, because later frames sample them — and
+    // keeping them drawn marks their VFBs as used so decimateVFBs won't evict them.
+    if (skipScanout && isScanout) return;
+    if (isScanout) this.lastDrawnScanout = renderAddr;
     let glPrim: number;
     if (primType === 1 || primType === 2) {
       glPrim = gl.LINES;
@@ -867,7 +885,7 @@ export class WebGLGERenderer {
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
   }
 
-  presentToScreen(): void {
+  presentToScreen(preferLastDrawnScanout = false): void {
     this.flush(); // draw any pending geometry before presenting
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -902,7 +920,12 @@ export class WebGLGERenderer {
 
     // PPSSPP PrepareCopyDisplayToOutput: find VFB at display address.
     // If found, present FBO texture. If not, fall back to VRAM bytes.
-    const displayAddr = this.displayFbAddr;
+    // When frame-skipping, the lagged display address may point at a skipped (black)
+    // buffer; prefer the buffer the batch actually rendered to if we have a VFB for it.
+    let displayAddr = this.displayFbAddr;
+    if (preferLastDrawnScanout && this.lastDrawnScanout && this.vfbs.has(this.lastDrawnScanout)) {
+      displayAddr = this.lastDrawnScanout;
+    }
     const displayVfb = displayAddr ? this.vfbs.get(displayAddr) : null;
     this._dbgDisplayPath = displayVfb ? "vfb" : (displayAddr && this.vramRef ? "vram" : "none");
 
@@ -1325,6 +1348,13 @@ export class WebGLGERenderer {
     this.displayFbAddr = this.normFb(addr);
     this.displayFbWidth = width || 512;
     this.displayFbFormat = format;
+    // Remember it as a scanout buffer (frame skip only suppresses draws to these).
+    // Keep a few recent distinct addresses for double/triple buffering; cap so a
+    // scene change can't keep stale render-target addresses in the skip set.
+    if (this.displayFbAddr !== 0 && !this.scanoutAddrs.includes(this.displayFbAddr)) {
+      this.scanoutAddrs.push(this.displayFbAddr);
+      if (this.scanoutAddrs.length > 4) this.scanoutAddrs.shift();
+    }
   }
 
   /** Get the WebGL context (shared with FramebufferRenderer if needed). */
@@ -1435,6 +1465,9 @@ export class WebGLGERenderer {
 
     // Fog coefficient (pre-computed per vertex, 1.0 = no fog, 0.0 = full fog)
     d[base + 9] = v.fogCoef;
+
+    // Clip-space w for perspective-correct texture interpolation (1.0 for 2D).
+    d[base + 10] = v.clipw;
 
     this.vertexCount++;
   }
