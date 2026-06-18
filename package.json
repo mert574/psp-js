@@ -9,16 +9,24 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "dev": "vite",
-    "build:web": "vite build"
+    "dev:all": "concurrently -k -n app,docs -c blue,green \"vite\" \"vitepress dev docs --port 5174 --strictPort\"",
+    "build:web": "vite build",
+    "docs:dev": "vitepress dev docs --port 5174 --strictPort",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs",
+    "docs:shots": "node tools/docs-shots.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "concurrently": "^10.0.3",
+    "playwright": "^1.61.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vite": "^8.0.16",
+    "vitepress": "^1.6.4",
     "vitest": "^4.1.8"
   },
   "dependencies": {
@@ -26,6 +34,7 @@
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
     "@libav.js/types": "^6.8.8",
+    "gsap": "^3.15.0",
     "libav.js": "^6.8.8",
     "libavjs-webcodecs-bridge": "^0.3.2",
     "lit": "^3.3.3",
