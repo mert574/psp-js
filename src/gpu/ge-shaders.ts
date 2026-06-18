@@ -7,14 +7,15 @@
  * pixel coordinates to clip space.
  */
 
-// 10 floats per vertex: x, y, z, u, v, r, g, b, a, fogCoef
-export const FLOATS_PER_VERT = 10;
+// 11 floats per vertex: x, y, z, u, v, r, g, b, a, fogCoef, clipw
+export const FLOATS_PER_VERT = 11;
 
 export const VS_GE = `
 attribute vec3 a_position;
 attribute vec2 a_texcoord;
 attribute vec4 a_color;
 attribute float a_fogCoef;
+attribute float a_clipw;
 
 uniform vec2 u_resolution;
 
@@ -23,12 +24,27 @@ varying vec4 v_color;
 varying float v_fogCoef;
 
 void main() {
-  // Screen pixels → clip space: x [0,W]→[-1,1], y [0,H]→[1,-1] (PSP Y-down)
+  // Screen pixels → screen-NDC: x [0,W]→[-1,1], y [0,H]→[1,-1] (PSP Y-down)
   vec2 ndc = (a_position.xy / u_resolution) * 2.0 - 1.0;
   ndc.y = -ndc.y;
-  // Z: PSP depth [0,1] maps to WebGL depth [-1,1]
-  float z = a_position.z * 2.0 - 1.0;
-  gl_Position = vec4(ndc, z, 1.0);
+  // Z: PSP depth [0,1] maps to WebGL depth [-1,1]. Quantize to the PSP's 16-bit
+  // depth resolution first — games draw 2D layers at very close but distinct z
+  // values that all land on the same 16-bit Z, so GEQUAL/LEQUAL act as a no-op
+  // (painter's order). Our depth buffer is 24-bit, which would otherwise keep
+  // those tiny differences and reject the later, slightly-nearer layers.
+  float z16 = floor(a_position.z * 65535.0 + 0.5) / 65535.0;
+  float z = z16 * 2.0 - 1.0;
+  // Positions arrive pre-divided to screen space, with the original clip-space w
+  // in a_clipw. Scaling the screen-NDC clip position by w rebuilds a true
+  // clip-space coordinate (w cancels the 1/w baked into the pre-divide, so this
+  // stays linear in the original clip coords even for behind-camera verts). The
+  // GPU then (a) does the perspective divide back to the same screen position,
+  // (b) interpolates texcoord/color/fog perspective-correctly — no more texture
+  // swim — and (c) clips at the near plane (w<=0), so behind-camera and
+  // camera-straddling triangles are clipped instead of smearing. a_clipw is 1.0
+  // for 2D/through-mode, so those stay exactly as before.
+  float w = a_clipw;
+  gl_Position = vec4(ndc * w, z * w, w);
   v_texcoord = a_texcoord;
   v_color = a_color;
   v_fogCoef = a_fogCoef;

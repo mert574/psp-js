@@ -145,11 +145,11 @@ describe("GEProcessor", () => {
 
       ge.executeList(LIST_ADDR, 0);
 
-      // Red vertex stored as [B=0, G=0, R=0xFF, A=0xFF]
+      // Hardware R/B order (977ac7f): byte0=R, byte2=B. Red → [R=0xFF, G=0, B=0, A=0xFF]
       const vram = bus.vramBuffer;
-      expect(vram[0]).toBe(0x00); // B of vertex
+      expect(vram[0]).toBe(0xFF); // R of vertex
       expect(vram[1]).toBe(0x00); // G
-      expect(vram[2]).toBe(0xFF); // R of vertex
+      expect(vram[2]).toBe(0x00); // B of vertex
       expect(vram[3]).toBe(0xFF); // A
     });
   });
@@ -250,11 +250,10 @@ describe("GEProcessor", () => {
 
       const vram = bus.vramBuffer;
       // Pixel (0,0): sprite uses v1 color (RED_ABGR = R=0xFF, G=0, B=0, A=0xFF).
-      // writePixel stores bytes as [B_vertex, G_vertex, R_vertex, A] so the
-      // shader swizzle (c.b, c.g, c.r, c.a) produces correct RGB on screen.
-      expect(vram[0]).toBe(0x00); // B of vertex → byte0
+      // writePixel stores hardware R/B order (977ac7f): [R, G, B, A], no present swizzle.
+      expect(vram[0]).toBe(0xFF); // R of vertex → byte0
       expect(vram[1]).toBe(0x00); // G
-      expect(vram[2]).toBe(0xFF); // R of vertex → byte2 → displayed as Red
+      expect(vram[2]).toBe(0x00); // B of vertex → byte2
       expect(vram[3]).toBe(0xFF); // A
     });
 
@@ -284,11 +283,11 @@ describe("GEProcessor", () => {
 
       const vram = bus.vramBuffer;
       // Check middle of screen — cyan: R=0xFF, G=0xFF, B=0, A=0xFF
-      // writePixel swaps R/B: stored as [B=0, G=0xFF, R=0xFF, A=0xFF]
+      // Hardware R/B order (977ac7f): stored as [R=0xFF, G=0xFF, B=0, A=0xFF]
       const mid = (136 * 512 + 240) * 4;
-      expect(vram[mid]).toBe(0x00);     // B of vertex → byte0
+      expect(vram[mid]).toBe(0xFF);     // R of vertex → byte0
       expect(vram[mid + 1]).toBe(0xFF); // G
-      expect(vram[mid + 2]).toBe(0xFF); // R of vertex → byte2
+      expect(vram[mid + 2]).toBe(0x00); // B of vertex → byte2
       expect(vram[mid + 3]).toBe(0xFF); // A
     });
   });
@@ -366,11 +365,11 @@ describe("GEProcessor", () => {
 
       ge.executeList(LIST_ADDR, 0);
 
-      // Blue: stored as [B=0xFF, G=0, R=0, A=0xFF]
+      // Blue: hardware R/B order (977ac7f) stores [R=0, G=0, B=0xFF, A=0xFF]
       const vram = bus.vramBuffer;
-      expect(vram[0]).toBe(0xFF); // B of vertex → byte0
+      expect(vram[0]).toBe(0x00); // R of vertex → byte0
       expect(vram[1]).toBe(0x00); // G
-      expect(vram[2]).toBe(0x00); // R of vertex
+      expect(vram[2]).toBe(0xFF); // B of vertex → byte2
       expect(vram[3]).toBe(0xFF); // A
     });
   });
@@ -498,11 +497,11 @@ describe("GEProcessor", () => {
 
       ge.executeList(LIST_ADDR, 0);
 
-      // Blue stored as [B=0xFF, G=0, R=0, A=0xFF] at VRAM offset 0
+      // Blue: hardware R/B order (977ac7f) stores [R=0, G=0, B=0xFF, A=0xFF] at VRAM offset 0
       const vram = bus.vramBuffer;
-      expect(vram[0]).toBe(0xFF); // B of vertex → byte0
+      expect(vram[0]).toBe(0x00); // R of vertex → byte0
       expect(vram[1]).toBe(0x00); // G
-      expect(vram[2]).toBe(0x00); // R of vertex
+      expect(vram[2]).toBe(0xFF); // B of vertex → byte2
       expect(vram[3]).toBe(0xFF); // A
     });
   });

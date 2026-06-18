@@ -185,18 +185,26 @@ export function readVertices(
         // PPSSPP Step_PosS8Through: 8-bit through positions always decode to 0.
         v.x = 0; v.y = 0; v.z = 0; off += 3;
       } else {
-        v.x = (bus.readU8(vAddr + off) << 24) >> 24; off++;
-        v.y = (bus.readU8(vAddr + off) << 24) >> 24; off++;
-        v.z = (bus.readU8(vAddr + off) << 24) >> 24; off++;
+        // Transform mode: PPSSPP Step_PosS8 normalizes by 1/128 (the model/world
+        // matrix carries the real scale). Reading raw makes s8 models 128x too big.
+        v.x = ((bus.readU8(vAddr + off) << 24) >> 24) / 128.0; off++;
+        v.y = ((bus.readU8(vAddr + off) << 24) >> 24) / 128.0; off++;
+        v.z = ((bus.readU8(vAddr + off) << 24) >> 24) / 128.0; off++;
       }
     } else if (posFmt === 2) { // s16
       align2();
-      v.x = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
-      v.y = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
       if (through) {
+        v.x = (bus.readU16(vAddr + off) << 16) >> 16; off += 2; // raw screen pixels
+        v.y = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
         v.z = bus.readU16(vAddr + off) / 65535.0; off += 2; // unsigned u16 → [0,1]
       } else {
-        v.z = (bus.readU16(vAddr + off) << 16) >> 16; off += 2;
+        // Transform mode: PPSSPP Step_PosS16 normalizes by 1/32768 (the model/world
+        // matrix carries the real scale). Reading raw made s16 models 32768x too big,
+        // e.g. Burnout/Ridge Racer cars (s16 verts + a ~600x world matrix) blew up into
+        // screen-filling blobs that occluded the scene.
+        v.x = ((bus.readU16(vAddr + off) << 16) >> 16) / 32768.0; off += 2;
+        v.y = ((bus.readU16(vAddr + off) << 16) >> 16) / 32768.0; off += 2;
+        v.z = ((bus.readU16(vAddr + off) << 16) >> 16) / 32768.0; off += 2;
       }
     } else if (posFmt === 3) { // float
       align4();

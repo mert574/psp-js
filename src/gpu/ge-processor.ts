@@ -1053,8 +1053,10 @@ export class GEProcessor {
         case 0x4B: this.texOffsetV = getFloat24(param); break;
 
         // ── Screen offset ────────────────────────────────────────
-        case 0x4C: this.geOffsetX = param; break; // OFFSET_X (1/16 pixel units)
-        case 0x4D: this.geOffsetY = param; break; // OFFSET_Y
+        // PPSSPP GPUState.h getOffsetX16/getOffsetY16: only the low 16 bits are
+        // the offset; high bits of the 24-bit param are ignored.
+        case 0x4C: this.geOffsetX = param & 0xFFFF; break; // OFFSET_X (1/16 pixel units)
+        case 0x4D: this.geOffsetY = param & 0xFFFF; break; // OFFSET_Y
         case 0x4E: case 0x4F: break; // unknown/unused
 
         // ── Shade model (0x50), misc ─────────────────────────────
@@ -1487,7 +1489,6 @@ export class GEProcessor {
       const doLighting = this.lightingEnable;
       const ls = doLighting ? this.lightState : null;
       const hasVColor = colorFmt !== 0;
-      const normFmt = (vtype >>> 5) & 3;
 
       for (const v of tessVerts) {
         // Tessellated vertices are in model space — apply full pipeline
@@ -1504,7 +1505,9 @@ export class GEProcessor {
         if (nLen > 1e-6) { wnx /= nLen; wny /= nLen; wnz /= nLen; }
         else { wnx = 0; wny = 0; wnz = 1; }
 
-        if (ls && (normFmt !== 0 || kind === "bezier" || kind === "spline")) {
+        // PPSSPP lights whenever lighting is enabled, regardless of normals (patch
+        // verts always carry a generated normal; others fall back to the (0,0,1) above).
+        if (ls) {
           v.color = computeVertexLighting(ls, [wx, wy, wz], [wnx, wny, wnz], v.color, hasVColor);
         }
 
@@ -1580,19 +1583,29 @@ export class GEProcessor {
         const wy = wm[1]!*bx + wm[4]!*by + wm[7]!*bz + wm[10]!;
         const wz = wm[2]!*bx + wm[5]!*by + wm[8]!*bz + wm[11]!;
 
-        // World-space normal (rotation only, no translation)
-        let wnx = wm[0]!*v.nx + wm[3]!*v.ny + wm[6]!*v.nz;
-        let wny = wm[1]!*v.nx + wm[4]!*v.ny + wm[7]!*v.nz;
-        let wnz = wm[2]!*v.nx + wm[5]!*v.ny + wm[8]!*v.nz;
-        // NormalizeOr001
-        const nLen = Math.sqrt(wnx*wnx + wny*wny + wnz*wnz);
-        if (nLen > 1e-6) {
-          wnx /= nLen; wny /= nLen; wnz /= nLen;
+        // World-space normal (rotation only, no translation). When the vertex has no
+        // normal, PPSSPP leaves worldnormal at (0,0,1) un-transformed (SoftwareTransformCommon.cpp:227,243).
+        let wnx: number, wny: number, wnz: number;
+        if (normFmt !== 0) {
+          wnx = wm[0]!*v.nx + wm[3]!*v.ny + wm[6]!*v.nz;
+          wny = wm[1]!*v.nx + wm[4]!*v.ny + wm[7]!*v.nz;
+          wnz = wm[2]!*v.nx + wm[5]!*v.ny + wm[8]!*v.nz;
+          // NormalizeOr001
+          const nLen = Math.sqrt(wnx*wnx + wny*wny + wnz*wnz);
+          if (nLen > 1e-6) {
+            wnx /= nLen; wny /= nLen; wnz /= nLen;
+          } else {
+            wnx = 0; wny = 0; wnz = 1;
+          }
         } else {
           wnx = 0; wny = 0; wnz = 1;
         }
 
-        if (ls && normFmt !== 0) {
+        // PPSSPP lights a vertex whenever lighting is enabled, even with no normal
+        // (using the (0,0,1) default above) — SoftwareTransformCommon.cpp:251. Skipping
+        // it left no-normal models showing their raw vertex color, e.g. black cars in
+        // Ridge Racer that modulate a texture to black.
+        if (ls) {
           v.color = computeVertexLighting(
             ls, [wx, wy, wz], [wnx, wny, wnz], v.color, hasVertexColor,
           );
@@ -1666,9 +1679,9 @@ export class GEProcessor {
       this.lastDrawFbPtr = this.fbPtr;
       this.lastDrawFbWidth = this.fbWidth;
       this.lastDrawFbFormat = this.fbFormat;
-      if (!this.skipDraw) {
-        this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
-      }
+      // Frame skip: pass skipDraw so the renderer drops only scanout-buffer draws,
+      // not render-to-texture draws that later frames sample.
+      this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus, this.skipDraw);
       return;
     }
 
@@ -2028,7 +2041,9 @@ export class GEProcessor {
         this.clearColorWrite, this.clearAlphaWrite, this.clearDepthWrite,
         this.fbPtr, this.fbFormat, this.fbWidth || 512,
         // PSP clear mode writes the rect's own z to depth (here already in [0,1]).
-        Math.max(0, Math.min(1, v1.z)),
+        // Quantize to 16-bit so the cleared depth lands on the same grid the GE
+        // vertex shader uses, matching the PSP's 16-bit Z buffer.
+        Math.round(Math.max(0, Math.min(1, v1.z)) * 65535) / 65535,
       );
       return;
     }
@@ -2266,9 +2281,7 @@ export class GEProcessor {
 
     // WebGL path for immediate mode
     if (this.webglRenderer) {
-      if (!this.skipDraw) {
-        this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
-      }
+      this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus, this.skipDraw);
       return;
     }
 
