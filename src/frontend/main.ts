@@ -156,6 +156,46 @@ let optionsScreenReady = false;
 let pendingDirFiles: Map<string, Uint8Array> | null = null;
 let pendingStartDir: string | null = null;
 
+/** Build the renderer for the current dropdown choice. Each renderer sizes the
+ *  canvas backing store itself (WebGL to scale×, software to native), so the
+ *  store stays correct when switching between them. Sets the module-level
+ *  `renderer` (software) or `geRenderer` (WebGL); assumes both are already null. */
+function setupRenderer(canvas: HTMLCanvasElement): void {
+  if (isSoftwareRenderer()) {
+    renderer = new FramebufferRenderer(canvas);
+  } else {
+    geRenderer = new WebGLGERenderer(canvas);
+    geRenderer.setResolutionScale(resolutionScale());
+  }
+}
+
+/** Wire the freshly-built WebGL renderer into the running GE. No-op for software
+ *  (geRenderer null), GE draws fall back to the software rasterizer. */
+function attachActiveRenderer(): void {
+  if (!emulator || !geRenderer) return;
+  emulator.hle.ensureGeProcessor().webglRenderer = geRenderer;
+  geRenderer.setVRAM(emulator.bus.vramBuffer);
+}
+
+/** Switch the active renderer live, without rebooting the game. Runs from the
+ *  dropdown's change handler (between frames, so never mid-present). The renderers
+ *  keep pixels in different places (WebGL in FBOs, software in VRAM), so expect a
+ *  couple of frames of stale content while the game redraws into the new target. */
+function switchRenderer(): void {
+  if (!emulator) return; // only meaningful while a game is running
+  const canvas = document.getElementById("psp-canvas") as HTMLCanvasElement;
+  geRenderer?.destroy();
+  geRenderer = null;
+  renderer?.destroy();
+  renderer = null;
+  // Detach from the GE before swapping; GE draws fall back to the software
+  // rasterizer whenever webglRenderer is null.
+  const ge = emulator.hle.geProcessor;
+  if (ge) ge.webglRenderer = null;
+  setupRenderer(canvas);
+  attachActiveRenderer();
+}
+
 // ── Debug: ?homebrew=<dir> loads a served directory-homebrew from public/ ────
 // Mirrors the library flow (loadCompanionFiles → disc0:/ + start dir) without
 // the native directory picker, so scripted sessions can boot homebrew like Duke3D.
@@ -202,6 +242,17 @@ fileInputEboot?.addEventListener("change", () => {
 // ── Buttons ───────────────────────────────────────────────────────────────────
 bootBtn.addEventListener("click", () => bootGame());
 
+// Live renderer switch: the options dropdown applies immediately while a game
+// runs (no reboot). Before boot it's a no-op, setupRenderer reads the value then.
+document.getElementById("renderer-select")?.addEventListener("change", () => switchRenderer());
+// The options screen is hidden in-game, so the debug panel offers the same switch.
+// It flips the dropdown (the source of truth) so the choice sticks across reboots.
+document.getElementById("debug-panel")?.addEventListener("renderer-toggle", () => {
+  const sel = document.getElementById("renderer-select") as HTMLSelectElement | null;
+  if (sel) sel.value = sel.value === "software" ? "webgl" : "software";
+  switchRenderer();
+});
+
 function bootGame(): void {
   if (!ebootBytes) {
     showError("No EBOOT.BIN found in this ISO — cannot boot.");
@@ -223,14 +274,9 @@ function bootGame(): void {
 
   const canvas = document.getElementById("psp-canvas") as HTMLCanvasElement;
 
-  // Renderer choice applies on boot: WebGL draws GE primitives on the GPU,
-  // software rasterizes into VRAM and we present VRAM bytes each frame.
-  if (isSoftwareRenderer()) {
-    renderer = new FramebufferRenderer(canvas);
-  } else {
-    geRenderer = new WebGLGERenderer(canvas);
-    geRenderer.setResolutionScale(resolutionScale());
-  }
+  // WebGL draws GE primitives on the GPU; software rasterizes into VRAM and we
+  // present VRAM bytes each frame. Switchable live via the dropdown (see below).
+  setupRenderer(canvas);
   // <debug-panel> is a persistent custom element in the DOM; grab it and reset
   // its per-game state rather than constructing a new (unattached) instance.
   debugPanel = document.querySelector<DebugPanel>("debug-panel");
@@ -369,10 +415,7 @@ function bootGame(): void {
     await emulator!.initWorker();
 
     // Attach WebGL renderer to the GE processor for GPU-accelerated rendering
-    if (geRenderer) {
-      emulator!.hle.ensureGeProcessor().webglRenderer = geRenderer;
-      geRenderer.setVRAM(emulator!.bus.vramBuffer);
-    }
+    attachActiveRenderer();
 
     startRafLoop();
   })();

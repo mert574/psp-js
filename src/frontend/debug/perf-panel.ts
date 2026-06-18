@@ -35,6 +35,13 @@ export class PerfPanel extends SubPanel {
     return html`<section class="section"><h4>Performance</h4><div class="perf">${this.tpl}</div></section>`;
   }
 
+  // The options screen (which owns the renderer dropdown) is hidden in-game, so
+  // the panel offers a live switch. main.ts listens for this on the debug-panel
+  // host; composed/bubbles carry it out through the shadow boundary.
+  #onToggleRenderer = (): void => {
+    this.dispatchEvent(new CustomEvent("renderer-toggle", { bubbles: true, composed: true }));
+  };
+
   markStarted(): void { this.#emulationStarted = true; }
 
   reset(): void {
@@ -104,6 +111,13 @@ export class PerfPanel extends SubPanel {
     for (const blk of emu.hle.memBlocks.values()) ramUsed += blk.size;
     const ramTotal = emu.hle.ramSize || PSP_RAM_BYTES;
     const ramPct   = Math.min(100, Math.round((ramUsed / ramTotal) * 100));
+    // Actual renderer doing the work, read from the live GE state (NOT the boot
+    // dropdown, which can drift from what actually booted): the WebGL GE renderer
+    // is attached to geProcessor.webglRenderer only on the WebGL path, and the
+    // present path uses it iff it's set. Null GE = nothing rendered yet.
+    const ge = emu.hle.geProcessor;
+    const activeRenderer = ge ? (ge.webglRenderer ? "WebGL" : "Software") : "-";
+
     const cpuColor = cpuPct < 70 ? "var(--ok)" : cpuPct < 90 ? "var(--warn)" : "var(--danger)";
     const gpuColor = "#a371f7"; // emulated-GE bar: a fixed hue, distinct from CPU and RAM
     const ramUsedMB  = (ramUsed / 1048576).toFixed(1);
@@ -127,6 +141,10 @@ export class PerfPanel extends SubPanel {
         <div class="top"><span class="label">RAM</span><span class="val">${ramUsedMB} / ${ramTotalMB} MB</span></div>
         <span class="bar" style="--pct:${ramPct}%;--clr:#4a9eff"></span>
       </div>
+      <div class="stat wide"><div class="top"><span class="label">Renderer</span>
+        <button class="val" title="Switch renderer (live)" @click=${this.#onToggleRenderer}
+          style="cursor:pointer;background:none;border:none;padding:0;text-decoration:underline dotted">${activeRenderer}</button>
+      </div></div>
       <div class="stat"><span class="label">Prims / s</span><span class="val">${primsPerSec.toLocaleString()}</span></div>
       <div class="stat"><span class="label">Lists / s</span><span class="val">${listsPerSec.toLocaleString()}</span></div>
       <div class="stat"><span class="label">IO ops / s</span><span class="val">${ioPerSec.toLocaleString()}</span></div>
