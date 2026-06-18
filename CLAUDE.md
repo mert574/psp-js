@@ -19,12 +19,19 @@ npx vitest run src/timing/ # Run specific test directory
 npm run dev                # Vite dev server (browser frontend) — serves with COOP/COEP for SharedArrayBuffer
 npm run build              # TypeScript compilation (tsc)
 npm run build:web          # Vite production build to dist-web/
+npm run docs:dev           # VitePress docs dev server (port 5174)
+npm run docs:build         # Build the docs site to docs/.vitepress/dist
+npm run dev:all            # Run the app and the docs together (docs proxied under /docs/)
 npx tsx tools/boot-iso.ts test/fixtures/puzzle-bobble.iso 100   # Boot ISO for N frames (headless, node)
 npx tsx tools/game-diag.ts test/fixtures/gta.iso                # Headless game diagnostics
 npx tsx tools/find-dup-nids.ts                                  # Check for duplicate NID values
 ```
 
 The dev/preview server must send `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (configured in `vite.config.ts`) — without these, `SharedArrayBuffer` is unavailable and the GE worker can't run.
+
+## Documentation
+
+A VitePress docs site lives in `docs/`: end-user guide, per-subsystem and per-HLE-module reference, CPU/GE opcode references, and an architecture animation. CI builds it and publishes it under `/psp-js/docs/` next to the app (see `.github/workflows/deploy-pages.yml`). When you change emulated behavior, update the matching page so the docs stay accurate.
 
 ## Architecture
 

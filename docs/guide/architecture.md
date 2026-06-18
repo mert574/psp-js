@@ -20,7 +20,15 @@ The CPU, kernel, memory, and GE are all **renderer-agnostic** and run identicall
 
 ## One frame, step by step
 
-A "frame" here is one call to `runFrame()` followed by presenting the result. There is no single hardware cycle to watch; instead the CPU runs in slices and the GE and timing run alongside it, thousands of instructions per displayed frame. The animation below follows the real dataflow: MIPS instructions stream through the CPU (fetch, decode, execute); now and then a SYSCALL peels off into the HLE kernel and the result returns; the kernel feeds GE display-list commands to the GEProcessor, which rasterizes into a framebuffer; CoreTiming advances a clock the whole time. The CPU, kernel and GE keep cycling like this until the scheduled VBlank event is due, and only then is the framebuffer presented to the screen, which kicks off the next frame.
+A "frame" here is one call to `runFrame()` followed by presenting the result. There is no single hardware cycle to watch; instead the CPU runs in slices and the GPU and timing run alongside it, thousands of instructions per displayed frame. The animation below is the real dataflow, and the moving dots are data and control passing between the parts (hover any box for a one-line description). Solid arrows carry data; the dashed ones are control signals: the syscall trap, and the timer events that wake the CPU and fire the present.
+
+Read it as two columns either side of the shared `MemoryBus` (RAM holds code, GE display lists and vertices; VRAM holds the framebuffer):
+
+- **Left, the execution side.** `CoreTiming` fires the VBlank event the render thread was waiting on, which wakes it. The `AllegrexCPU` then runs fetch, decode, execute slices, loading and storing against RAM as it goes. When the game makes a system call, a SYSCALL traps up into the `HLEKernel`, which itself reads the call's arguments from RAM and writes results back.
+
+- **Right, the graphics side.** To draw, the game builds a GE display list in RAM and the kernel dispatches it to the `GEProcessor`, the PSP's GPU. The GPU reads that list and the vertices from RAM and writes pixels into the VRAM framebuffer. The CPU never calls the GPU directly; they meet through the dispatch and shared memory.
+
+`CoreTiming` advances a clock the whole time and only lights up when it signals. When its scheduled VBlank event fires, that both triggers `Present` to scan the VRAM framebuffer out to the screen and wakes the CPU thread for the next frame.
 
 <ClientOnly>
   <FrameCycle />

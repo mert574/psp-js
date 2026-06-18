@@ -6,6 +6,10 @@ It boots real games: decrypts KIRK-encrypted EBOOTs, loads ISO/PBP, runs the MIP
 
 Work in progress. Several commercial games boot to their menus and render, and the pspautotests CPU/kernel suite passes. Per-game status lives in `CLAUDE.md` and the project notes.
 
+## Documentation
+
+Full docs (user guide, architecture, and per-subsystem and per-HLE-module reference) are published at https://mert574.github.io/psp-js/docs/. Run them locally with `npm run docs:dev`, or `npm run dev:all` to serve the app and docs side by side.
+
 ## Quick start
 
 ```bash
