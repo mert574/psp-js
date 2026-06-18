@@ -46,11 +46,13 @@ export class FramebufferRenderer {
   private bufferInfo: twgl.BufferInfo;
   private texture: WebGLTexture;
   private rgbaBuf: Uint8Array; // pre-allocated RGBA conversion buffer
+  private maxAttribs: number;
 
   constructor(canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl", { alpha: false, antialias: false });
     if (!gl) throw new Error("WebGL not supported");
     this.gl = gl;
+    this.maxAttribs = gl.getParameter(gl.MAX_VERTEX_ATTRIBS) as number;
 
     this.programInfo = twgl.createProgramInfo(gl, [VS, FS]);
 
@@ -133,6 +135,12 @@ export class FramebufferRenderer {
         { numComponents: 2, data: [0, 1, uMax, 1, 0, 0, uMax, 0] },
       );
     }
+
+    // The GE renderer (WebGLGERenderer) leaves its vertex attrib arrays enabled
+    // on this shared context. Our quad only uses position+texcoord, so any other
+    // enabled-but-unbound array makes drawElements throw INVALID_OPERATION.
+    // Disable them all; setBuffersAndAttributes re-enables the two we need.
+    for (let i = 0; i < this.maxAttribs; i++) gl.disableVertexAttribArray(i);
 
     gl.useProgram(this.programInfo.program);
     twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);
