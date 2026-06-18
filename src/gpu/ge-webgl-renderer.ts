@@ -1351,6 +1351,23 @@ export class WebGLGERenderer {
     // which is getTextureWidth(0) = texWidth, NOT texBufWidth.
     // The WebGL texture is uploaded at texWidth dimensions (matching the normalized UV space).
 
+    // Render-to-texture: this draw samples a framebuffer (FBO) we rendered to
+    // earlier. Our GE vertex shader flips Y when rendering, so the FBO stores the
+    // PSP image upside down, and its real size is the FBO (FBO_WIDTH x PSP_HEIGHT),
+    // not the declared texWidth/Height. Map the raw texel UV into the FBO's
+    // normalized space and flip V so the sampled image comes out upright.
+    // (Software reads VRAM top-row-first so it doesn't need this.) Through-mode
+    // only — that's how the full-screen compose blit is drawn.
+    const texFb = this.normFb(ts.texAddr0);
+    const samplingVFB = this.vfbs.has(texFb) && texFb !== this.normFb(state.fbPtr);
+    if (samplingVFB && state.throughMode) {
+      this.uvScaleU = 1 / FBO_WIDTH;
+      this.uvScaleV = -1 / PSP_HEIGHT;
+      this.uvOffsetU = 0;
+      this.uvOffsetV = 1;
+      return;
+    }
+
     if (state.throughMode) {
       // Through mode: UV is raw texel coords → normalize by dividing by texWidth/texHeight
       this.uvScaleU = 1 / tw;
