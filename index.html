@@ -104,6 +104,7 @@
               <span title="Frame number">Frame <b id="hud-frame">0</b></span>
               <span title="Current thread ID">TID <b id="hud-tid">-</b></span>
               <span title="Program counter">PC <b id="hud-pc">-</b></span>
+              <span title="Frames skipped on the last displayed frame">Skip <b id="hud-skip">0</b></span>
               <span class="perf-bar__spacer"></span>
               <button id="pause-btn" class="perf-bar__btn" title="Pause / resume">Pause</button>
               <button id="step-btn" class="perf-bar__btn" title="Step one frame" disabled>Step</button>
@@ -156,6 +157,13 @@
                 <button class="seg__btn seg__btn--active" data-speed="1">1×</button>
                 <button class="seg__btn" data-speed="2">2×</button>
                 <button class="seg__btn" data-speed="4">4×</button>
+              </span>
+              <span class="seg" title="Frame skip — drop draws to hold real time (audio stays 1×)">
+                <button class="seg__btn" data-frameskip="off">Skip Off</button>
+                <button class="seg__btn seg__btn--active" data-frameskip="auto">Auto</button>
+                <button class="seg__btn" data-frameskip="1">1</button>
+                <button class="seg__btn" data-frameskip="2">2</button>
+                <button class="seg__btn" data-frameskip="3">3</button>
               </span>
               <button id="fullscreen-btn" class="btn btn--ghost" title="Fullscreen">Fullscreen</button>
               <span class="gameplay-toolbar__spacer"></span>
