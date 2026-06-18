@@ -193,6 +193,40 @@ describe("GEProcessor", () => {
       expect(vram[1]).toBe(0);
     });
 
+    it("should write no pixels when skipDraw is set (frame skip)", () => {
+      const WHITE = 0xFFFFFFFF;
+      let vaddr = VERT_ADDR;
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 5, 5, 0, WHITE);
+      vaddr = writeVertex_color8888_pos16(bus, vaddr, 15, 15, 0, WHITE);
+
+      const cmds = [
+        geCmd(GE_CMD.FRAMEBUFPTR, VRAM_BASE & 0xFFFFFF),
+        geCmd(GE_CMD.FRAMEBUFWIDTH, 512 | ((VRAM_BASE >>> 8) & 0xFF0000)),
+        geCmd(GE_CMD.FRAMEBUFPIXFMT, 3),
+        geCmd(GE_CMD.BASE, (VERT_ADDR >>> 8) & 0xFFFFFF),
+        geCmd(GE_CMD.VTYPE, VTYPE_THROUGH_COLOR8888_POS16),
+        geCmd(GE_CMD.VADDR, VERT_ADDR & 0xFFFFFF),
+        geCmd(GE_CMD.PRIM, (6 << 16) | 2),
+        geCmd(GE_CMD.FINISH),
+        geCmd(GE_CMD.END),
+      ];
+      writeCommandList(bus, LIST_ADDR, cmds);
+
+      const inside = (10 * 512 + 10) * 4;
+
+      // skipDraw on: the draw is suppressed, VRAM stays untouched.
+      ge.skipDraw = true;
+      ge.executeList(LIST_ADDR, 0);
+      expect(bus.vramBuffer[inside]).toBe(0);
+      expect(bus.vramBuffer[inside + 3]).toBe(0);
+
+      // skipDraw off: the same list now writes the sprite.
+      ge.skipDraw = false;
+      ge.executeList(LIST_ADDR, 0);
+      expect(bus.vramBuffer[inside]).toBe(0xFF);
+      expect(bus.vramBuffer[inside + 3]).toBe(0xFF);
+    });
+
     it("should draw sprite with specific color", () => {
       // Red sprite: ABGR = 0xFF0000FF → R=0xFF, G=0, B=0, A=0xFF
       const RED_ABGR = 0xFF0000FF;

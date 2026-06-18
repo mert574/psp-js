@@ -21,6 +21,7 @@ import type { SavedataList } from "./savedata-list.js";
 import "./game-library.js";
 import "./app-bar.js"; // registers the <app-bar> custom element
 import { initWaveBackground } from "./wave-background.js";
+import { computeFramesToRun, FRAMESKIP_AUTO, FRAMESKIP_OFF, type FrameSkipMode } from "./frameskip.js";
 
 initWaveBackground();
 
@@ -299,6 +300,10 @@ function bootGame(): void {
   emulator = new PSPEmulator();
   window._dbgEmu = emulator; // debug: expose for console inspection
   window._dbgLogger = Logger;  // debug: window._dbgLogger.minLevel = "debug"
+  (window as unknown as { _dbgStep?: (n?: number) => number })._dbgStep = (n = 1) => { // debug: run+present N frames manually (beats backgrounded rAF)
+    for (let i = 0; i < n; i++) runOneFrame();
+    return emulator ? emulator.hle.vblankCount : -1;
+  };
   window._dbgPauseAt = (frame: number) => { _pauseAtFrame = frame > 0 ? Math.floor(frame) : 0; }; // debug: auto-pause at a frame
   window._dbgPerf = { // debug: per-frame CPU-vs-present profiler
     start: () => { _perfEnabled = true; _perfFrames.clear(); },
@@ -513,6 +518,24 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-speed]")) 
   });
 }
 
+// ── Frame-skip buttons ────────────────────────────────────────────────────────
+// Off renders every frame. Auto lets the accumulator decide how many frames to
+// skip to hold 1× real time. 1/2/3 always skip that many between renders. Unlike
+// the speed buttons this keeps audio at 1× — it is not fast-forward.
+let _frameSkipMode: FrameSkipMode = FRAMESKIP_AUTO; // default: Auto (per-session)
+let _accumulator = 0;
+let _lastSkipCount = 0;
+for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-frameskip]")) {
+  btn.addEventListener("click", () => {
+    const v = btn.dataset.frameskip;
+    _frameSkipMode = v === "auto" ? FRAMESKIP_AUTO : Number(v) || FRAMESKIP_OFF;
+    _accumulator = 0; // reset so a mode change doesn't burst-run frames
+    for (const b of document.querySelectorAll<HTMLButtonElement>("[data-frameskip]")) {
+      b.classList.toggle("seg__btn--active", b === btn);
+    }
+  });
+}
+
 // ── Browser back/forward navigation ──────────────────────────────────────────
 window.addEventListener("popstate", () => {
   const route = location.hash.replace(/^#/, "") || "library";
@@ -660,6 +683,8 @@ let _hudFps: HTMLElement | null = null;
 let _hudFrame: HTMLElement | null = null;
 let _hudTid: HTMLElement | null = null;
 let _hudPc: HTMLElement | null = null;
+let _hudSkip: HTMLElement | null = null;
+let _lastDisplayTime = 0; // real-time anchor for the Auto accumulator
 let _lastHudUpdate = 0;
 const HUD_UPDATE_MS = 200;
 
@@ -671,6 +696,8 @@ function setPaused(paused: boolean): void {
   if (stepBtn) stepBtn.disabled = !_paused;
   if (!_paused && rafHandle === 0) {
     _lastFrameTime = performance.now();
+    _lastDisplayTime = performance.now();
+    _accumulator = 0;
     rafHandle = requestAnimationFrame(frameLoop);
   }
 }
@@ -684,8 +711,9 @@ function doSingleFrame(): void {
   runOneFrame();
 }
 
-/** Run one frame and render (shared between frame loop and step). */
-function runOneFrame(): void {
+/** Run one displayed frame and render (shared between frame loop and step).
+ *  framesToRun > 1 means frame-skip: run that many PSP frames, draw only the last. */
+function runOneFrame(framesToRun = 1): void {
   if (!emulator) return;
   // Auto-pause once we've run _pauseAtFrame frames (debug/measurement). Checked
   // before running more, so exactly _pauseAtFrame frames execute, then the loop
@@ -699,9 +727,6 @@ function runOneFrame(): void {
   _frameCount++;
   if (_frameCount >= 1_000_000_000) _frameCount = 0;
 
-  // Invalidate textures that may have been modified in RAM since last frame
-  geRenderer?.onFrameStart();
-
   let cpuMs = 0;
   let geMs = 0;
   let presentMs = 0;
@@ -710,20 +735,35 @@ function runOneFrame(): void {
   // delta over this frame is the GE slice of cpuMs, so interpreter = cpuMs - geMs.
   const geBefore = emulator.hle.geTimeMs;
   try {
-    // Run _speed PSP frames per displayed frame for 2×/4× emulation speed;
-    // we present only the last one. Stop early if the game halts mid-batch.
-    for (let i = 0; i < _speed; i++) {
-      emulator.runFrame();
+    // framesToRun is the frame-skip batch: run that many PSP frames but draw only
+    // the last (skipDraw suppresses the GE draws on the earlier ones). _speed nests
+    // inside it for 2×/4× fast-forward. Stop early if the game halts mid-batch.
+    for (let f = 0; f < framesToRun; f++) {
+      const isLast = f === framesToRun - 1;
+      const ge = emulator.hle.geProcessor;
+      if (ge) ge.skipDraw = !isLast;
+      // Invalidate textures modified in RAM since last frame. Run each iteration so
+      // VFB decimation tracking stays correct across skipped frames.
+      geRenderer?.onFrameStart();
+      for (let i = 0; i < _speed; i++) {
+        emulator.runFrame();
+        if (emulator.halted) break;
+      }
       if (emulator.halted) break;
     }
+    const ge = emulator.hle.geProcessor;
+    if (ge) ge.skipDraw = false; // always clear before present / next frame
     cpuMs = performance.now() - frameStart;
     geMs = emulator.hle.geTimeMs - geBefore;
   } catch (err) {
+    const ge = emulator.hle.geProcessor;
+    if (ge) ge.skipDraw = false; // never leave the screen stuck on a skipped frame
     stopRafLoop();
     if (emulator && debugPanel) debugPanel.dumpStubsToConsole(emulator);
     showError(`CPU error: ${String(err)}`, err);
     return;
   }
+  _lastSkipCount = framesToRun - 1;
 
   const hle = emulator.hle;
   const fbAddr = hle.framebufAddr !== 0 ? hle.framebufAddr : hle.geFbAddr;
@@ -754,6 +794,7 @@ function runOneFrame(): void {
     if (_hudFrame) _hudFrame.textContent = String(_frameCount);
     if (_hudTid)   _hudTid.textContent   = String(emulator.hle.currentThreadId);
     if (_hudPc)    _hudPc.textContent    = emulator.cpu.regs.pc.toString(16);
+    if (_hudSkip)  _hudSkip.textContent  = String(_lastSkipCount);
   }
 
   debugPanel?.tick(emulator, cpuMs, presentMs);
@@ -820,11 +861,15 @@ function startRafLoop(): void {
   _hudFrame = document.getElementById("hud-frame");
   _hudTid   = document.getElementById("hud-tid");
   _hudPc    = document.getElementById("hud-pc");
+  _hudSkip  = document.getElementById("hud-skip");
   _lastHudUpdate = 0;
 
   _frameCount = 0;
   _fpsLastTime = performance.now();
   _lastFrameTime = performance.now();
+  _lastDisplayTime = performance.now();
+  _accumulator = 0;
+  _lastSkipCount = 0;
   _fpsFrames = 0;
   _fpsValue = 0;
   _paused = false;
@@ -845,24 +890,38 @@ function startRafLoop(): void {
 function frameLoop(): void {
   if (!emulator || _paused) return;
 
-  // Throttle to ~60fps
   const now = performance.now();
-  const elapsed = now - _lastFrameTime;
-  if (elapsed < FRAME_INTERVAL) {
-    rafHandle = requestAnimationFrame(frameLoop);
-    return;
-  }
-  _lastFrameTime = now - (elapsed % FRAME_INTERVAL);
-  _fpsFrames++;
 
-  // FPS counter
-  if (now - _fpsLastTime >= 1000) {
-    _fpsValue = _fpsFrames;
-    _fpsFrames = 0;
-    _fpsLastTime = now;
+  // Off mode keeps the legacy ~60fps throttle so high-refresh displays don't run
+  // the game fast. Auto / fixed modes pace via the accumulator / fixed count.
+  if (_frameSkipMode === FRAMESKIP_OFF) {
+    const elapsed = now - _lastFrameTime;
+    if (elapsed < FRAME_INTERVAL) {
+      rafHandle = requestAnimationFrame(frameLoop);
+      return;
+    }
+    _lastFrameTime = now - (elapsed % FRAME_INTERVAL);
   }
 
-  runOneFrame();
+  const realDelta = now - _lastDisplayTime;
+  _lastDisplayTime = now;
+
+  const { frames, accumulator } = computeFramesToRun(_frameSkipMode, _accumulator, realDelta);
+  _accumulator = accumulator;
+
+  // Auto can return 0 when less than one PSP frame of real time has passed (e.g. a
+  // 120Hz rAF tick): present nothing new this tick, just keep the loop alive. This
+  // is what stops the game running faster than real time on high-refresh displays.
+  if (frames > 0) {
+    _fpsFrames++;
+    // FPS counter
+    if (now - _fpsLastTime >= 1000) {
+      _fpsValue = _fpsFrames;
+      _fpsFrames = 0;
+      _fpsLastTime = now;
+    }
+    runOneFrame(frames);
+  }
 
   if (!emulator?.halted && !_paused) {
     rafHandle = requestAnimationFrame(frameLoop);

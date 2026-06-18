@@ -250,6 +250,13 @@ export class GEProcessor {
   /** When true, skip per-pixel sprite/triangle rasterization (keep clears + block transfers). */
   skipSoftwareRaster = false;
 
+  /** When true, suppress the actual GE draw/rasterize calls for this frame (frame
+   *  skip). All GE state bookkeeping still runs (lastDrawFbPtr etc.); only the
+   *  draw work is skipped. Clears and block transfers are NOT skipped, so the next
+   *  rendered frame can still sample what they wrote. Set/reset per-frame by the
+   *  frontend. */
+  skipDraw = false;
+
   /** When set, route PRIM and clear commands to WebGL instead of software rasterization. */
   webglRenderer: WebGLGERenderer | null = null;
 
@@ -1659,12 +1666,15 @@ export class GEProcessor {
       this.lastDrawFbPtr = this.fbPtr;
       this.lastDrawFbWidth = this.fbWidth;
       this.lastDrawFbFormat = this.fbFormat;
-      this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
+      if (!this.skipDraw) {
+        this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
+      }
       return;
     }
 
-    // Skip expensive software rasterization for non-clear primitives.
-    if (this.skipSoftwareRaster) return;
+    // Skip expensive software rasterization for non-clear primitives, and when
+    // frame-skipping this frame.
+    if (this.skipSoftwareRaster || this.skipDraw) return;
 
     // Record which buffer is receiving actual pixel draws
     this.lastDrawFbPtr = this.fbPtr;
@@ -2256,9 +2266,13 @@ export class GEProcessor {
 
     // WebGL path for immediate mode
     if (this.webglRenderer) {
-      this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
+      if (!this.skipDraw) {
+        this.webglRenderer.drawPrimitives(primType, vertices, this.drawState, this.bus);
+      }
       return;
     }
+
+    if (this.skipDraw) return; // skip software immediate-mode raster too
 
     if (primType === 6) { // SPRITES
       for (let i = 0; i + 1 < vertices.length; i += 2) {
