@@ -125,6 +125,56 @@ function resolutionScale(): number {
   return Number.isFinite(n) && n >= 1 ? n : 1;
 }
 
+// ── Boot-option persistence ───────────────────────────────────────────────────
+// The "Boot options" fieldset is global (not per-game), so we store each control
+// by id under one localStorage key and restore it on load. Checkboxes save their
+// checked state, selects save their value. Runs at module load (the options screen
+// is in the DOM from the start, just hidden), then re-saves whenever one changes.
+const BOOT_OPTIONS_KEY = "psp-js:boot-options";
+const BOOT_OPTION_CHECKBOXES = ["disable-audio-chk", "profiler-chk"];
+const BOOT_OPTION_SELECTS = ["renderer-select", "resolution-select"];
+
+function saveBootOptions(): void {
+  const state: Record<string, boolean | string> = {};
+  for (const id of BOOT_OPTION_CHECKBOXES) {
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (el) state[id] = el.checked;
+  }
+  for (const id of BOOT_OPTION_SELECTS) {
+    const el = document.getElementById(id) as HTMLSelectElement | null;
+    if (el) state[id] = el.value;
+  }
+  try {
+    localStorage.setItem(BOOT_OPTIONS_KEY, JSON.stringify(state));
+  } catch { /* persistence best-effort */ }
+}
+
+function restoreBootOptions(): void {
+  let state: Record<string, boolean | string>;
+  try {
+    const raw = localStorage.getItem(BOOT_OPTIONS_KEY);
+    if (!raw) return;
+    state = JSON.parse(raw) as Record<string, boolean | string>;
+  } catch { return; /* missing or corrupt — keep the HTML defaults */ }
+
+  for (const id of BOOT_OPTION_CHECKBOXES) {
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (el && typeof state[id] === "boolean") el.checked = state[id];
+  }
+  for (const id of BOOT_OPTION_SELECTS) {
+    const el = document.getElementById(id) as HTMLSelectElement | null;
+    // Only apply a stored value that still matches one of the options.
+    if (el && typeof state[id] === "string" && [...el.options].some(o => o.value === state[id])) {
+      el.value = state[id];
+    }
+  }
+}
+
+restoreBootOptions();
+for (const id of [...BOOT_OPTION_CHECKBOXES, ...BOOT_OPTION_SELECTS]) {
+  document.getElementById(id)?.addEventListener("change", saveBootOptions);
+}
+
 // ── Hash-based router ─────────────────────────────────────────────────────────
 // Routes: #library (default), #game/<id> (options; deep-link boots),
 // #details/<id> (details page; deep-links without booting), #play/<id>
@@ -266,6 +316,8 @@ document.getElementById("debug-panel")?.addEventListener("renderer-toggle", () =
   const sel = document.getElementById("renderer-select") as HTMLSelectElement | null;
   if (sel) sel.value = sel.value === "software" ? "webgl" : "software";
   switchRenderer();
+  // Programmatic value changes don't fire "change", so persist the flip directly.
+  saveBootOptions();
 });
 
 function bootGame(): void {
@@ -453,9 +505,10 @@ const exitBtn = document.getElementById("exit-btn")!;
 exitBtn.addEventListener("click", () => {
   teardownGameplay();
   if (optionsScreenReady) {
-    // Came in via the gear → return to that game's options screen.
+    // The game screen is still rendered, so return to it as the details page
+    // (#details, which won't re-boot on refresh) rather than the boot screen.
     exitGameplayView();
-    navTo(`game/${currentGameSlug}`);
+    navTo(`details/${currentGameSlug}`);
   } else {
     // Booted straight from the library → go back to the library.
     exitGameplayView();
