@@ -14,20 +14,16 @@ void main() {
 }
 `;
 
-// Fragment shader swizzles ABGR → RGBA for format 3 (most common).
-// For other formats we do CPU conversion to RGBA before upload.
+// PSP framebuffer pixels are stored R-low in memory for every format:
+// 8888 is 0xAABBGGRR (bytes [R,G,B,A]) and the 16-bit formats put R in the low
+// bits. Both the raw 8888 upload and the CPU-converted 16-bit buffer are already
+// [R,G,B,A], which WebGL reads straight as RGBA, so no channel swap is needed.
 const FS = `
 precision mediump float;
 varying vec2 v_uv;
 uniform sampler2D u_texture;
-uniform bool u_swizzle; // true for ABGR8888 direct upload
 void main() {
-  vec4 c = texture2D(u_texture, v_uv);
-  if (u_swizzle) {
-    gl_FragColor = vec4(c.b, c.g, c.r, c.a); // BGRA → RGBA (WebGL reads as RGBA)
-  } else {
-    gl_FragColor = c;
-  }
+  gl_FragColor = texture2D(u_texture, v_uv);
 }
 `;
 
@@ -49,6 +45,10 @@ export class FramebufferRenderer {
   private maxAttribs: number;
 
   constructor(canvas: HTMLCanvasElement) {
+    // Present at native size. The WebGL GE renderer may have left the backing
+    // store scaled up (scale×); reset it so the fullscreen quad fills the canvas.
+    canvas.width = PSP_WIDTH;
+    canvas.height = PSP_HEIGHT;
     const gl = canvas.getContext("webgl", { alpha: false, antialias: false });
     if (!gl) throw new Error("WebGL not supported");
     this.gl = gl;
@@ -104,7 +104,6 @@ export class FramebufferRenderer {
     if (offset < 0 || offset >= vram.length) return;
 
     const stride = width || 512; // buffer width (pixels per row)
-    const swizzle = format === 3;
 
     if (format === 3) {
       // ABGR8888: upload raw VRAM bytes, swizzle in shader
@@ -146,7 +145,6 @@ export class FramebufferRenderer {
     twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);
     twgl.setUniforms(this.programInfo, {
       u_texture: this.texture,
-      u_swizzle: swizzle,
     });
     twgl.drawBufferInfo(gl, this.bufferInfo);
   }
