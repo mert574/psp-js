@@ -26,6 +26,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build:web
+      # Build the docs and place them under /psp-js/docs/ alongside the app. The
+      # docs base is set to /psp-js/docs/ when GITHUB_ACTIONS is set (see
+      # docs/.vitepress/config.ts), matching this path.
+      - run: npm run docs:build
+      - run: cp -r docs/.vitepress/dist dist-web/docs
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist-web
