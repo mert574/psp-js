@@ -103,7 +103,19 @@ export function ratingLabel(level: number): string {
   return PARENTAL_LABELS[level] ?? `Level ${level}`;
 }
 
+// Object URLs from the previous details view; revoked when the next one loads so
+// icon/background/logo blobs don't accumulate across game selections.
+let _prevIconUrl: string | undefined;
+let _prevBgUrl: string | undefined;
+let _prevLogoUrl: string | undefined;
+function revokeIfBlob(url: string | undefined): void {
+  if (url && url.startsWith("blob:")) URL.revokeObjectURL(url);
+}
+
 export function showGameView(info: GameInfo, iconUrl?: string, bgUrl?: string, logoUrl?: string): void {
+  revokeIfBlob(_prevIconUrl); revokeIfBlob(_prevBgUrl); revokeIfBlob(_prevLogoUrl);
+  _prevIconUrl = iconUrl; _prevBgUrl = bgUrl; _prevLogoUrl = logoUrl;
+
   document.getElementById("game-title")!.textContent    = info.title;
   document.getElementById("game-disc-id")!.textContent  = info.discId   || "—";
   document.getElementById("game-version")!.textContent  = info.version  || "—";

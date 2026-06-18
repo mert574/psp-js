@@ -17,8 +17,51 @@ const WAVE_ALPHA = 0.2;
 // PPSSPP adds a 3px-tall soft top edge as cheap antialiasing on the crest line.
 const AA_PX = 3;
 
+// localStorage key for the user's chosen wave color. The default below keeps the
+// original PPSSPP white when nothing is stored.
+export const WAVE_COLOR_KEY = "psp-js:wave-color";
+const DEFAULT_WAVE_COLOR = "#ffffff";
+
+// Current wave color as "r,g,b" so it drops straight into the rgba() strings the
+// draw uses. Updated live by setWaveColor; the running animation reads it each frame.
+let waveRgb = "255,255,255";
+
+/** Parse "#rrggbb" (or "#rgb") to an "r,g,b" string. Returns null on anything we
+ *  don't understand, so callers can keep the current color. */
+function hexToRgbTriplet(hex: string): string | null {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  let h = m[1]!;
+  if (h.length === 3) h = h[0]! + h[0]! + h[1]! + h[1]! + h[2]! + h[2]!;
+  const n = parseInt(h, 16);
+  return `${(n >> 16) & 0xff},${(n >> 8) & 0xff},${n & 0xff}`;
+}
+
+/** Read the persisted wave color, or the default if none/invalid is stored. */
+export function getStoredWaveColor(): string {
+  try {
+    const v = localStorage.getItem(WAVE_COLOR_KEY);
+    if (v && hexToRgbTriplet(v)) return v;
+  } catch { /* localStorage may be unavailable */ }
+  return DEFAULT_WAVE_COLOR;
+}
+
+/** Set the wave color live (the running animation picks it up next frame) and
+ *  persist it. Accepts "#rrggbb" / "#rgb"; ignored if it can't be parsed. */
+export function setWaveColor(color: string): void {
+  const rgb = hexToRgbTriplet(color);
+  if (!rgb) return;
+  waveRgb = rgb;
+  try {
+    localStorage.setItem(WAVE_COLOR_KEY, color.startsWith("#") ? color : `#${color}`);
+  } catch { /* persistence best-effort */ }
+}
+
 export function initWaveBackground(): void {
   if (document.querySelector("canvas.wave-bg")) return;
+
+  // Apply the persisted color before the first frame so there's no white flash.
+  waveRgb = hexToRgbTriplet(getStoredWaveColor()) ?? waveRgb;
 
   const canvas = document.createElement("canvas");
   canvas.className = "wave-bg";
@@ -66,17 +109,18 @@ export function initWaveBackground(): void {
   }
 
   function paintBand(x: number, width: number, top: number): void {
+    // waveRgb is the user-chosen base color; the gradient fades it to transparent.
     // Main body: crest line (full color) down to the bottom (transparent).
     const body = ctx!.createLinearGradient(0, top, 0, h);
-    body.addColorStop(0, `rgba(255,255,255,${WAVE_ALPHA})`);
-    body.addColorStop(1, "rgba(255,255,255,0)");
+    body.addColorStop(0, `rgba(${waveRgb},${WAVE_ALPHA})`);
+    body.addColorStop(1, `rgba(${waveRgb},0)`);
     ctx!.fillStyle = body;
     ctx!.fillRect(x, top, width, h - top);
 
     // Soft top edge: transparent up to full color over the last few px.
     const edge = ctx!.createLinearGradient(0, top - AA_PX, 0, top);
-    edge.addColorStop(0, "rgba(255,255,255,0)");
-    edge.addColorStop(1, `rgba(255,255,255,${WAVE_ALPHA})`);
+    edge.addColorStop(0, `rgba(${waveRgb},0)`);
+    edge.addColorStop(1, `rgba(${waveRgb},${WAVE_ALPHA})`);
     ctx!.fillStyle = edge;
     ctx!.fillRect(x, top - AA_PX, width, AA_PX);
   }

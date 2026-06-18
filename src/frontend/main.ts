@@ -8,7 +8,8 @@ import { warmupAtracDecode, getDecodeConcurrency } from "../audio/atrac-decoder.
 import { decodePmfNative, type PmfPlayer } from "./pmf-native.js";
 import { PSPEmulator } from "../emulator.js";
 import { CpuProfiler } from "../cpu/cpu-profiler.js";
-import { isPbp } from "../loader/pbp.js";
+import { isPbp, parsePbp, type PbpContents } from "../loader/pbp.js";
+import { parseSfo, extractGameInfo } from "../iso/sfo.js";
 import { FramebufferRenderer } from "../gpu/framebuffer-renderer.js";
 import { WebGLGERenderer } from "../gpu/ge-webgl-renderer.js";
 import "./debug-panel.js"; // registers the <debug-panel> custom element
@@ -18,11 +19,10 @@ import type { SavedataOverlay } from "./savedata-overlay.js";
 import "./savedata-list.js"; // registers <savedata-list>
 import type { SavedataList } from "./savedata-list.js";
 import "./game-library.js";
+import "./app-bar.js"; // registers the <app-bar> custom element
 import { initWaveBackground } from "./wave-background.js";
-import { initClock } from "./clock.js";
 
 initWaveBackground();
-initClock();
 
 declare global {
   interface Window {
@@ -64,9 +64,13 @@ const flash0Fonts = new Map<string, Uint8Array>();
 // gameplay. mode "options" (the gear) opens the info/boot-options screen instead.
 document.getElementById("game-library")?.addEventListener("game-select", (e: Event) => {
   const detail = (e as CustomEvent).detail as {
-    file: File; parentDir: FileSystemDirectoryHandle | null; mode?: "boot" | "options";
+    file: File; parentDir: FileSystemDirectoryHandle | null; mode?: "boot" | "options" | "details";
   };
-  void handleIso(detail.file, detail.parentDir ?? undefined, detail.mode !== "options");
+  const mode = detail.mode ?? "boot";
+  // "details" opens the details page (#details); "options" the boot screen
+  // (#game); only "boot" goes straight into gameplay. The details intent is
+  // passed through, not left as sticky module state.
+  void handleIso(detail.file, detail.parentDir ?? undefined, mode === "boot", mode === "details");
 });
 
 // ── Debug: ?iso=/name.iso fetches an ISO served from public/ and boots it ────
@@ -121,10 +125,14 @@ function resolutionScale(): number {
 }
 
 // ── Hash-based router ─────────────────────────────────────────────────────────
-// Routes: #library (default), #game/<id>, #play/<id>
+// Routes: #library (default), #game/<id> (options; deep-link boots),
+// #details/<id> (details page; deep-links without booting), #play/<id>
 // <id> is discId if available, else filename (sanitized).
 
 let currentGameSlug = "";
+/** Set by the game-select handler: true when the next options-screen load was
+ *  requested as a details view (#details) rather than the boot screen (#game). */
+let pendingDetailsView = false;
 
 function gameSlug(discId: string, fileName: string): string {
   return (discId || fileName.replace(/\.[^.]+$/, "")).replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -137,6 +145,12 @@ function navTo(route: string, replace = false): void {
   } else {
     history.pushState({ route }, "", hash);
   }
+}
+
+/** The details screen routes to #details when the selection asked for the details
+ *  view (card click / #details deep-link), otherwise the #game boot screen. */
+function gameOrDetailsRoute(slug: string): string {
+  return pendingDetailsView ? `details/${slug}` : `game/${slug}`;
 }
 
 let inputHandler: InputHandler | null = null;
@@ -511,9 +525,9 @@ window.addEventListener("popstate", () => {
     clearGameVideo(); clearGameAudio();
     exitGameplayView();
     showFilePicker();
-  } else if (route.startsWith("game/")) {
-    // Back to the options screen from gameplay: stop the emulator. If the game was
-    // booted straight from the library (no options screen), fall back to it.
+  } else if (route.startsWith("game/") || route.startsWith("details/")) {
+    // Back to the options/details screen from gameplay: stop the emulator. If the
+    // game was booted straight from the library (no options screen), fall back to it.
     if (emulator) {
       teardownGameplay();
       if (optionsScreenReady) {
@@ -993,8 +1007,66 @@ async function loadCompanionFiles(
   return files;
 }
 
+/** Build an object URL for a PBP image section (icon/logo/background). */
+function pbpImageUrl(bytes: Uint8Array | null | undefined): string | undefined {
+  return bytes ? URL.createObjectURL(new Blob([bytes as BlobPart], { type: "image/png" })) : undefined;
+}
+
+/** Decode and play a game's preview media on the details screen: the animated
+ *  PMF icon (video) plus AT3 audio. Shared by the ISO and PBP/homebrew paths.
+ *  A stale run is cancelled via the shared mediaAbort controller. */
+function playGameMedia(pmfData?: Uint8Array, at3Data?: Uint8Array): void {
+  mediaAbort?.abort();
+  const abort = new AbortController();
+  mediaAbort = abort;
+
+  void (async () => {
+    if (pmfData) {
+      setMediaLoading(true);
+      try {
+        if (pmfPlayer) { pmfPlayer.stop(); pmfPlayer = null; }
+        const player = await decodePmfNative(pmfData);
+        if (abort.signal.aborted) { player.stop(); return; }
+        pmfPlayer = player;
+        setGameCanvas(player.canvas);
+        player.play();
+      } catch (err) {
+        if (abort.signal.aborted) return;
+        log.warn("PMF decode failed:", err);
+        setMediaLoading(false);
+      }
+
+      if (!at3Data && !isAudioDisabled()) {
+        try {
+          const audioUrl = await transcodePmfAudio(pmfData);
+          if (abort.signal.aborted) { URL.revokeObjectURL(audioUrl); return; }
+          playGameAudio(audioUrl);
+        } catch (err) {
+          if (abort.signal.aborted) return;
+          log.warn("PMF audio extract failed:", err);
+        }
+      }
+    }
+
+    if (at3Data && !isAudioDisabled()) {
+      if (abort.signal.aborted) return;
+      showAudioLoading();
+      try {
+        const url = await transcodeAt3(at3Data);
+        if (abort.signal.aborted) { URL.revokeObjectURL(url); return; }
+        playGameAudio(url);
+      } catch (err) {
+        if (abort.signal.aborted) return;
+        log.warn("AT3 transcode failed:", err);
+        showAudioError();
+      }
+    }
+  })();
+}
+
 // ── ISO loading ───────────────────────────────────────────────────────────────
-async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle, autoBoot = false): Promise<void> {
+async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle, autoBoot = false, detailsView = false): Promise<void> {
+  pendingDetailsView = detailsView;
   clearError();
   clearGameVideo();
   clearGameAudio();
@@ -1016,7 +1088,7 @@ async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle, auto
       pendingDirFiles = await loadCompanionFiles(parentDir, "disc0:");
       pendingStartDir = "disc0:/";
     }
-    await handleEboot(file, autoBoot);
+    await handleEboot(file, autoBoot, detailsView);
     return;
   }
 
@@ -1085,6 +1157,11 @@ async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle, auto
   // into the game. The ISO filesystem + EBOOT are already loaded above.
   if (autoBoot) {
     optionsScreenReady = false;
+    // The options screen (and its preview images) is skipped, so the metadata's
+    // icon/bg/logo object URLs are never shown; revoke them so they don't leak.
+    for (const u of [meta.iconUrl, meta.bgUrl, meta.logoUrl]) {
+      if (u?.startsWith("blob:")) URL.revokeObjectURL(u);
+    }
     setStatus(`Booting ${gameInfo.title}…`);
     bootGame();
     return;
@@ -1095,66 +1172,17 @@ async function handleIso(file: File, parentDir?: FileSystemDirectoryHandle, auto
   showGameView(gameInfo, meta.iconUrl ?? undefined, meta.bgUrl ?? undefined, meta.logoUrl ?? undefined);
   showFileTree(volume.root);
   setStatus(`Loaded: ${gameInfo.title}${gameInfo.discId ? ` · ${gameInfo.discId}` : ""}`);
-  navTo(`game/${currentGameSlug}`);
+  navTo(gameOrDetailsRoute(currentGameSlug));
 
   // Read media files on demand from ISO (small files, read lazily)
   const pmfData = pmfEntry ? await readFileFromIso(file, pmfEntry) : undefined;
   const at3Data = at3Entry ? await readFileFromIso(file, at3Entry) : undefined;
-
-  // Transcode PMF then AT3 sequentially (FFmpeg can only run one exec at a time)
-  // Use AbortController so boot/change can cancel stale results
-  mediaAbort?.abort();
-  const abort = new AbortController();
-  mediaAbort = abort;
-
-  void (async () => {
-    if (pmfData) {
-      setMediaLoading(true);
-      try {
-        // Stop any previous player
-        if (pmfPlayer) { pmfPlayer.stop(); pmfPlayer = null; }
-        const player = await decodePmfNative(pmfData);
-        if (abort.signal.aborted) { player.stop(); return; }
-        pmfPlayer = player;
-        setGameCanvas(player.canvas);
-        player.play();
-      } catch (err) {
-        if (abort.signal.aborted) return;
-        log.warn("PMF decode failed:", err);
-        setMediaLoading(false);
-      }
-
-      // Extract and play audio from PMF (runs in parallel with video)
-      if (!at3Data && !isAudioDisabled()) {
-        try {
-          const audioUrl = await transcodePmfAudio(pmfData);
-          if (abort.signal.aborted) { URL.revokeObjectURL(audioUrl); return; }
-          playGameAudio(audioUrl);
-        } catch (err) {
-          if (abort.signal.aborted) return;
-          log.warn("PMF audio extract failed:", err);
-        }
-      }
-    }
-
-    if (at3Data && !isAudioDisabled()) {
-      if (abort.signal.aborted) return;
-      showAudioLoading();
-      try {
-        const url = await transcodeAt3(at3Data);
-        if (abort.signal.aborted) { URL.revokeObjectURL(url); return; }
-        playGameAudio(url);
-      } catch (err) {
-        if (abort.signal.aborted) return;
-        log.warn("AT3 transcode failed:", err);
-        showAudioError();
-      }
-    }
-  })();
+  playGameMedia(pmfData, at3Data);
 }
 
 // ── Directory loading ─────────────────────────────────────────────────────────
 async function handleDirectory(files: FileList): Promise<void> {
+  pendingDetailsView = false; // directory load always opens the boot/options screen
   clearError();
   clearGameVideo();
   clearGameAudio();
@@ -1236,7 +1264,8 @@ async function handleDirectory(files: FileList): Promise<void> {
 }
 
 // ── Direct EBOOT / PBP loading ────────────────────────────────────────────────
-async function handleEboot(file: File, autoBoot = false): Promise<void> {
+async function handleEboot(file: File, autoBoot = false, detailsView = false): Promise<void> {
+  pendingDetailsView = detailsView;
   clearError();
   clearGameVideo();
   clearGameAudio();
@@ -1257,7 +1286,7 @@ async function handleEboot(file: File, autoBoot = false): Promise<void> {
 
   ebootBytes = new Uint8Array(buf);
 
-  const gameInfo = {
+  let gameInfo = {
     title: file.name,
     discId: "",
     category: "",
@@ -1267,6 +1296,16 @@ async function handleEboot(file: File, autoBoot = false): Promise<void> {
     saveTitle: "",
     saveDetail: ""
   };
+  // PBP games carry their PARAM.SFO and preview media (icon/pic/PMF/audio) inside
+  // the container; read them so homebrew shows its real title and media instead
+  // of the filename and a placeholder.
+  let pbp: PbpContents | null = null;
+  if (isPbp(ebootBytes)) {
+    try {
+      pbp = parsePbp(ebootBytes);
+      if (pbp.paramSfo) gameInfo = extractGameInfo(parseSfo(pbp.paramSfo.slice().buffer as ArrayBuffer));
+    } catch { /* keep the filename fallback */ }
+  }
 
   currentGameSlug = gameSlug(gameInfo.discId, file.name);
 
@@ -1278,6 +1317,8 @@ async function handleEboot(file: File, autoBoot = false): Promise<void> {
   }
 
   optionsScreenReady = true;
-  showGameView(gameInfo, undefined, undefined, undefined);
-  setStatus("Direct ELF boot — disc filesystem not available");
+  showGameView(gameInfo, pbpImageUrl(pbp?.icon0), pbpImageUrl(pbp?.pic1), pbpImageUrl(pbp?.pic0));
+  playGameMedia(pbp?.icon1Pmf ?? undefined, pbp?.snd0 ?? undefined);
+  setStatus(`Loaded: ${gameInfo.title}${gameInfo.discId ? ` · ${gameInfo.discId}` : ""}`);
+  navTo(gameOrDetailsRoute(currentGameSlug));
 }

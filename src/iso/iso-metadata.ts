@@ -9,6 +9,7 @@
 import type { IsoFile, IsoVolume } from "./iso9660.js";
 import { readFile } from "./iso9660.js";
 import { parseSfo, extractGameInfo } from "./sfo.js";
+import { isPbp, parsePbp, type PbpContents } from "../loader/pbp.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -154,12 +155,66 @@ export interface PartialIsoMetadata {
  * Extract title, disc ID, and icon from an ISO file using partial reads.
  * Only reads ~30KB per ISO instead of the full file.
  */
+// Cache by file signature so repeated calls (the scan + the focus extraction,
+// and any later recall of the same game) don't re-read and re-parse the file.
+// The value is the parsed sections with the executable stripped out (callers
+// here only read the small SFO/media sections); null means "known not a PBP".
+const pbpCache = new Map<string, PbpContents | null>();
+
+function fileSig(file: File): string {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+/** If the file is a PBP, load it fully and parse its sections (cached); else
+ *  null. This keeps ALL PBP section logic in parsePbp (the single source) so a
+ *  fix there updates every caller. ISO files fail the 4-byte magic check and
+ *  fall through to the partial-read path. */
+async function loadPbpIfPbp(file: File): Promise<PbpContents | null> {
+  const key = fileSig(file);
+  const hit = pbpCache.get(key);
+  if (hit !== undefined) return hit; // cached PBP, or cached "not a PBP" (null)
+
+  let result: PbpContents | null = null;
+  try {
+    const head = await readSlice(file, 0, 4);
+    if (isPbp(new Uint8Array(head))) {
+      const pbp = parsePbp(new Uint8Array(await file.arrayBuffer()));
+      result = { ...pbp, dataPsp: new Uint8Array(0) }; // drop the executable; not needed here
+    }
+  } catch {
+    result = null;
+  }
+  pbpCache.set(key, result);
+  return result;
+}
+
 export async function extractFromFile(file: File): Promise<PartialIsoMetadata> {
   const fallbackTitle = file.name.replace(/\.[^.]+$/, "");
   const result: PartialIsoMetadata = {
     title: fallbackTitle, discId: "", region: "", version: "", parentalLevel: 0,
     saveTitle: "", saveDetail: "", iconDataUrl: null,
   };
+
+  // PBP (homebrew): metadata + icon live inside the container, via parsePbp.
+  const pbp = await loadPbpIfPbp(file);
+  if (pbp) {
+    if (pbp.paramSfo) {
+      const info = extractGameInfo(parseSfo(pbp.paramSfo.slice().buffer as ArrayBuffer));
+      result.title = info.title || fallbackTitle;
+      result.discId = info.discId || "";
+      result.region = info.region || "";
+      result.version = info.version || "";
+      result.parentalLevel = info.parentalLevel || 0;
+      result.saveTitle = info.saveTitle || "";
+      result.saveDetail = info.saveDetail || "";
+    }
+    if (pbp.icon0) {
+      try {
+        result.iconDataUrl = await blobToDataUrl(new Blob([pbp.icon0 as BlobPart], { type: "image/png" }));
+      } catch { /* no icon */ }
+    }
+    return result;
+  }
 
   try {
     // Read PVD
@@ -215,6 +270,13 @@ export async function extractFromFile(file: File): Promise<PartialIsoMetadata> {
  */
 export async function extractMediaFromFile(file: File): Promise<{ pmf: Uint8Array | null; at3: Uint8Array | null; pic1: Uint8Array | null; pic0: Uint8Array | null }> {
   const empty = { pmf: null, at3: null, pic1: null, pic0: null };
+
+  // PBP (homebrew): the preview media is inside the container, via parsePbp.
+  const pbp = await loadPbpIfPbp(file);
+  if (pbp) {
+    return { pmf: pbp.icon1Pmf, at3: pbp.snd0, pic1: pbp.pic1, pic0: pbp.pic0 };
+  }
+
   try {
     const pvdBuf = await readSlice(file, PVD_SECTOR_NUM * SECTOR, SECTOR);
     if (new DataView(pvdBuf).getUint8(0) !== 1) return empty;

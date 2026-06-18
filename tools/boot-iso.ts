@@ -22,6 +22,8 @@ function flagValue(name: string): string | undefined {
 // --save-state <file>: write a save state after the run loop finishes.
 const loadStatePath = flagValue("--load-state");
 const saveStatePath = flagValue("--save-state");
+// --force: allow --load-state to overlay a state from a different EBOOT build.
+const forceLoad = process.argv.includes("--force");
 
 if (!isoPath || !existsSync(isoPath)) {
   console.error("Usage: npx tsx tools/boot-iso.ts <iso-path> [frames]");
@@ -101,7 +103,7 @@ async function main() {
   console.log(`Entry: 0x${emu.cpu.regs.pc.toString(16)}`);
 
   if (loadStatePath) {
-    await emu.loadState(new Uint8Array(readFileSync(loadStatePath)));
+    await emu.loadState(new Uint8Array(readFileSync(loadStatePath)), { allowBuildMismatch: forceLoad });
     console.log(`Loaded save state from ${loadStatePath} (PC now 0x${emu.cpu.regs.pc.toString(16)}, vblank ${emu.hle.vblankCount})`);
   }
 

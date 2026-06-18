@@ -1295,6 +1295,23 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     });
     return alarmEventId;
   }
+  // Register the Alarm event type eagerly once CoreTiming exists, so a save
+  // state taken with an alarm pending still remaps that event by name after a
+  // fresh boot (CoreTiming.deserialize drops events whose type isn't registered).
+  kernel.onTimingReady(() => { ensureAlarmEvent(); });
+
+  // Save the alarm table so a restored Alarm event has data to fire against.
+  // Without this the remapped event fires into an empty map and the guest
+  // handler silently never runs. (The scheduled event itself is in CoreTiming.)
+  kernel.registerStateModule("alarm", {
+    save: () => ({ alarms: [...alarms.entries()], nextAlarmId }),
+    load: (data) => {
+      const d = data as { alarms: [number, AlarmEntry][]; nextAlarmId: number };
+      alarms.clear();
+      for (const [k, v] of d.alarms) alarms.set(k, { ...v });
+      nextAlarmId = d.nextAlarmId;
+    },
+  });
 
   // sceKernelSetAlarm(clock, handler, common) → alarmId
   kernel.register(KERNEL.sceKernelSetAlarm, (regs) => {
