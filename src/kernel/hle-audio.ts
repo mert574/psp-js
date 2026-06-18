@@ -16,7 +16,7 @@ import type { HLEKernel, HLEHandler } from "./hle-kernel.js";
 import { parseAtracHeader, decodeAtrac, getCachedAtrac, getCachedAtracBySize, type AtracInfo } from "../audio/atrac-decoder.js";
 import { Mp3FrameAccumulator, decodeAudioFrame } from "../audio/frame-decoder.js";
 import { AUDIO, ATRAC, AAC, AUDIOCODEC, VAUDIO, MP3, MP4 } from "./nids.js";
-import { int16ToB64, b64ToInt16 } from "../state/binutil.js";
+import { int16ToB64, b64ToInt16, bytesToB64, b64ToBytes } from "../state/binutil.js";
 
 const log = Logger.get("HLE-AUDIO");
 const atracDecodeCallCount = new Map<number, number>();
@@ -69,6 +69,74 @@ interface AtracContext {
   bufSize: number;
   status: AtracStatus;
   codecType: number;
+
+  // ── Streaming state (HALFWAY_BUFFER / STREAMED_*) ──────────────────────────
+  // Port of PPSSPP AtracCtx: the game refills a ring buffer as it plays. We
+  // accumulate the compressed bytes linearly into `dataBuf` (= PPSSPP dataBuf_)
+  // and decode that, while keeping ring bookkeeping for the game-facing
+  // sceAtracGetStreamDataInfo / RemainingFrames. Names mirror PPSSPP fields.
+  streaming: boolean;
+  /** Full compressed file size (dataOffset + dataSize from the header). */
+  fileSize: number;
+  /** Offset where compressed frames begin (track_.dataByteOffset). */
+  dataByteOffset: number;
+  /** Compressed bytes/frame (decode + ring-consume unit). */
+  bytesPerFrame: number;
+  /** Linear accumulation of all compressed bytes received (file order). */
+  dataBuf: Uint8Array | null;
+  /** Compressed bytes in `dataBuf` so far (PPSSPP first_.size). */
+  firstSize: number;
+  /** Total bytes read from the file so far (PPSSPP first_.fileoffset). */
+  fileOffset: number;
+  /** Ring read position, advances per decoded frame (PPSSPP bufferPos_). */
+  bufferPos: number;
+  /** Valid undecoded bytes in the ring (PPSSPP bufferValidBytes_). */
+  bufferValidBytes: number;
+  /** Game ring-buffer size (PPSSPP bufferMaxSize_). */
+  bufferMaxSize: number;
+  /** `firstSize` value that `decodedPcm` was last decoded from (re-decode trigger). */
+  decodedFromSize: number;
+}
+
+/** Non-streaming default values for the streaming fields of an AtracContext. */
+function streamDefaults(): Pick<AtracContext,
+  "streaming" | "fileSize" | "dataByteOffset" | "bytesPerFrame" | "dataBuf" |
+  "firstSize" | "fileOffset" | "bufferPos" | "bufferValidBytes" | "bufferMaxSize" | "decodedFromSize"> {
+  return {
+    streaming: false, fileSize: 0, dataByteOffset: 0, bytesPerFrame: 0, dataBuf: null,
+    firstSize: 0, fileOffset: 0, bufferPos: 0, bufferValidBytes: 0, bufferMaxSize: 0, decodedFromSize: 0,
+  };
+}
+
+/** Fill the codec-extent fields when we only have a placeholder AtracInfo. */
+const FALLBACK_EXTENT = { bytesPerFrame: 0, dataOffset: 0, dataSize: 0 } as const;
+
+/**
+ * Build a self-contained RIFF/WAVE for FFmpeg from a streamed chunk: the original
+ * `fmt ` chunk verbatim (keeps the codec params and AT3+ SubFormat GUID), a `fact`
+ * with the sample count actually present, and a `data` chunk of just the whole
+ * frames. Any `smpl`/loop chunk is dropped on purpose: PSP looping files declare
+ * loop points millions of samples past the truncated data, which makes FFmpeg's
+ * AT3+ decoder read out of bounds. We handle looping ourselves.
+ *
+ * @param header  Buffer whose first bytes hold the source RIFF header (`fmt ` at offset 12).
+ * @param frames  Whole compressed frames to wrap.
+ * @param sampleCount  Decoded PCM samples the frames represent (for the `fact` chunk).
+ */
+function buildAtracRiff(header: Uint8Array, frames: Uint8Array, sampleCount: number): Uint8Array {
+  const fmtSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(16, true);
+  const fmtChunk = header.subarray(12, 20 + fmtSize);
+  const out = new Uint8Array(12 + fmtChunk.length + 12 + 8 + frames.length);
+  const dv = new DataView(out.buffer);
+  out.set([0x52, 0x49, 0x46, 0x46], 0);                                                       // "RIFF"
+  dv.setUint32(4, out.length - 8, true);
+  out.set([0x57, 0x41, 0x56, 0x45], 8);                                                       // "WAVE"
+  let o = 12;
+  out.set(fmtChunk, o); o += fmtChunk.length;
+  out.set([0x66, 0x61, 0x63, 0x74], o); dv.setUint32(o + 4, 4, true); dv.setUint32(o + 8, sampleCount, true); o += 12; // "fact"
+  out.set([0x64, 0x61, 0x74, 0x61], o); dv.setUint32(o + 4, frames.length, true); o += 8;     // "data"
+  out.set(frames, o);
+  return out;
 }
 
 // ── atracDecodeData helper ────────────────────────────────────────────────────
@@ -87,6 +155,11 @@ function atracDecodeData(
   remainPtr: number,
 ): void {
   const samplesPerFrame = ctx?.info.samplesPerFrame ?? 512;
+
+  if (ctx?.streaming) {
+    atracDecodeStreaming(bus, ctx, outAddr, numSamplesPtr, finishFlagPtr, remainPtr);
+    return;
+  }
 
   if (!ctx?.decodedPcm) {
     // Decode unavailable (still running, failed, or no audio backend) — write
@@ -132,18 +205,26 @@ function atracDecodeData(
   // Handle looping at end of stream — PPSSPP Atrac::DecodeData loops only when
   // loopNum != 0 (set via sceAtracSetLoopNum; -1 = infinite, >0 counts down)
   // and the track has valid loop points.
+  //
+  // Key guard: loop only when we actually decoded through the song's loop end.
+  // Streamed games (Burnout EA Trax) resubmit a tiny buffer via
+  // sceAtracSetDataAndGetID whose header declares the WHOLE song
+  // (loopEnd ~ millions of samples) but only ~0.5s is present. Hitting the
+  // decoded-buffer end there means "data exhausted", so we raise finishFlag=1
+  // and the game streams the next chunk instead of us looping the half-second.
   const hasLoop =
     ctx.info.loopStart >= 0 && ctx.info.loopEnd > ctx.info.loopStart;
+  const decodedThroughLoopEnd = totalPcmFrames >= ctx.info.loopEnd;
   let finishFlag: number;
   if (end >= totalPcmFrames) {
-    if (hasLoop && ctx.loopNum !== 0) {
+    if (hasLoop && ctx.loopNum !== 0 && decodedThroughLoopEnd) {
       ctx.decodePos = ctx.info.loopStart;
       if (ctx.loopNum > 0) ctx.loopNum--;
       finishFlag = 0;
       log.info(`sceAtracDecodeData id=${ctx.id}: loop wrap loopStart=${ctx.info.loopStart} loopNum=${ctx.loopNum}`);
     } else {
       finishFlag = 1;
-      log.info(`sceAtracDecodeData id=${ctx.id}: end of stream (no loop), finishFlag=1 totalFrames=${totalPcmFrames}`);
+      log.info(`sceAtracDecodeData id=${ctx.id}: chunk/stream end, finishFlag=1 decodedFrames=${totalPcmFrames} loopEnd=${ctx.info.loopEnd}`);
     }
   } else {
     finishFlag = 0;
@@ -165,6 +246,84 @@ function atracDecodeData(
   if (callN <= 5) {
     log.debug(`atracDec id=${ctx.id} #${callN} pos=${start}→${ctx.decodePos} samples=${actualSamples} remain=${remainFrames} finish=${finishFlag}`);
   }
+}
+
+/**
+ * DecodeData for streaming contexts (HALFWAY_BUFFER / STREAMED_*). Port of the
+ * relevant parts of PPSSPP Atrac::DecodeData + ConsumeFrame + RemainingFrames.
+ * Plays from the growing decodedPcm; finishes only at the header's true end
+ * sample, not at the current window. Advances the ring bookkeeping per frame so
+ * sceAtracGetStreamDataInfo keeps telling the game to refill.
+ */
+function atracDecodeStreaming(
+  bus: HLEKernel["bus"],
+  ctx: AtracContext,
+  outAddr: number,
+  numSamplesPtr: number,
+  finishFlagPtr: number,
+  remainPtr: number,
+): void {
+  const spf = ctx.info.samplesPerFrame;
+  const ch  = ctx.info.channels;
+  const pcm = ctx.decodedPcm;
+  const decodedFrames = pcm ? (pcm.length / ch) | 0 : 0;
+  const allLoaded = ctx.status === AtracStatus.ALL_DATA_LOADED;
+  // True end: header endSample if known, else (once fully loaded) what decoded.
+  const total = ctx.info.totalSamples > 0
+    ? ctx.info.totalSamples
+    : (allLoaded ? decodedFrames : Number.POSITIVE_INFINITY);
+
+  const start = ctx.decodePos;
+  let actualSamples = spf;
+  let finishFlag = 0;
+
+  if (start >= total && ctx.loopNum === 0) {
+    if (outAddr !== 0) bus.writeBytes(outAddr, new Uint8Array(spf * 4));
+    actualSamples = 0;
+    finishFlag = 1;
+  } else if (start + spf <= decodedFrames) {
+    // Decoded audio available for this frame.
+    const end = start + spf;
+    if (outAddr !== 0) {
+      const sl = pcm!.subarray(start * ch, end * ch);
+      bus.writeBytes(outAddr, new Uint8Array(sl.buffer, sl.byteOffset, sl.byteLength));
+    }
+    ctx.decodePos = end;
+  } else {
+    // Decode hasn't caught up yet (data still streaming in / FFmpeg running).
+    // Output silence and keep pace, but do NOT finish — more is coming.
+    if (outAddr !== 0) bus.writeBytes(outAddr, new Uint8Array(spf * 4));
+    ctx.decodePos = start + spf;
+  }
+
+  // Loop / true-end handling.
+  if (Number.isFinite(total) && ctx.decodePos >= total) {
+    const hasLoop = ctx.info.loopStart >= 0 && ctx.info.loopEnd > ctx.info.loopStart;
+    if (hasLoop && ctx.loopNum !== 0) {
+      ctx.decodePos = ctx.info.loopStart;
+      if (ctx.loopNum > 0) ctx.loopNum--;
+    } else if (allLoaded) {
+      finishFlag = 1;
+    } else {
+      // Hit the declared end while still streaming in — clamp, wait for data.
+      ctx.decodePos = total as number;
+    }
+  }
+
+  // Ring consume (PPSSPP ConsumeFrame) — drives GetStreamDataInfo refill.
+  if (!allLoaded && ctx.bytesPerFrame > 0) {
+    ctx.bufferPos += ctx.bytesPerFrame;
+    ctx.bufferValidBytes = ctx.bufferValidBytes > ctx.bytesPerFrame ? ctx.bufferValidBytes - ctx.bytesPerFrame : 0;
+    const end = Math.floor(ctx.bufferMaxSize / ctx.bytesPerFrame) * ctx.bytesPerFrame;
+    if (end > 0 && ctx.bufferPos >= end) ctx.bufferPos -= end;
+  }
+
+  // RemainingFrames (PPSSPP): -1 when all loaded, else valid frames in the ring.
+  const remain = allLoaded ? (-1 >>> 0) : ((ctx.bufferValidBytes / (ctx.bytesPerFrame || 1)) | 0);
+
+  if (numSamplesPtr !== 0) bus.writeU32(numSamplesPtr, actualSamples);
+  if (finishFlagPtr !== 0) bus.writeU32(finishFlagPtr, finishFlag);
+  if (remainPtr     !== 0) bus.writeU32(remainPtr, remain >>> 0);
 }
 
 // ── registerAudioHLE ─────────────────────────────────────────────────────────
@@ -443,27 +602,38 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       const sizeGuess = bufSize || data.byteLength;
       const sizeHit   = sizeGuess > 0 ? getCachedAtracBySize(sizeGuess, id) : null;
       if (sizeHit) {
-        log.debug(`sceAtrac id=${id}: empty buffer — size-based cache hit (bufAlloc=${sizeGuess}, fileSize=${sizeHit.fileSize}, ${sizeHit.pcm.length} samples)`);
-        atracContexts.set(id, { id, info: sizeHit.info, decodedPcm: sizeHit.pcm, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
+        log.debug(`sceAtrac id=${id}: empty buffer, size-based cache hit (bufAlloc=${sizeGuess}, fileSize=${sizeHit.fileSize}, ${sizeHit.pcm.length} samples)`);
+        atracContexts.set(id, { id, info: sizeHit.info, decodedPcm: sizeHit.pcm, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType, ...streamDefaults() });
         return;
       }
       log.warn(`sceAtrac id=${id}: header parse failed: ${err}`);
-      info = { codecType: "AT3", totalSamples: 0, loopStart: -1, loopEnd: -1, channels: 2, sampleRate: 44100, samplesPerFrame: 512 };
-      atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
+      info = { codecType: "AT3", totalSamples: 0, loopStart: -1, loopEnd: -1, channels: 2, sampleRate: 44100, samplesPerFrame: 512, ...FALLBACK_EXTENT };
+      atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType, ...streamDefaults() });
       return;
     }
+
+    // Detect the resubmit-streaming pattern: the header declares a far longer
+    // song (loopEnd / totalSamples) than this small buffer can hold, so it's one
+    // chunk of a stream the game keeps refilling through the same buffer
+    // (Burnout EA Trax). The RIFF header is identical on every resubmit, so the
+    // content fingerprint collides; caching would replay chunk 1 forever and
+    // leak a copy per chunk. Skip the cache and always decode the current bytes.
+    const framesInBuf = info.bytesPerFrame > 0 ? Math.floor((data.byteLength - info.dataOffset) / info.bytesPerFrame) : 0;
+    const bufferedSamples = framesInBuf * info.samplesPerFrame;
+    const declaredSamples = Math.max(info.totalSamples, info.loopEnd, 0);
+    const isStreamChunk = bufferedSamples > 0 && declaredSamples > bufferedSamples * 2;
 
     // Check if already decoded (pre-warmed or previously decoded)
-    const cached = getCachedAtrac(data);
+    const cached = isStreamChunk ? null : getCachedAtrac(data);
     if (cached) {
       log.debug(`sceAtrac id=${id}: cache hit, ${cached.length / info.channels} frames, totalSamples=${info.totalSamples}, loop=${info.loopStart}..${info.loopEnd}`);
-      atracContexts.set(id, { id, info, decodedPcm: cached, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
+      atracContexts.set(id, { id, info, decodedPcm: cached, decodePos: 0, decoding: false, released: false, loopNum: 0, bufPtr, bufSize, status, codecType, ...streamDefaults() });
       return;
     }
 
-    atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: true, released: false, loopNum: 0, bufPtr, bufSize, status, codecType });
+    atracContexts.set(id, { id, info, decodedPcm: null, decodePos: 0, decoding: true, released: false, loopNum: 0, bufPtr, bufSize, status, codecType, ...streamDefaults() });
 
-    decodeAtrac(data, info).then((pcm) => {
+    decodeAtrac(data, info, !isStreamChunk).then((pcm) => {
       const ctx = atracContexts.get(id);
       if (ctx) { ctx.decodedPcm = pcm; ctx.decoding = false; }
       log.info(`sceAtrac id=${id}: decoded ${pcm.length / info.channels} frames`);
@@ -485,6 +655,108 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     });
   }
 
+  // ── Streaming (HALFWAY_BUFFER / STREAMED_*) ────────────────────────────────
+  // Port of PPSSPP AtracCtx. The game keeps refilling a ring buffer; we
+  // accumulate every compressed byte linearly into ctx.dataBuf and decode that,
+  // and keep PPSSPP-shaped ring bookkeeping for the game-facing stream info.
+
+  /** Effective ring size, floored to whole frames (PPSSPP StreamBufferEnd). */
+  function streamBufferEnd(ctx: AtracContext): number {
+    const bpf = ctx.bytesPerFrame || 1;
+    return Math.floor(ctx.bufferMaxSize / bpf) * bpf;
+  }
+
+  /** Decode ctx.dataBuf[0..firstSize] → decodedPcm. Patches the RIFF data/RIFF
+   *  chunk sizes to the bytes actually present so FFmpeg decodes a clean
+   *  (possibly truncated) file. One contiguous decode from the start, so there
+   *  are no per-chunk boundary artifacts. Lazy: only when new data arrived. */
+  function decodeStream(ctx: AtracContext): void {
+    if (!ctx.dataBuf || ctx.decoding) return;
+    if (ctx.firstSize <= ctx.dataByteOffset) return;       // only the header so far
+    const bpf = ctx.bytesPerFrame || 1;
+    // Feed FFmpeg only whole compressed frames. firstSize rarely lands on a frame
+    // boundary, and a partial trailing frame makes the AT3/AT3+ decoder read past
+    // the buffer ("memory access out of bounds").
+    const wholeData = Math.floor((ctx.firstSize - ctx.dataByteOffset) / bpf) * bpf;
+    if (wholeData <= 0) return;
+    const fromSize = ctx.dataByteOffset + wholeData;
+    if (fromSize <= ctx.decodedFromSize) return;           // no new whole frames since last decode
+    // Throttle: re-decoding the whole accumulation on every ~500-byte AddStreamData
+    // is O(n^2) and saturates the FFmpeg pool, which starves the next song's decode
+    // when the game switches tracks. After the first decode, wait for a batch of new
+    // frames (or the end of the stream).
+    const allLoaded = ctx.status === AtracStatus.ALL_DATA_LOADED;
+    if (ctx.decodedFromSize > 0 && (fromSize - ctx.decodedFromSize) < bpf * 24 && !allLoaded) return;
+    const realSpf = ctx.codecType === PSP_CODEC_AT3PLUS ? 2048 : 1024;
+    const frames = ctx.dataBuf.subarray(ctx.dataByteOffset, ctx.dataByteOffset + wholeData);
+    const buf = buildAtracRiff(ctx.dataBuf, frames, (wholeData / bpf) * realSpf);
+    ctx.decoding = true;
+    // Don't cache: each growing partial decode is unique and never reused, so
+    // caching would leak large PCM arrays over a long stream.
+    decodeAtrac(buf, ctx.info, false).then((pcm) => {
+      ctx.decoding = false;
+      // A song switch may have replaced this context on the same id while we
+      // decoded — drop the stale PCM instead of overwriting the new song.
+      if (atracContexts.get(ctx.id) !== ctx) return;
+      // Keep the largest decode (a later, bigger one may finish out of order).
+      if (!ctx.decodedPcm || pcm.length >= ctx.decodedPcm.length) {
+        ctx.decodedPcm = pcm;
+        ctx.decodedFromSize = fromSize;
+      }
+      const w = atracWaiters.get(ctx.id);
+      if (w) { atracWaiters.delete(ctx.id); for (const tid of w) kernel.pendingAtracWakes.add(tid); }
+    }).catch((err: unknown) => {
+      // The FFmpeg pool drops the trapped instance and retries on the next
+      // refill, so a one-off decode failure self-heals; keep it quiet.
+      log.debug(`sceAtrac id=${ctx.id}: stream decode failed (will retry): ${err}`);
+      ctx.decoding = false;
+    });
+  }
+
+  /** Set up a streaming context from the initial window. Returns false if the
+   *  header can't be parsed or the data is actually complete (caller falls back
+   *  to the whole-buffer path). */
+  function setupStreaming(id: number, bufPtr: number, readSize: number, bufSize: number, codecType: number): boolean {
+    let info: AtracInfo;
+    try {
+      info = parseAtracHeader(kernel.bus.readBytes(bufPtr, Math.min(readSize, 4096)));
+    } catch {
+      return false; // not RIFF / unparseable → caller handles best-effort
+    }
+    const fileSize = info.dataOffset + info.dataSize;
+    if (info.dataOffset === 0 || fileSize <= readSize) return false; // complete → not streaming
+
+    const dataBuf = new Uint8Array(fileSize);
+    dataBuf.set(kernel.bus.readBytes(bufPtr, Math.min(readSize, fileSize)));
+
+    // Buffer big enough for the whole file → HALFWAY (linear fill); else ring stream.
+    const hasLoop = info.loopStart >= 0 && info.loopEnd > info.loopStart;
+    const status = bufSize >= fileSize
+      ? AtracStatus.HALFWAY_BUFFER
+      : (hasLoop ? AtracStatus.STREAMED_LOOP_FROM_END : AtracStatus.STREAMED_WITHOUT_LOOP);
+
+    const ctx: AtracContext = {
+      id, info, decodedPcm: null, decodePos: 0, decoding: false, released: false, loopNum: 0,
+      bufPtr, bufSize, status, codecType,
+      ...streamDefaults(),
+      streaming: true,
+      fileSize,
+      dataByteOffset: info.dataOffset,
+      bytesPerFrame: info.bytesPerFrame,
+      dataBuf,
+      firstSize: readSize,
+      fileOffset: readSize,
+      bufferMaxSize: bufSize,
+      // Ring read starts after the first frame; valid undecoded = what's buffered past it.
+      bufferPos: info.dataOffset,
+      bufferValidBytes: Math.max(0, Math.min(readSize, fileSize) - info.dataOffset),
+    };
+    atracContexts.set(id, ctx);
+    log.debug(`sceAtrac id=${id}: streaming setup fileSize=${fileSize} readSize=${readSize} bufSize=${bufSize} bpf=${info.bytesPerFrame} status=${status} loop=${info.loopStart}..${info.loopEnd}`);
+    decodeStream(ctx);
+    return true;
+  }
+
   // ── sceAtracSetDataAndGetID(buf, size) → atracID ─────────────────────────
   kernel.register(ATRAC.sceAtracSetDataAndGetID, (regs, bus) => {
     const ptr  = regs.getGpr(4);
@@ -502,8 +774,15 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       regs.setGpr(2, SCE_ERROR_ATRAC_NO_ATRACID);
       return;
     }
-    log.debug(`sceAtracSetDataAndGetID: ptr=0x${ptr.toString(16)} size=${size} → id=${id}`);
-    beginAtracDecode(id, bus.readBytes(ptr, size), ptr, size, AtracStatus.ALL_DATA_LOADED, codecType);
+    log.debug(`sceAtracSetDataAndGetID: ptr=0x${ptr.toString(16)} size=${size} codec=0x${codecType.toString(16)} → id=${id}`);
+    // PPSSPP passes bufferSize = readSize = size here; if the header declares a
+    // bigger file than the buffer holds, that makes the track STREAMED (the game
+    // then keeps feeding via GetStreamDataInfo/AddStreamData). Burnout EA Trax
+    // polls GetStreamDataInfo every decode, so it needs nonzero writableBytes.
+    // Fall back to a whole-buffer decode only when the file is fully present.
+    if (!setupStreaming(id, ptr, size, size, codecType)) {
+      beginAtracDecode(id, bus.readBytes(ptr, size), ptr, size, AtracStatus.ALL_DATA_LOADED, codecType);
+    }
     regs.setGpr(2, id);
   });
 
@@ -529,9 +808,12 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       regs.setGpr(2, SCE_ERROR_ATRAC_NO_ATRACID);
       return;
     }
-    const atracStatus = readSize === bSize ? AtracStatus.ALL_DATA_LOADED : AtracStatus.HALFWAY_BUFFER;
     log.debug(`sceAtracSetHalfwayBufferAndGetID: ptr=0x${ptr.toString(16)} readSize=${readSize} bufSize=${bSize} → id=${id}`);
-    beginAtracDecode(id, bus.readBytes(ptr, readSize), ptr, bSize, atracStatus, codecType);
+    // Streaming if the file is bigger than what's buffered; else whole-buffer.
+    if (!setupStreaming(id, ptr, readSize, bSize, codecType)) {
+      const atracStatus = readSize === bSize ? AtracStatus.ALL_DATA_LOADED : AtracStatus.HALFWAY_BUFFER;
+      beginAtracDecode(id, bus.readBytes(ptr, readSize), ptr, bSize, atracStatus, codecType);
+    }
     regs.setGpr(2, id);
   });
 
@@ -549,6 +831,17 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     // Alignment check
     if (outAddr & 1) {
       regs.setGpr(2, SCE_ERROR_ATRAC_BAD_ALIGNMENT);
+      return;
+    }
+
+    // Streaming: keep the decode of the accumulated buffer current (lazy — only
+    // re-decodes when new compressed data arrived), then play from it. Never
+    // block per-frame; if decode lags, atracDecodeStreaming outputs brief
+    // silence without finishing.
+    if (ctx?.streaming) {
+      decodeStream(ctx);
+      atracDecodeData(bus, ctx, outAddr, regs.getGpr(6), regs.getGpr(7), regs.getGpr(8));
+      regs.setGpr(2, 0);
       return;
     }
 
@@ -589,9 +882,12 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     if (!ctx) { regs.setGpr(2, SCE_ERROR_ATRAC_BAD_ATRACID); return; }
     const remain = ctx.status === AtracStatus.ALL_DATA_LOADED
       ? (-1 >>> 0)
-      : (ctx.decodedPcm === null
-          ? 1
-          : Math.max(0, Math.ceil((ctx.info.totalSamples - ctx.decodePos) / ctx.info.samplesPerFrame)));
+      : ctx.streaming
+        // Streaming: valid undecoded frames in the ring (PPSSPP RemainingFrames).
+        ? ((ctx.bufferValidBytes / (ctx.bytesPerFrame || 1)) | 0)
+        : (ctx.decodedPcm === null
+            ? 1
+            : Math.max(0, Math.ceil((ctx.info.totalSamples - ctx.decodePos) / ctx.info.samplesPerFrame)));
     const addr = regs.getGpr(5);
     if (addr !== 0) bus.writeU32(addr, remain);
     regs.setGpr(2, 0);
@@ -709,11 +1005,13 @@ export function registerAudioHLE(kernel: HLEKernel): void {
         totalSamples: 0, loopStart: -1, loopEnd: -1,
         channels: 2, sampleRate: 44100,
         samplesPerFrame: codecType === PSP_CODEC_AT3PLUS ? 2048 : 1024,
+        ...FALLBACK_EXTENT,
       },
       decodedPcm: null, decodePos: 0, decoding: false, released: false, loopNum: 0,
       bufPtr: 0, bufSize: 0,
       status: AtracStatus.LOW_LEVEL,
       codecType,
+      ...streamDefaults(),
     });
     log.debug(`sceAtracGetAtracID: codecType=0x${codecType.toString(16)} → id=${id}`);
     regs.setGpr(2, id);
@@ -722,9 +1020,34 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   // ── sceAtracGetStreamDataInfo(id, writePtrAddr, writableBytesAddr, readOffsetAddr) ──
   // PPSSPP NID 0x5d268707
   kernel.register(ATRAC.sceAtracGetStreamDataInfo, (regs, bus) => {
-    const writeP  = regs.getGpr(5); if (writeP  !== 0) bus.writeU32(writeP, 0);
-    const writeSz = regs.getGpr(6); if (writeSz !== 0) bus.writeU32(writeSz, 0);
-    const rdOff   = regs.getGpr(7); if (rdOff   !== 0) bus.writeU32(rdOff, 0);
+    const ctx = atracContexts.get(regs.getGpr(4));
+    const writeP  = regs.getGpr(5);
+    const writeSz = regs.getGpr(6);
+    const rdOff   = regs.getGpr(7);
+    // Port of PPSSPP Atrac::CalculateStreamInfo (AtracCtx.cpp:515). Tells the
+    // game where in its ring to write the next chunk, how much, and the file
+    // offset to read from. Non-streaming contexts have nothing to add.
+    let writePtr = ctx?.bufPtr ?? 0, writableBytes = 0, readOffset = 0;
+    if (ctx?.streaming && ctx.status !== AtracStatus.ALL_DATA_LOADED) {
+      readOffset = ctx.fileOffset;
+      let offset = 0;
+      if (ctx.status === AtracStatus.HALFWAY_BUFFER) {
+        offset = readOffset;
+        writableBytes = ctx.fileSize - readOffset;
+      } else {
+        const bufEnd = streamBufferEnd(ctx);
+        const validExt = ctx.bufferPos + ctx.bufferValidBytes;
+        if (validExt < bufEnd) { offset = validExt; writableBytes = bufEnd - validExt; }
+        else { const startUsed = validExt - bufEnd; offset = startUsed; writableBytes = ctx.bufferPos - startUsed; }
+        if (readOffset >= ctx.fileSize) { readOffset = 0; offset = 0; writableBytes = 0; }
+      }
+      if (readOffset + writableBytes > ctx.fileSize) writableBytes = ctx.fileSize - readOffset;
+      if (writableBytes < 0) writableBytes = 0;
+      writePtr = ctx.bufPtr + offset;
+    }
+    if (writeP  !== 0) bus.writeU32(writeP, writePtr >>> 0);
+    if (writeSz !== 0) bus.writeU32(writeSz, writableBytes >>> 0);
+    if (rdOff   !== 0) bus.writeU32(rdOff, readOffset >>> 0);
     regs.setGpr(2, 0);
   });
 
@@ -741,7 +1064,7 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   // buffer set up by sceAtracSetHalfwayBufferAndGetID.  Re-read and decode.
   kernel.register(ATRAC.sceAtracAddStreamData, (regs, bus) => {
     const id         = regs.getGpr(4);
-    const bytesAdded = regs.getGpr(5);
+    const bytesAdded = regs.getGpr(5) >>> 0;
     const ctx = atracContexts.get(id);
     if (!ctx || ctx.bufPtr === 0) { regs.setGpr(2, 0); return; }
     if (ctx.status === AtracStatus.ALL_DATA_LOADED) {
@@ -749,10 +1072,29 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       regs.setGpr(2, SCE_ERROR_ATRAC_ALL_DATA_LOADED);
       return;
     }
-    log.info(`sceAtracAddStreamData id=${id} bytesAdded=${bytesAdded} — re-reading buffer`);
-    // Re-read the full buffer from PSP RAM (game has now filled it)
-    const data = bus.readBytes(ctx.bufPtr, ctx.bufSize || bytesAdded);
-    beginAtracDecode(id, data, ctx.bufPtr, ctx.bufSize, ctx.status, ctx.codecType);
+    if (!ctx.streaming || !ctx.dataBuf) {
+      // Pre-streaming fallback (non-RIFF/unparseable header): re-read whole buffer.
+      const data = bus.readBytes(ctx.bufPtr, ctx.bufSize || bytesAdded);
+      beginAtracDecode(id, data, ctx.bufPtr, ctx.bufSize, ctx.status, ctx.codecType);
+      regs.setGpr(2, 0);
+      return;
+    }
+    // Port of PPSSPP Atrac::AddStreamData (AtracCtx.cpp:546): the game wrote
+    // `bytesAdded` compressed bytes at the ring position we returned in
+    // GetStreamDataInfo. Copy them into our linear accumulation buffer.
+    const ringPos = (ctx.status === AtracStatus.HALFWAY_BUFFER)
+      ? ctx.fileOffset
+      : ((ctx.bufferPos + ctx.bufferValidBytes) % streamBufferEnd(ctx));
+    const n = Math.min(bytesAdded, ctx.fileSize - ctx.fileOffset);
+    if (n > 0) {
+      const src = bus.readBytes(ctx.bufPtr + ringPos, n);
+      ctx.dataBuf.set(src.subarray(0, Math.min(n, ctx.dataBuf.length - ctx.fileOffset)), ctx.fileOffset);
+      ctx.fileOffset += n;
+      ctx.firstSize += n;
+      ctx.bufferValidBytes += n;
+    }
+    if (ctx.fileOffset >= ctx.fileSize) ctx.status = AtracStatus.ALL_DATA_LOADED;
+    decodeStream(ctx);
     regs.setGpr(2, 0);
   });
 
@@ -763,7 +1105,10 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     const sz  = regs.getGpr(6) >>> 0;
     const ctx = atracContexts.get(id);
     if (!ctx) { regs.setGpr(2, SCE_ERROR_ATRAC_BAD_ATRACID); return; }
-    beginAtracDecode(id, bus.readBytes(ptr, sz), ptr, sz, AtracStatus.ALL_DATA_LOADED, ctx.codecType);
+    log.debug(`sceAtracSetData: id=${id} ptr=0x${ptr.toString(16)} size=${sz}`);
+    if (!setupStreaming(id, ptr, sz, sz, ctx.codecType)) {
+      beginAtracDecode(id, bus.readBytes(ptr, sz), ptr, sz, AtracStatus.ALL_DATA_LOADED, ctx.codecType);
+    }
     regs.setGpr(2, 0);
   });
 
@@ -851,7 +1196,9 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     if (readSize > bSize) { regs.setGpr(2, SCE_ERROR_ATRAC_INCORRECT_READ_SIZE); return; }
     const ctx = atracContexts.get(id);
     if (!ctx) { regs.setGpr(2, SCE_ERROR_ATRAC_BAD_ATRACID); return; }
-    beginAtracDecode(id, bus.readBytes(ptr, readSize), ptr, bSize, AtracStatus.HALFWAY_BUFFER, ctx.codecType);
+    if (!setupStreaming(id, ptr, readSize, bSize, ctx.codecType)) {
+      beginAtracDecode(id, bus.readBytes(ptr, readSize), ptr, bSize, AtracStatus.HALFWAY_BUFFER, ctx.codecType);
+    }
     regs.setGpr(2, 0);
   });
 
@@ -1142,7 +1489,7 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   kernel.stub(MP3.sceMp3GetSamplingRate);
   kernel.stub(MP3.sceMp3GetSumDecodedSample);
   kernel.stub(MP3.sceMp3Init, 1);
-  kernel.stub(MP3.sceMp3InitResource, 1);
+  kernel.stub(MP3.sceMp3InitResource); // PPSSPP sceMp3.cpp:306 returns 0 on success, not 1
   kernel.stub(MP3.sceMp3LowLevelDecode);
   kernel.stub(MP3.sceMp3LowLevelInit, 1);
   kernel.stub(MP3.sceMp3NotifyAddStreamData, 1);
@@ -1205,6 +1552,7 @@ export function registerAudioHLE(kernel: HLEKernel): void {
         atracContexts: [...atracContexts.entries()].map(([k, v]) => [k, {
           ...v,
           decodedPcm: v.decodedPcm ? int16ToB64(v.decodedPcm) : null,
+          dataBuf: v.dataBuf ? bytesToB64(v.dataBuf) : null,
         }]),
         atracContextTypes: atracContextTypes.slice(),
         atracWaiters: [...atracWaiters.entries()].map(([k, v]) => [k, v.slice()]),
@@ -1217,7 +1565,7 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     },
     load(data) {
       const d = data as {
-        atracContexts: [number, Omit<AtracContext, "decodedPcm"> & { decodedPcm: string | null }][];
+        atracContexts: [number, Omit<AtracContext, "decodedPcm" | "dataBuf"> & { decodedPcm: string | null; dataBuf: string | null }][];
         atracContextTypes: number[];
         atracWaiters: [number, number[]][];
         outputCallCount: [number, number][];
@@ -1227,8 +1575,10 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       atracContexts.clear();
       for (const [k, v] of d.atracContexts) {
         atracContexts.set(k, {
+          ...streamDefaults(), // defaults for fields absent in older save states
           ...v,
-          decodedPcm: v.decodedPcm !== null ? b64ToInt16(v.decodedPcm) : null,
+          decodedPcm: v.decodedPcm ? b64ToInt16(v.decodedPcm) : null,
+          dataBuf: v.dataBuf ? b64ToBytes(v.dataBuf) : null,
         });
       }
       atracContextTypes.length = 0;

@@ -77,9 +77,15 @@ export class FFmpegPool {
   async exec<T>(fn: (ff: FFmpeg) => Promise<T>): Promise<T> {
     const entry = await this._acquire();
     try {
-      return await fn(entry.ff);
-    } finally {
+      const result = await fn(entry.ff);
       this._release(entry);
+      return result;
+    } catch (err) {
+      // A WASM trap (e.g. "memory access out of bounds") permanently corrupts
+      // the instance. Recycling it would poison every later decode routed to it,
+      // so drop it and spin up a replacement instead of releasing it.
+      this._replace(entry);
+      throw err;
     }
   }
 
@@ -141,6 +147,24 @@ export class FFmpegPool {
     if (next) {
       entry.busy = true;
       next(entry);
+    }
+  }
+
+  /**
+   * Drop a (possibly trapped) instance from the pool and tear it down. If callers
+   * are waiting, create a fresh instance to take the freed slot so a poisoned
+   * instance is never handed out again.
+   */
+  private _replace(entry: PoolEntry): void {
+    const idx = this.entries.indexOf(entry);
+    if (idx >= 0) this.entries.splice(idx, 1);
+    try { entry.ff.terminate(); } catch { /* ignore */ }
+
+    const next = this.waitQueue.shift();
+    if (next) {
+      this._createEntry()
+        .then(fresh => { fresh.busy = true; next(fresh); })
+        .catch(() => { this.waitQueue.unshift(next); });
     }
   }
 }
