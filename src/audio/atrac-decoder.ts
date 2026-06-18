@@ -114,6 +114,12 @@ export interface AtracInfo {
   channels: number;
   sampleRate: number;
   samplesPerFrame: number; // 512 for AT3, 1024 for AT3+
+  /** Compressed bytes per frame (RIFF fmt nBlockAlign); the streaming decode/consume unit. */
+  bytesPerFrame: number;
+  /** File offset where the compressed `data` payload begins (header size). */
+  dataOffset: number;
+  /** Size of the compressed `data` payload (full, even when only partly buffered). */
+  dataSize: number;
 }
 
 /**
@@ -136,6 +142,9 @@ export function parseAtracHeader(data: Uint8Array): AtracInfo {
   let totalSamples = 0;
   let loopStart  = -1;
   let loopEnd    = -1;
+  let blockAlign = 0;
+  let dataOffset = 0;
+  let dataSize   = 0;
 
   while (offset + 8 <= data.length) {
     const tag  = String.fromCharCode(data[offset]!, data[offset + 1]!, data[offset + 2]!, data[offset + 3]!);
@@ -146,6 +155,7 @@ export function parseAtracHeader(data: Uint8Array): AtracInfo {
       codecTag   = view.getUint16(chunkStart,     true);
       channels   = view.getUint16(chunkStart + 2, true);
       sampleRate = view.getUint32(chunkStart + 4, true);
+      blockAlign = view.getUint16(chunkStart + 12, true); // nBlockAlign = compressed bytes/frame
     } else if (tag === "fact") {
       totalSamples = view.getUint32(chunkStart, true);
     } else if (tag === "smpl" && size >= 36) {
@@ -154,26 +164,45 @@ export function parseAtracHeader(data: Uint8Array): AtracInfo {
         loopStart = view.getUint32(chunkStart + 36 + 8,  true);
         loopEnd   = view.getUint32(chunkStart + 36 + 12, true);
       }
+    } else if (tag === "data") {
+      // Offset/size of the compressed payload. The declared size is the FULL
+      // size even when the buffer only holds part of it (streaming).
+      dataOffset = chunkStart;
+      dataSize   = size;
     }
 
+    if (tag === "data") break; // data is last; its content may be truncated in a streaming buffer
     offset = chunkStart + ((size + 1) & ~1); // word-align next chunk
   }
 
-  // 0x0270 = AT3PLUS (ATRAC3plus), 0x0162 = AT3 (ATRAC3)
+  // 0x0270 = AT3PLUS (ATRAC3plus), 0x0162 = AT3 (ATRAC3).
+  // NOTE: PSP streaming files (e.g. Burnout EA Trax) are WAVE_FORMAT_EXTENSIBLE
+  // (tag 0xFFFE) with the real codec in the SubFormat GUID, so they fall through
+  // to "AT3" here. That's left as-is on purpose: FFmpeg reads the actual codec
+  // from the GUID, and the streaming path is paced by decoded PCM length, so the
+  // misclassification (and the half-size samplesPerFrame below) is harmless in
+  // practice. Reading the GUID to set this exactly would be more correct but
+  // changes behaviour for working games, so it's not worth the regression risk.
   const codecType      = (codecTag === 0x0270) ? "AT3PLUS" : "AT3";
   const samplesPerFrame = codecType === "AT3PLUS" ? 1024 : 512;
+  const bytesPerFrame   = blockAlign > 0 ? blockAlign : (codecType === "AT3PLUS" ? 0x200 : 0xC0);
 
-  return { codecType, totalSamples, loopStart, loopEnd, channels, sampleRate, samplesPerFrame };
+  return {
+    codecType, totalSamples, loopStart, loopEnd, channels, sampleRate, samplesPerFrame,
+    bytesPerFrame, dataOffset, dataSize,
+  };
 }
 
 /**
  * Decode an ATRAC audio file to raw signed-16-bit little-endian PCM using FFmpeg WASM.
  * Returns an Int16Array of interleaved stereo (or mono) samples.
  */
-export async function decodeAtrac(data: Uint8Array, info: AtracInfo): Promise<Int16Array> {
+export async function decodeAtrac(data: Uint8Array, info: AtracInfo, cache = true): Promise<Int16Array> {
   const key = fingerprint(data);
-  const cached = pcmCache.get(key);
-  if (cached) return cached;
+  if (cache) {
+    const cached = pcmCache.get(key);
+    if (cached) return cached;
+  }
 
   return getPool().exec(async (ff) => {
     // Unique filenames per decode to avoid collisions across pool instances
@@ -196,7 +225,7 @@ export async function decodeAtrac(data: Uint8Array, info: AtracInfo): Promise<In
       const raw = await ff.readFile(outputName) as Uint8Array;
       const plain = raw.slice();
       const result = new Int16Array(plain.buffer, plain.byteOffset, plain.byteLength / 2);
-      pcmCache.set(key, result);
+      if (cache) pcmCache.set(key, result);
       return result;
     } finally {
       try { await ff.deleteFile(inputName);  } catch { /* ignore */ }
