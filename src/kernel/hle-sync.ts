@@ -1444,6 +1444,21 @@ export function registerSyncHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
+  // sceKernelSetCompiledSdkVersion395 — PPSSPP sceKernelMemory.cpp:1097 records the
+  // SDK version (range warning skipped), same as the family above.
+  kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion395, (regs) => {
+    kernel.compiledSdkVersion = regs.getGpr(4);
+    log.debug(`sceKernelSetCompiledSdkVersion395(0x${kernel.compiledSdkVersion.toString(16)})`);
+    regs.setGpr(2, 0);
+  });
+
+  // sceKernelSetCompiledSdkVersion600_602 — PPSSPP sceKernelMemory.cpp:1112, same.
+  kernel.register(SYSMEM.sceKernelSetCompiledSdkVersion600_602, (regs) => {
+    kernel.compiledSdkVersion = regs.getGpr(4);
+    log.debug(`sceKernelSetCompiledSdkVersion600_602(0x${kernel.compiledSdkVersion.toString(16)})`);
+    regs.setGpr(2, 0);
+  });
+
   // sceKernelGetCompiledSdkVersion
   kernel.register(SYSMEM.sceKernelGetCompiledSdkVersion, (regs) => {
     regs.setGpr(2, kernel.compiledSdkVersion);

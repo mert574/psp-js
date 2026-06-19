@@ -19,6 +19,7 @@ import { registerDisplayHLE } from "./hle-display.js";
 import { registerCtrlHLE } from "./hle-ctrl.js";
 import { registerIoHLE } from "./hle-io.js";
 import { registerPowerHLE } from "./hle-power.js";
+import { registerUmdHLE } from "./hle-umd.js";
 import { registerNetHLE } from "./hle-net.js";
 import { registerMediaHLE } from "./hle-media.js";
 import { registerMpegHLE } from "./hle-mpeg.js";
@@ -758,6 +759,7 @@ export class HLEKernel {
     registerCtrlHLE(this);
     registerIoHLE(this);
     registerPowerHLE(this);
+    registerUmdHLE(this);
     registerNetHLE(this);
     registerPsmfPlayerHLE(this);
     registerMpegHLE(this);
@@ -1162,14 +1164,17 @@ export class HLEKernel {
     return true;
   }
 
-  yieldToOtherThread(regs: AllegrexRegisters): boolean {
+  yieldToOtherThread(regs: AllegrexRegisters, maxPriority?: number): boolean {
     const current = this.threads.get(this.currentThreadId);
     if (!current) return false;
 
-    // Find a different READY thread
+    // Find a different READY thread. When maxPriority is given, only consider
+    // threads at least as high priority (priority number <= maxPriority) — used by
+    // sceKernelRotateThreadReadyQueue, which only yields to same-or-higher threads.
     let best: Thread | null = null;
     for (const t of this.threads.values()) {
       if (t.id !== current.id && t.state === ThreadState.READY) {
+        if (maxPriority !== undefined && t.priority > maxPriority) continue;
         if (!best || t.priority < best.priority) best = t;
       }
     }

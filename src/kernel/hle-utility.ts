@@ -912,9 +912,11 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  kernel.stub(HPRM.sceHprmIsHeadphoneExist);
-  kernel.stub(HPRM.sceHprmIsMicrophoneExist);
-  kernel.stub(HPRM.sceHprmIsRemoteExist);
+  // sceHprmIs{Headphone,Microphone,Remote}Exist — PPSSPP sceHprm.cpp:31-40 all
+  // return 0 (nothing attached). Real return-0 handlers, not stubs.
+  kernel.register(HPRM.sceHprmIsHeadphoneExist, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(HPRM.sceHprmIsMicrophoneExist, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(HPRM.sceHprmIsRemoteExist, (regs) => { regs.setGpr(2, 0); });
   kernel.stub(HPRM.sceHprmPeekLatch);
   kernel.stub(HPRM.sceHprmReadLatch);
   kernel.stub(HPRM.sceHprmRegisterCallback, 1);

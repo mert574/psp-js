@@ -143,6 +143,20 @@ export function registerMediaHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
+  // sceRtcGetAccumulativeTime() — PPSSPP sceRtc.cpp:290 returns the current RTC tick
+  // as a u64 (v0=low, v1=high) and reschedules. The old stub returned 0, so games
+  // that use it as a monotonic clock (e.g. `while (getAccumulativeTime() - start <
+  // delay)`) saw time frozen at 0 and spun forever. Set the return before yielding.
+  const rtcAccumulativeTime = (regs: Parameters<Parameters<typeof kernel.register>[1]>[0]): void => {
+    const us = BigInt(getEmulatedUsRtc());
+    regs.setGpr(2, Number(us & 0xFFFFFFFFn));
+    regs.setGpr(3, Number((us >> 32n) & 0xFFFFFFFFn));
+    kernel.reschedule(regs); // PPSSPP hleReSchedule
+  };
+  kernel.register(RTC.sceRtcGetAccumulativeTime, rtcAccumulativeTime);
+  // PPSSPP maps the misspelled alias NID (0x029CA3B3) to the same function.
+  kernel.register(RTC.sceRtcGetAccumlativeTime, rtcAccumulativeTime);
+
   // sceRtcGetTickResolution → 1000000 (microseconds)
   kernel.register(RTC.sceRtcGetTickResolution, (regs) => {
     regs.setGpr(2, 1000000);
@@ -614,8 +628,6 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   kernel.stub(RTC.sceRtcFormatRFC2822LocalTime);
   kernel.stub(RTC.sceRtcFormatRFC3339);
   kernel.stub(RTC.sceRtcFormatRFC3339LocalTime);
-  kernel.stub(RTC.sceRtcGetAccumlativeTime);
-  kernel.stub(RTC.sceRtcGetAccumulativeTime);
   kernel.stub(RTC.sceRtcGetAlarmTick);
   kernel.stub(RTC.sceRtcGetCurrentNetworkTick);
   kernel.stub(RTC.sceRtcGetDayOfWeek);
