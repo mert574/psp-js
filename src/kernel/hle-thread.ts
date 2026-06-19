@@ -1350,8 +1350,26 @@ export function registerThreadHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
+  // sceKernelRotateThreadReadyQueue(priority) — PPSSPP sceKernelThread.cpp:2137/2161.
+  // Moves the head of the ready queue at `priority` to the back, then reschedules, so
+  // the next thread of that priority gets the CPU (round-robin). priority 0 means "my
+  // own priority". Games busy-call this to hand off to a sibling thread (Wipeout's
+  // loop does); the old stub returned 0 without yielding, so the caller spun forever
+  // and the game hung. We set v0 first, then yield to another same-or-higher thread
+  // (PPSSPP only switches to a thread at >= the rotated priority).
+  kernel.register(THREAD.sceKernelRotateThreadReadyQueue, (regs) => {
+    let priority = regs.getGpr(4) | 0;
+    const cur = kernel.threads.get(kernel.currentThreadId);
+    if (priority === 0 && cur) priority = cur.priority;
+    if (priority <= 0x07 || priority > 0x77) {
+      regs.setGpr(2, 0x80020193); // SCE_KERNEL_ERROR_ILLEGAL_PRIORITY
+      return;
+    }
+    regs.setGpr(2, 0); // set return value before yielding (yielding thread resumes with it)
+    kernel.yieldToOtherThread(regs, priority);
+  });
+
   // ── Stubs: THREAD ──────────────────────────────────────────────────────────
-  kernel.stub(THREAD.sceKernelRotateThreadReadyQueue);
   kernel.stub(THREAD.sceKernelSuspendThread);
   kernel.stub(THREAD.sceKernelResumeThread);
   // sceKernelWaitThreadEndCB — same as WaitThreadEnd but allows callbacks
@@ -1693,10 +1711,8 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(SYSMEM.SysMemUserForUser_D8DE5C1E);
   kernel.stub(SYSMEM.sceKernelGetPTRIG);
   kernel.stub(SYSMEM.sceKernelQueryMemoryInfo);
-  kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion395);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion401_402);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion507);
-  kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion600_602);
   kernel.stub(SYSMEM.sceKernelSetCompiledSdkVersion606);
   kernel.stub(SYSMEM.sceKernelSetPTRIG);
   kernel.stub(SYSMEM.sceKernelSetUsersystemLibWork);

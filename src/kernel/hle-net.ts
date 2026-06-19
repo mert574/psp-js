@@ -10,6 +10,23 @@ const log = Logger.get("HLE-NET");
 
 export function registerNetHLE(kernel: HLEKernel): void {
 
+  // sceWlanGetEtherAddr(addrAddr) — PPSSPP sceNet.cpp:1027. Writes the 6-byte
+  // wlan MAC address to addrAddr. The old stub wrote nothing and just returned 0,
+  // so games read whatever was already in that RAM as their MAC. Some games embed
+  // the MAC in savedata and report "corrupted data" when it differs between runs
+  // (PPSSPP names Gran Turismo for exactly this). We hand back a fixed MAC with the
+  // low two bits of byte 0 cleared (unicast, globally-unique), matching PPSSPP.
+  const wlanMac = [0x00, 0x16, 0x44, 0x12, 0x34, 0x56];
+  kernel.register(WLAN.sceWlanGetEtherAddr, (regs, bus) => {
+    const addrAddr = regs.getGpr(4) >>> 0;
+    if (!bus.isValidAddress(addrAddr) || !bus.isValidAddress(addrAddr + 5)) {
+      regs.setGpr(2, 0x800200d3); // SCE_KERNEL_ERROR_ILLEGAL_ADDR
+      return;
+    }
+    for (let i = 0; i < 6; i++) bus.writeU8(addrAddr + i, wlanMac[i]!);
+    regs.setGpr(2, 0);
+  });
+
   // ── Stubs: HTTP ──────────────────────────────────────────────────────────
   kernel.stub(HTTP.sceHttpAbortRequest);
   kernel.stub(HTTP.sceHttpAddCookie, 1);
@@ -311,7 +328,7 @@ export function registerNetHLE(kernel: HLEKernel): void {
   kernel.stub(NP2.sceNpMatching2SignalingGetConnectionStatus, 1);
   kernel.stub(NP2.sceNpMatching2Term);
   // ── WLAN ──────────────────────────────────────────────────────────
-  kernel.stub(WLAN.sceWlanGetEtherAddr);
+  // sceWlanGetEtherAddr is a real handler above (writes the MAC).
   kernel.stub(WLAN.sceWlanGetSwitchState);
   // ── OPENPSID ──────────────────────────────────────────────────────────
   kernel.stub(OPENPSID.sceDdrdb_F013F8BF);
