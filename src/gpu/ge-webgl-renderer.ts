@@ -387,7 +387,10 @@ export class WebGLGERenderer {
       antialias: false,
       depth: true,
       stencil: true,
-      preserveDrawingBuffer: false,
+      // Keep the last presented frame on the canvas. Frame skip doesn't present on
+      // skipped frames; without this WebGL clears the drawing buffer after each
+      // composite, so skipped frames would flash black instead of holding the frame.
+      preserveDrawingBuffer: true,
     });
     if (!gl) throw new Error("WebGL not supported");
     this.gl = gl;
