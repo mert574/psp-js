@@ -142,12 +142,12 @@ export function readVertices(
     }
 
     // Color
-    if (colorFmt === 4) { // 16-bit 5551
-      align2();
-      v.color = color5551to8888(bus.readU16(vAddr + off)); off += 2;
-    } else if (colorFmt === 5) { // 16-bit 5650
+    if (colorFmt === 4) { // 16-bit 5650 (GE_VTYPE_COL_565 = 4)
       align2();
       v.color = color5650to8888(bus.readU16(vAddr + off)); off += 2;
+    } else if (colorFmt === 5) { // 16-bit 5551 (GE_VTYPE_COL_5551 = 5)
+      align2();
+      v.color = color5551to8888(bus.readU16(vAddr + off)); off += 2;
     } else if (colorFmt === 6) { // 16-bit 4444
       align2();
       v.color = color4444to8888(bus.readU16(vAddr + off)); off += 2;
