@@ -27,7 +27,7 @@ Click a thumbnail to play (video only, no audio).
 
 ## Documentation
 
-Full docs (user guide, architecture, and per-subsystem and per-HLE-module reference) are published at https://mert.js.org/psp-js/docs/. Run them locally with `npm run docs:dev`, or `npm run dev:all` to serve the app and docs side by side.
+The [full documentation](https://mert.js.org/psp-js/docs/) covers the user guide, architecture, and a per-subsystem and per-HLE-module reference. Run it locally with `npm run docs:dev`, or `npm run dev:all` to serve the app and docs side by side.
 
 ## Quick start
 
@@ -75,20 +75,22 @@ PSPEmulator (src/emulator.ts)
 ├── MemoryBus     64MB RAM, 2MB VRAM, BlockAllocator     (src/memory/)
 ├── HLEKernel     syscall dispatch, thread scheduler     (src/kernel/)
 ├── CoreTiming    cycle-accurate event scheduler         (src/timing/)
-└── GeDispatcher  GE command list + off-thread worker    (src/gpu/)
+└── GEProcessor   GE command processing, runs inline     (src/gpu/)
 ```
 
-- `src/cpu/` Allegrex CPU and VFPU (decoder, executor, registers).
-- `src/memory/` MemoryBus routing plus a port of PPSSPP's BlockAllocator.
-- `src/kernel/` HLEKernel and per-module `hle-*.ts` handlers. NID values live in `nids.ts`.
-- `src/gpu/` the GE: command processor, vertex/lighting/texture pipeline, WebGL and software renderers, and a worker that shares memory with the main thread.
-- `src/loader/` ELF loader, PBP parser, and the PRX decrypter for encrypted EBOOTs.
-- `src/crypto/` AES, SHA1, KIRK, AMCTRL.
-- `src/iso/` ISO9660 reader, param.sfo parser, ISO metadata.
-- `src/audio/` AudioWorklet engine and ATRAC3+ decode (via ffmpeg/libav).
-- `src/media/` MPEG/PSMF video demux and decode (WebCodecs).
-- `src/storage/` browser-persisted savedata and file stores.
-- `src/frontend/` the browser UI. Entry point is `main.ts`, loaded by `index.html`.
+| Path | What's there |
+|---|---|
+| `src/cpu/` | Allegrex CPU and VFPU (decoder, executor, registers). |
+| `src/memory/` | MemoryBus routing plus a port of PPSSPP's BlockAllocator. |
+| `src/kernel/` | HLEKernel and per-module `hle-*.ts` handlers. NID values live in `nids.ts`. |
+| `src/gpu/` | The GE: command processor, vertex/lighting/texture pipeline, WebGL and software renderers. Runs inline on the main thread (the off-thread worker exists but is dead code). |
+| `src/loader/` | ELF loader, PBP parser, and the PRX decrypter for encrypted EBOOTs. |
+| `src/crypto/` | AES, SHA1, KIRK, AMCTRL. |
+| `src/iso/` | ISO9660 reader, param.sfo parser, ISO metadata. |
+| `src/audio/` | AudioWorklet engine and ATRAC3+ decode (via ffmpeg/libav). |
+| `src/media/` | MPEG/PSMF video demux and decode (WebCodecs). |
+| `src/storage/` | Browser-persisted savedata and file stores. |
+| `src/frontend/` | The browser UI. Entry point is `main.ts`, loaded by `index.html`. |
 
 ## Testing
 
