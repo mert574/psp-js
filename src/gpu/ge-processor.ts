@@ -122,6 +122,8 @@ export interface GeProcessorState {
   depthTestEnable: boolean;
   depthWriteDisable: boolean;
   depthFunc: number;
+  minZ: number;
+  maxZ: number;
 
   // Write masks
   maskRgb: number;
@@ -361,6 +363,8 @@ export class GEProcessor {
   // Depth
   private depthTestEnable = false;
   private depthWriteDisable = false;
+  private minZ = 0;          // MINZ (0xD6), 16-bit depth-clamp lower bound
+  private maxZ = 65535;      // MAXZ (0xD7), 16-bit depth-clamp upper bound
 
   // Color/alpha write mask (0xE8/0xE9): bit=1 means DON'T write that bit
   private maskRgb = 0;    // 24-bit: bits 0-7=R mask, 8-15=G mask, 16-23=B mask
@@ -419,6 +423,23 @@ export class GEProcessor {
   private materialUpdate = 0;         // which material uses vertex color (0x53)
   private shadeMode = 1;              // 0=flat, 1=gouraud (0x50)
   private reverseNormals = false;     // (0x51)
+
+  /** Debug render toggles (set from the debug panel). `true` = honor the game's
+   *  setting, `false` = force the feature off for the whole scene. Not part of
+   *  savestate; purely a live inspection aid. */
+  debugOverrides = {
+    fog: true,
+    lighting: true,
+    colorDoubling: true,
+    textures: true,
+    alphaBlend: true,
+    depthTest: true,
+    cull: true,
+    alphaTest: true,
+    colorTest: true,
+    stencilTest: true,
+    scissor: true,
+  };
 
   // Lighting state
   private lightingEnable = false;     // (0x17)
@@ -563,7 +584,7 @@ export class GEProcessor {
   get drawState(): GEDrawState {
     return {
       throughMode: ((this.vtypeRaw >>> 23) & 1) === 1,
-      texEnable: this.texEnable,
+      texEnable: this.texEnable && this.debugOverrides.textures,
       texState: {
         texAddr0: this.texAddr0,
         texBufWidth0: this.texBufWidth0,
@@ -588,22 +609,22 @@ export class GEProcessor {
         clutStart: this.clutStart,
       },
       fragState: {
-        alphaTestEnable: this.alphaTestEnable,
+        alphaTestEnable: this.alphaTestEnable && this.debugOverrides.alphaTest,
         alphaTestFunc: this.alphaTestFunc,
         alphaTestRef: this.alphaTestRef,
         alphaTestMask: this.alphaTestMask,
-        colorTestEnable: this.colorTestEnable,
+        colorTestEnable: this.colorTestEnable && this.debugOverrides.colorTest,
         colorTestFunc: this.colorTestFunc,
         colorTestRef: this.colorTestRef,
         colorTestMask: this.colorTestMask,
-        stencilTestEnable: this.stencilTestEnable,
+        stencilTestEnable: this.stencilTestEnable && this.debugOverrides.stencilTest,
         stencilFunc: this.stencilFunc,
         stencilRef: this.stencilRef,
         stencilMask: this.stencilMask,
         stencilSFail: this.stencilSFail,
         stencilZFail: this.stencilZFail,
         stencilZPass: this.stencilZPass,
-        alphaBlendEnable: this.alphaBlendEnable,
+        alphaBlendEnable: this.alphaBlendEnable && this.debugOverrides.alphaBlend,
         blendSrc: this.blendSrc,
         blendDst: this.blendDst,
         blendOp: this.blendOp,
@@ -627,20 +648,23 @@ export class GEProcessor {
       clearColorWrite: this.clearColorWrite,
       clearAlphaWrite: this.clearAlphaWrite,
       clearDepthWrite: this.clearDepthWrite,
-      depthTestEnable: this.depthTestEnable,
+      depthTestEnable: this.depthTestEnable && this.debugOverrides.depthTest,
       depthFunc: this.depthFunc,
       depthWriteDisable: this.depthWriteDisable,
-      cullEnable: this.cullEnable,
+      minZ: this.minZ,
+      maxZ: this.maxZ,
+      cullEnable: this.cullEnable && this.debugOverrides.cull,
       cullCW: this.cullCW,
-      scissorX1: this.scissorX1,
-      scissorY1: this.scissorY1,
-      scissorX2: this.scissorX2,
-      scissorY2: this.scissorY2,
-      fogEnable: this.fogEnable,
+      // Scissor off = clamp to the full 480x272 screen (PSP's default scissor).
+      scissorX1: this.debugOverrides.scissor ? this.scissorX1 : 0,
+      scissorY1: this.debugOverrides.scissor ? this.scissorY1 : 0,
+      scissorX2: this.debugOverrides.scissor ? this.scissorX2 : 479,
+      scissorY2: this.debugOverrides.scissor ? this.scissorY2 : 271,
+      fogEnable: this.fogEnable && this.debugOverrides.fog,
       fogColor: this.fogColor,
       fogEnd: this.fogEnd,
       fogSlope: this.fogSlope,
-      colorDoubling: this.colorDoubling,
+      colorDoubling: this.colorDoubling && this.debugOverrides.colorDoubling,
       shadeMode: this.shadeMode,
     };
   }
@@ -1163,7 +1187,10 @@ export class GEProcessor {
         case 0xCF: this.fogColor = param & 0xFFFFFF; break;
 
         // ── Stencil / color test / logic op / masks ──────────────
-        case 0xD6: case 0xD7: break; // min/max Z
+        // MINZ (0xD6) / MAXZ (0xD7): 16-bit depth-clamp range. The fragment shader
+        // clamps per-pixel depth to [minZ, maxZ] (PSP GPUStateUtils depth range).
+        case 0xD6: this.minZ = param & 0xFFFF; break;
+        case 0xD7: this.maxZ = param & 0xFFFF; break;
 
         // GE_CMD_COLORTEST (0xD8): func[1:0] — PPSSPP GPUState.h getColorTestFunction()
         case 0xD8: this.colorTestFunc = param & 3; break;
@@ -1486,7 +1513,7 @@ export class GEProcessor {
     // Transform tessellated vertices through the normal pipeline (same as PRIM triangles)
     const throughMode = (vtype >>> 23) & 1;
     if (!throughMode) {
-      const doLighting = this.lightingEnable;
+      const doLighting = this.lightingEnable && this.debugOverrides.lighting;
       const ls = doLighting ? this.lightState : null;
       const hasVColor = colorFmt !== 0;
 
@@ -1554,7 +1581,7 @@ export class GEProcessor {
     // Apply vertex transform pipeline for non-through-mode primitives
     if (!throughMode) {
       // Snapshot lighting state once per draw call (not per vertex)
-      const doLighting = this.lightingEnable;
+      const doLighting = this.lightingEnable && this.debugOverrides.lighting;
       const ls = doLighting ? this.lightState : null;
       const hasVertexColor = colorFmt !== 0;
       const normFmt = (vtype >>> 5) & 3;
@@ -2439,6 +2466,8 @@ export class GEProcessor {
       depthTestEnable: this.depthTestEnable,
       depthWriteDisable: this.depthWriteDisable,
       depthFunc: this.depthFunc,
+      minZ: this.minZ,
+      maxZ: this.maxZ,
 
       maskRgb: this.maskRgb,
       maskAlpha: this.maskAlpha,
@@ -2619,6 +2648,8 @@ export class GEProcessor {
     this.depthTestEnable = s.depthTestEnable;
     this.depthWriteDisable = s.depthWriteDisable;
     this.depthFunc = s.depthFunc;
+    this.minZ = s.minZ ?? 0;
+    this.maxZ = s.maxZ ?? 65535;
 
     this.maskRgb = s.maskRgb;
     this.maskAlpha = s.maskAlpha;

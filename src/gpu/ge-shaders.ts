@@ -10,7 +10,11 @@
 // 11 floats per vertex: x, y, z, u, v, r, g, b, a, fogCoef, clipw
 export const FLOATS_PER_VERT = 11;
 
-export const VS_GE = `
+/** Build the GE vertex shader. When `fragDepth` is true the fragment shader does
+ *  the 16-bit depth quantization per pixel (via gl_FragDepthEXT), so the vertex
+ *  shader passes screen depth through unquantized; otherwise it quantizes here. */
+export function buildVsGe(fragDepth: boolean): string {
+  return `
 attribute vec3 a_position;
 attribute vec2 a_texcoord;
 attribute vec4 a_color;
@@ -27,13 +31,16 @@ void main() {
   // Screen pixels → screen-NDC: x [0,W]→[-1,1], y [0,H]→[1,-1] (PSP Y-down)
   vec2 ndc = (a_position.xy / u_resolution) * 2.0 - 1.0;
   ndc.y = -ndc.y;
-  // Z: PSP depth [0,1] maps to WebGL depth [-1,1]. Quantize to the PSP's 16-bit
-  // depth resolution first — games draw 2D layers at very close but distinct z
-  // values that all land on the same 16-bit Z, so GEQUAL/LEQUAL act as a no-op
-  // (painter's order). Our depth buffer is 24-bit, which would otherwise keep
-  // those tiny differences and reject the later, slightly-nearer layers.
-  float z16 = floor(a_position.z * 65535.0 + 0.5) / 65535.0;
-  float z = z16 * 2.0 - 1.0;
+  // Z: PSP depth [0,1] maps to WebGL depth [-1,1]. PSP's depth buffer is 16-bit,
+  // and games draw 2D layers at very close but distinct z values that all land on
+  // the same 16-bit Z, so GEQUAL/LEQUAL act as a no-op (painter's order). Our depth
+  // buffer is 24-bit, which would otherwise keep those tiny differences and reject
+  // the later, slightly-nearer layers. ${fragDepth
+    ? "The fragment shader quantizes per pixel (gl_FragDepthEXT), so pass z through."
+    : "No EXT_frag_depth: quantize here at the vertex as a fallback."}
+${fragDepth
+    ? "  float z = a_position.z * 2.0 - 1.0;"
+    : "  float z16 = floor(a_position.z * 65535.0 + 0.5) / 65535.0;\n  float z = z16 * 2.0 - 1.0;"}
   // Positions arrive pre-divided to screen space, with the original clip-space w
   // in a_clipw. Scaling the screen-NDC clip position by w rebuilds a true
   // clip-space coordinate (w cancels the 1/w baked into the pre-divide, so this
@@ -50,13 +57,19 @@ void main() {
   v_fogCoef = a_fogCoef;
 }
 `;
+}
 
-export const FS_GE = `
-precision mediump float;
-
+/** Build the GE fragment shader. When `fragDepth` is true it writes a per-pixel
+ *  16-bit-quantized depth clamped to the MINZ/MAXZ range via gl_FragDepthEXT. */
+export function buildFsGe(fragDepth: boolean): string {
+  // The frag-depth variant needs highp: rounding gl_FragCoord.z to 1/65535 needs
+  // more than mediump's ~10-bit mantissa. (Guarded by EXT_frag_depth availability,
+  // and desktop GL honors highp in the fragment shader.)
+  return `${fragDepth ? "#extension GL_EXT_frag_depth : enable\nprecision highp float;\n" : "precision mediump float;\n"}
 varying vec2 v_texcoord;
 varying vec4 v_color;
 varying float v_fogCoef;
+${fragDepth ? "\n// MINZ/MAXZ depth clamp range, in 16-bit units (0..65535).\nuniform float u_minZ;\nuniform float u_maxZ;\n" : ""}
 
 uniform sampler2D u_texture;
 uniform bool u_texEnable;
@@ -161,8 +174,18 @@ void main() {
   }
 
   gl_FragColor = result;
+${fragDepth ? `
+  // Per-pixel depth at PSP's 16-bit resolution, clamped to [MINZ, MAXZ].
+  // gl_FragCoord.z is the window-space (screen-linear) depth, which equals the
+  // PSP screen depth; rounding it per pixel reproduces hardware z-fighting that a
+  // 24-bit buffer would otherwise avoid, and the clamp applies the depth range
+  // the viewport transform doesn't. (Fragments killed by the tests above already
+  // discarded, so they never write depth.)
+  highp float d16 = clamp(floor(gl_FragCoord.z * 65535.0 + 0.5), u_minZ, u_maxZ);
+  gl_FragDepthEXT = d16 / 65535.0;` : ""}
 }
 `;
+}
 
 /** Simple pass-through shader for presenting an FBO texture to screen. */
 export const VS_PRESENT = `

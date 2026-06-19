@@ -14,7 +14,7 @@ import type { Vertex } from "./ge-types.js";
 import type { GEFragmentState } from "./ge-fragment.js";
 import type { GETextureState } from "./ge-texture.js";
 import { decodeTexture } from "./ge-texture-upload.js";
-import { VS_GE, FS_GE, VS_PRESENT, FS_PRESENT, FLOATS_PER_VERT } from "./ge-shaders.js";
+import { buildVsGe, buildFsGe, VS_PRESENT, FS_PRESENT, FLOATS_PER_VERT } from "./ge-shaders.js";
 import { Logger } from "../utils/logger.js";
 
 const log = Logger.get("GE-GL");
@@ -44,6 +44,8 @@ export interface GEDrawState {
   depthTestEnable: boolean;
   depthFunc: number;
   depthWriteDisable: boolean;
+  minZ: number;   // MINZ (0xD6), 16-bit depth-clamp lower bound
+  maxZ: number;   // MAXZ (0xD7), 16-bit depth-clamp upper bound
   cullEnable: boolean;
   cullCW: boolean;
   scissorX1: number;
@@ -254,6 +256,14 @@ export class WebGLGERenderer {
   private frameCount = 0;
   private currentRenderAddr = 0; // currently bound VFB address
 
+  // Draw-call scrubber (debug): when >= 0, only the first N drawPrimitives calls
+  // of the frame run; the rest are skipped so you can watch a frame build up draw
+  // by draw. dbgFramePrimCount reports the last full frame's total so the UI can
+  // size its slider. -1 = unlimited (normal).
+  debugDrawLimit = -1;
+  dbgFramePrimCount = 0;
+  private framePrimIndex = 0;
+
   // GE draw pipeline state. The program, vertex buffer, and interleaved attribute
   // layout never change between GE draws, yet re-binding them per draw cost
   // ~140ms/frame on draw-heavy scenes (GoW's intro submits ~8k draws/frame). Cache
@@ -275,7 +285,8 @@ export class WebGLGERenderer {
     "u_resolution" | "u_texEnable" | "u_texFunc" | "u_texFuncAlpha" | "u_texEnvColor"
     | "u_alphaTestEnable" | "u_alphaTestFunc" | "u_alphaTestRef" | "u_colorDoubling"
     | "u_fogEnable" | "u_fogColor" | "u_colorTestEnable" | "u_colorTestFunc"
-    | "u_colorTestRef" | "u_colorTestMask" | "u_stencilReplace" | "u_stencilReplaceValue",
+    | "u_colorTestRef" | "u_colorTestMask" | "u_stencilReplace" | "u_stencilReplaceValue"
+    | "u_minZ" | "u_maxZ",
     WebGLUniformLocation | null
   > | null = null;
   private uLast = {
@@ -283,6 +294,7 @@ export class WebGLGERenderer {
     alphaTestEnable: -1, alphaTestFunc: -1, alphaTestRef: -1, colorDoubling: -1,
     fogEnable: -1, fogColor: -1, colorTestEnable: -1, colorTestFunc: -1,
     colorTestRef: -1, colorTestMask: -1, stencilReplace: -1, stencilReplaceValue: -1,
+    minZ: -1, maxZ: -1,
   };
 
   // Dirty-tracking for the per-draw GL state that applyBlendState/applyColorMask/
@@ -381,6 +393,8 @@ export class WebGLGERenderer {
   // FUNC_ADD (matches PPSSPP's eqLookup vs eqLookupNoMinMax fallback).
   private blendMinEq = 0;
   private blendMaxEq = 0;
+  // Whether the fragment shader writes per-pixel depth (EXT_frag_depth present).
+  private hasFragDepth = false;
 
   // Track current GL state to minimize state changes
   private currentBlendEnabled = false;
@@ -409,8 +423,13 @@ export class WebGLGERenderer {
     this.blendMinEq = minMaxExt ? minMaxExt.MIN_EXT : gl.FUNC_ADD;
     this.blendMaxEq = minMaxExt ? minMaxExt.MAX_EXT : gl.FUNC_ADD;
 
+    // EXT_frag_depth lets the fragment shader write depth, so we quantize to the
+    // PSP's 16-bit depth per pixel and clamp to MINZ/MAXZ. Without it we fall back
+    // to quantizing at the vertex (coarser; can't honor MINZ/MAXZ per pixel).
+    this.hasFragDepth = !!gl.getExtension("EXT_frag_depth");
+
     // Compile shaders
-    this.geProgram = twgl.createProgramInfo(gl, [VS_GE, FS_GE]);
+    this.geProgram = twgl.createProgramInfo(gl, [buildVsGe(this.hasFragDepth), buildFsGe(this.hasFragDepth)]);
     this.presentProgram = twgl.createProgramInfo(gl, [VS_PRESENT, FS_PRESENT]);
 
     // Fullscreen quad for presenting FBO
@@ -492,6 +511,7 @@ export class WebGLGERenderer {
         u_colorTestEnable: g("u_colorTestEnable"), u_colorTestFunc: g("u_colorTestFunc"),
         u_colorTestRef: g("u_colorTestRef"), u_colorTestMask: g("u_colorTestMask"),
         u_stencilReplace: g("u_stencilReplace"), u_stencilReplaceValue: g("u_stencilReplaceValue"),
+        u_minZ: g("u_minZ"), u_maxZ: g("u_maxZ"),
       };
     }
     const L = this.uLoc, U = this.uLast, frag = state.fragState;
@@ -536,6 +556,14 @@ export class WebGLGERenderer {
     const stencilReplace = (frag.stencilTestEnable && frag.stencilZPass === 2) ? 1 : 0;
     if (stencilReplace !== U.stencilReplace) { gl.uniform1i(L.u_stencilReplace, stencilReplace); U.stencilReplace = stencilReplace; }
     if (frag.stencilRef !== U.stencilReplaceValue) { gl.uniform1f(L.u_stencilReplaceValue, frag.stencilRef / 255); U.stencilReplaceValue = frag.stencilRef; }
+
+    // Per-pixel depth clamp range (MINZ/MAXZ, 16-bit units). Only present in the
+    // fragment shader when EXT_frag_depth is available; the uniform locations are
+    // null otherwise and these calls are skipped.
+    if (this.hasFragDepth) {
+      if (state.minZ !== U.minZ) { gl.uniform1f(L.u_minZ, state.minZ); U.minZ = state.minZ; }
+      if (state.maxZ !== U.maxZ) { gl.uniform1f(L.u_maxZ, state.maxZ); U.maxZ = state.maxZ; }
+    }
   }
 
   /** Flush the open batch: upload its accumulated vertices and issue one
@@ -657,6 +685,15 @@ export class WebGLGERenderer {
     skipScanout = false,
   ): void {
     const gl = this.gl;
+
+    // Draw-call scrubber: count every draw (so the UI can size its slider), and
+    // once the per-frame limit is hit flush whatever's open (so the kept draws
+    // show) and skip every remaining draw this frame.
+    const primIdx = this.framePrimIndex++;
+    if (this.debugDrawLimit >= 0 && primIdx >= this.debugDrawLimit) {
+      this.flush();
+      return;
+    }
 
     const renderAddr = this.normFb(state.fbPtr);
     const isScanout = this.scanoutAddrs.includes(renderAddr);
@@ -1036,6 +1073,12 @@ export class WebGLGERenderer {
    *  not per-frame — PPSSPP uses hash-based invalidation, not per-frame flush. */
   onFrameStart(): void {
     this.flush(); // draw any geometry left open at the frame boundary
+    // Scrubber: remember the just-finished frame's draw total, then reset for
+    // this frame. Only update when the frame actually drew — games that submit a
+    // GE list every other displayed frame would otherwise flip the total to 0 on
+    // the empty frames and make the slider jump.
+    if (this.framePrimIndex > 0) this.dbgFramePrimCount = this.framePrimIndex;
+    this.framePrimIndex = 0;
     // Snapshot the just-finished frame's GL work as a per-frame delta, then reset
     // the per-frame baseline. geGlStats stays cumulative.
     const cur = this.geGlStats, prev = this.geGlStatsAtFrameStart, f = this.geGlStatsFrame;

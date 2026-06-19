@@ -320,6 +320,14 @@ document.getElementById("debug-panel")?.addEventListener("renderer-toggle", () =
   // Programmatic value changes don't fire "change", so persist the flip directly.
   saveBootOptions();
 });
+// The draw-call scrubber re-renders one frame so its new limit shows immediately
+// while the rAF loop is paused (doSingleFrame is a no-op when running).
+document.getElementById("debug-panel")?.addEventListener("debug-rerender", () => {
+  // Step twice: some games submit GE draws only every other displayed frame, so
+  // a single step can land on an empty frame where the new limit has no effect.
+  doSingleFrame();
+  doSingleFrame();
+});
 
 function bootGame(): void {
   if (!ebootBytes) {
