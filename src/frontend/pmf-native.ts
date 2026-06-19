@@ -11,6 +11,10 @@ const log = Logger.get("PSMF");
 export interface PmfPlayer {
   play(): void;
   stop(): void;
+  /** Drive frame selection from an external clock (µs) instead of wall time.
+   *  Used to follow the audio element so video and sound stay in sync. Pass
+   *  null to fall back to the internal wall clock. */
+  setClock(fn: (() => number) | null): void;
   readonly canvas: HTMLCanvasElement;
 }
 
@@ -32,6 +36,9 @@ export async function decodePmfNative(pmfData: Uint8Array): Promise<PmfPlayer> {
   let animFrame = 0;
   let frameIdx = 0;
   let startTime = 0;
+  /** External clock (µs). When set, the video follows it (the audio element)
+   *  instead of wall time, so picture and sound stay locked together. */
+  let clock: (() => number) | null = null;
 
   if (frames.length === 0) {
     throw new Error("No frames decoded from PMF");
@@ -43,7 +50,8 @@ export async function decodePmfNative(pmfData: Uint8Array): Promise<PmfPlayer> {
   function renderLoop(ts: number) {
     if (stopped || frames.length === 0) return;
     if (startTime === 0) startTime = ts;
-    const elapsed = (ts - startTime) * 1000; // ms → µs
+    // Prefer the external clock (audio) when available; fall back to wall time.
+    const elapsed = clock ? clock() : (ts - startTime) * 1000; // µs
     const loopedTime = (elapsed % totalDuration) + frames[0]!.pts;
 
     let best = 0;
@@ -72,6 +80,9 @@ export async function decodePmfNative(pmfData: Uint8Array): Promise<PmfPlayer> {
     stop() {
       stopped = true;
       cancelAnimationFrame(animFrame);
+    },
+    setClock(fn: (() => number) | null) {
+      clock = fn;
     },
   };
 }

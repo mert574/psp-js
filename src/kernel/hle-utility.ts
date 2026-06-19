@@ -281,7 +281,7 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
             } else {
               // No data — zero everything
               for (let i = 0; i < 32; i++) bus.writeU8(infoOff + i, 0);
-              savedataResult = 0x80110326; // SCE_UTILITY_SAVEDATA_ERROR_SIZES_NO_DATA
+              savedataResult = 0x801103c7; // SCE_UTILITY_SAVEDATA_ERROR_SIZES_NO_DATA
             }
             // Write utilityData (estimated save size)
             const utilDataPtr = bus.readU32(paramAddr + 1496);
@@ -299,7 +299,7 @@ export function registerUtilityHLE(kernel: HLEKernel): void {
             }
             savedataIoComplete = true;
           }).catch(() => {
-            savedataResult = 0x80110326;
+            savedataResult = 0x801103c7;
             savedataIoComplete = true;
           });
           break; // async — doSave above handles the rest

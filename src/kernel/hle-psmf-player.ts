@@ -45,7 +45,15 @@ interface PsmfPlayerInstance {
   /** OffscreenCanvas for ImageBitmap → pixel readback */
   readbackCanvas: OffscreenCanvas | null;
   readbackCtx: OffscreenCanvasRenderingContext2D | null;
+  /** Decoded cutscene audio: 44100 Hz stereo s16le interleaved (null until ready). */
+  audioPcm: Int16Array | null;
+  /** Playback cursor into audioPcm, in stereo frames. */
+  audioCursor: number;
 }
+
+/** PSMF audio frame: 2048 stereo samples → 8192 bytes (PPSSPP scePsmf.cpp:60-61). */
+const PSMF_AUDIO_SAMPLES = 2048;
+const PSMF_AUDIO_BYTES = PSMF_AUDIO_SAMPLES * 4;
 
 // ── Pixel conversion ────────────────────────────────────────────────────────
 
@@ -166,6 +174,19 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
         log.warn(`Decode failed: ${err.message}`);
         player.status = PsmfPlayerStatus.ERROR;
       });
+
+      // Decode the cutscene's audio track to PCM in parallel. Dynamic import so
+      // the FFmpeg WASM dependency is only pulled in the browser (never in the
+      // headless/node bundle, which has no AudioContext/FFmpeg anyway).
+      void import("../frontend/pmf.js")
+        .then(({ decodePmfAudioToPcm }) => decodePmfAudioToPcm(data))
+        .then((pcm) => {
+          player.audioPcm = pcm.length > 0 ? pcm : null;
+          log.info(`Cutscene audio decoded: ${pcm.length >> 1} frames`);
+        })
+        .catch((err: unknown) => {
+          log.warn(`Cutscene audio decode failed: ${String(err)}`);
+        });
       return true;
     } catch (err) {
       log.warn(`PsmfDecoder setup failed: ${String(err)}`);
@@ -190,6 +211,8 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
       videoHeight: 0,
       readbackCanvas: null,
       readbackCtx: null,
+      audioPcm: null,
+      audioCursor: 0,
     };
     players.set(id, player);
     bus.writeU32(contextAddr, id);
@@ -240,6 +263,7 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
     if (!player) { regs.setGpr(2, 0x80000001 >>> 0); return; }
 
     player.currentFrame = 0;
+    player.audioCursor = 0;
     player.status = PsmfPlayerStatus.PLAYING;
     log.info(`PsmfPlayerStart: ${player.totalFrames} frames`);
     regs.setGpr(2, 0);
@@ -322,6 +346,7 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
     if (player) {
       player.status = PsmfPlayerStatus.STANDBY;
       player.currentFrame = 0;
+      player.audioCursor = 0;
     }
     regs.setGpr(2, 0);
   });
@@ -379,14 +404,36 @@ export function registerPsmfPlayerHLE(kernel: HLEKernel): void {
     regs.setGpr(2, 0);
   });
 
-  // scePsmfPlayerGetAudioOutSize(contextAddr)
+  // scePsmfPlayerGetAudioOutSize(contextAddr) — PPSSPP scePsmf.cpp:1308
   kernel.register(PSMF.scePsmfPlayerGetAudioOutSize, (regs) => {
-    regs.setGpr(2, 2048); // standard audio buffer size
+    regs.setGpr(2, PSMF_AUDIO_BYTES); // 8192 bytes (2048 stereo samples)
   });
 
   // scePsmfPlayerGetAudioData(contextAddr, audioDataAddr)
+  // Writes one 2048-sample stereo frame of decoded cutscene audio. The game
+  // then feeds this buffer to sceAudioOutput*, so it plays through the normal
+  // audio engine. Synced to playback by advancing in lockstep with the video.
   kernel.register(PSMF.scePsmfPlayerGetAudioData, (regs) => {
-    // Stub: write silence
+    const player = getPlayer(regs.getGpr(4));
+    const audioDataAddr = regs.getGpr(5);
+    if (!player || audioDataAddr === 0) { regs.setGpr(2, 0); return; }
+
+    const pcm = player.audioPcm;
+    if (!pcm) {
+      // Not decoded yet (or no audio track) — write silence to keep the game's
+      // mixer fed and in sync with the video instead of returning an error.
+      bus.writeBytes(audioDataAddr, new Uint8Array(PSMF_AUDIO_BYTES));
+      regs.setGpr(2, 0);
+      return;
+    }
+
+    const startSample = player.audioCursor * 2;            // interleaved index
+    const wantSamples = PSMF_AUDIO_SAMPLES * 2;            // stereo
+    const out = new Int16Array(PSMF_AUDIO_SAMPLES * 2);
+    const avail = Math.max(0, Math.min(wantSamples, pcm.length - startSample));
+    if (avail > 0) out.set(pcm.subarray(startSample, startSample + avail));
+    bus.writeBytes(audioDataAddr, new Uint8Array(out.buffer, out.byteOffset, out.byteLength));
+    player.audioCursor += PSMF_AUDIO_SAMPLES;
     regs.setGpr(2, 0);
   });
 

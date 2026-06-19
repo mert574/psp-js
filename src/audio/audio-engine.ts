@@ -35,6 +35,26 @@ export interface AudioChannelState {
   rightVol: number;
 }
 
+/** Linear-resample interleaved stereo s16 from `srcRate` to `dstRate`. */
+function resampleStereo(src: Int16Array<ArrayBuffer>, srcRate: number, dstRate: number): Int16Array<ArrayBuffer> {
+  const srcFrames = src.length >> 1;
+  if (srcFrames === 0 || srcRate === dstRate) return src;
+  const dstFrames = Math.max(1, Math.round((srcFrames * dstRate) / srcRate));
+  const out = new Int16Array(dstFrames * 2);
+  const ratio = srcRate / dstRate;
+  for (let i = 0; i < dstFrames; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const frac = pos - i0;
+    const i1 = i0 + 1 < srcFrames ? i0 + 1 : i0;
+    const l = src[i0 * 2]! * (1 - frac) + src[i1 * 2]! * frac;
+    const r = src[i0 * 2 + 1]! * (1 - frac) + src[i1 * 2 + 1]! * frac;
+    out[i * 2] = l | 0;
+    out[i * 2 + 1] = r | 0;
+  }
+  return out;
+}
+
 // ── AudioEngine ──────────────────────────────────────────────────────────────
 
 export class AudioEngine {
@@ -125,7 +145,7 @@ export class AudioEngine {
   ): void {
     if (!this.ctx || !this.workletNode) return;
 
-    const chunk = new Int16Array(sampleCount * 2);
+    let chunk = new Int16Array(sampleCount * 2);
     for (let i = 0; i < sampleCount; i++) {
       const [rawL, rawR] = mono
         ? [pcm[i] ?? 0, pcm[i] ?? 0]
@@ -134,6 +154,15 @@ export class AudioEngine {
       chunk[i * 2]     = Math.round((rawL * leftVol)  / PSP_VOL_MAX);
       chunk[i * 2 + 1] = Math.round((rawR * rightVol) / PSP_VOL_MAX);
     }
+
+    // The worklet plays at the AudioContext rate (44100). The regular channels
+    // are always 44100 on PSP, but the SRC channel carries its own frequency
+    // (sceAudioSRCChReserve, e.g. 24000/48000); resample it to 44100 here so it
+    // plays at the right pitch instead of being sped up/slowed down.
+    if (channelId === CHANNEL_COUNT && this.srcSampleRate !== PSP_SAMPLE_RATE) {
+      chunk = resampleStereo(chunk, this.srcSampleRate, PSP_SAMPLE_RATE);
+    }
+
     // Transfer the buffer so the worklet owns it — zero-copy.
     this.workletNode.port.postMessage(
       { channel: channelId, pcm: chunk },

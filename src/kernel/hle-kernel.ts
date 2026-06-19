@@ -1932,14 +1932,20 @@ export class HLEKernel {
     // sceGeListEnQueue(list, stall, cbid, arg) — queue display list
     // PPSSPP sceGe.cpp:353-373, GPUCommon.cpp:349-466
     this.register(GE.sceGeListEnQueue, (regs) => {
-      const listAddr = regs.getGpr(4);
-      const stallAddr = regs.getGpr(5);
+      const rawListAddr = regs.getGpr(4);
+      const rawStallAddr = regs.getGpr(5);
 
       // GPUCommon.cpp:356 — validate 4-byte alignment
-      if (((listAddr | stallAddr) & 3) !== 0) {
+      if (((rawListAddr | rawStallAddr) & 3) !== 0) {
         regs.setGpr(2, 0x80000103); // SCE_KERNEL_ERROR_INVALID_POINTER
         return;
       }
+
+      // GPUCommon.cpp:419-421 — pc and stall are stored masked to 0x0FFFFFFF.
+      // Without this, a stall passed via the uncached mirror (0x4xxxxxxx) never
+      // equals the scanner's masked pc, so the list runs into uninit memory.
+      const listAddr = rawListAddr & 0x0FFFFFFF;
+      const stallAddr = rawStallAddr & 0x0FFFFFFF;
 
       const cbId = regs.getGpr(6); // 3rd arg: callback ID from sceGeSetCallback
       const optParamAddr = regs.getGpr(7); // 4th arg: PspGeListArgs pointer
@@ -2037,7 +2043,8 @@ export class HLEKernel {
     // sceGeListUpdateStallAddr(listId, stallAddr) — advance stall for ring buffer
     this.register(GE.sceGeListUpdateStallAddr, (regs) => {
       const listId = regs.getGpr(4) ^ GE_LIST_ID_MAGIC;
-      const newStall = regs.getGpr(5);
+      // GPUCommon.cpp:498 — stall is masked to 0x0FFFFFFF (matches the masked pc).
+      const newStall = regs.getGpr(5) & 0x0FFFFFFF;
       // Drain Worker completions so we see the current list state
       if (this.geDispatcher) {
         const done = this.geDispatcher.drainCompletions();
@@ -2379,14 +2386,18 @@ export class HLEKernel {
     // Same as sceGeListEnQueue but inserts at front of queue (head=true).
     // GPUCommon.cpp:438-450: if currentList is not PAUSED → SCE_KERNEL_ERROR_INVALID_VALUE.
     this.register(GE.sceGeListEnQueueHead, (regs) => {
-      const listAddr  = regs.getGpr(4);
-      const stallAddr = regs.getGpr(5);
+      const rawListAddr  = regs.getGpr(4);
+      const rawStallAddr = regs.getGpr(5);
 
       // Validate alignment (GPUCommon.cpp:356)
-      if (((listAddr | stallAddr) & 3) !== 0) {
+      if (((rawListAddr | rawStallAddr) & 3) !== 0) {
         regs.setGpr(2, 0x80000103); // SCE_KERNEL_ERROR_INVALID_POINTER
         return;
       }
+
+      // GPUCommon.cpp:419-421 — pc and stall stored masked to 0x0FFFFFFF.
+      const listAddr  = rawListAddr & 0x0FFFFFFF;
+      const stallAddr = rawStallAddr & 0x0FFFFFFF;
 
       const cbId = regs.getGpr(6);
       const optParamAddr = regs.getGpr(7);
@@ -3343,22 +3354,47 @@ export class HLEKernel {
     };
 
     // Helper: fill PGFFontInfo (264 bytes) at ptr with 12×14px dummy metrics
-    const writeFontInfo = (ptr: number, bus: MemoryBus) => {
+    // Fill PGFFontInfo (264 bytes) from the font's real header. Matches PPSSPP
+    // PGF::GetFontInfo (Core/Font/PGF.cpp) field-for-field. Getting maxGlyphWidth
+    // wrong matters: games size their glyph-cache cells from it, so a too-small
+    // value (we used to hardcode 12) clips wide glyphs like 'm'/'w' to a narrower
+    // cell — the right stroke is dropped and an 'm' renders as 'n' (Gran Turismo).
+    const writeFontInfo = (ptr: number, bus: MemoryBus, pgf: PGF | null) => {
       for (let i = 0; i < 264; i += 4) bus.writeU32(ptr + i, 0);
-      const W26 = 12 * 64, H26 = 14 * 64;
-      bus.writeU32(ptr +  0, W26); bus.writeU32(ptr +  4, H26); // maxGlyphWidth/HeightI
-      bus.writeU32(ptr +  8, H26); bus.writeU32(ptr + 12, 0);   // ascender / descender
-      bus.writeU32(ptr + 16, 0);   bus.writeU32(ptr + 20, H26); // leftX / baseY
-      bus.writeU32(ptr + 24, 0);   bus.writeU32(ptr + 28, H26); // centerX / topY
-      bus.writeU32(ptr + 32, W26); bus.writeU32(ptr + 36, H26); // advanceX / advanceY
-      writeF32(ptr + 40, 12, bus); writeF32(ptr + 44, 14, bus);
-      writeF32(ptr + 48, 14, bus); writeF32(ptr + 52,  0, bus);
-      writeF32(ptr + 56,  0, bus); writeF32(ptr + 60, 14, bus);
-      writeF32(ptr + 64,  0, bus); writeF32(ptr + 68, 14, bus);
-      writeF32(ptr + 72, 12, bus); writeF32(ptr + 76, 14, bus);
-      bus.writeU16(ptr + 80, 12); bus.writeU16(ptr + 82, 14); // maxGlyphWidth/Height px
-      bus.writeU32(ptr + 84, 256);  // numGlyphs
-      bus.writeU8 (ptr + 260, 4);   // BPP
+      const hdr = pgf?.header;
+      if (!hdr) {
+        // No font: leave metrics zeroed, just report 4bpp like the old fallback.
+        bus.writeU8(ptr + 260, 4);
+        return;
+      }
+      // Integer (26.6 fixed-point) glyph metrics.
+      bus.writeU32(ptr +  0, hdr.maxSizeH);        // maxGlyphWidthI
+      bus.writeU32(ptr +  4, hdr.maxSizeV);        // maxGlyphHeightI
+      bus.writeU32(ptr +  8, hdr.maxAscender);     // maxGlyphAscenderI
+      bus.writeU32(ptr + 12, hdr.maxDescender);    // maxGlyphDescenderI
+      bus.writeU32(ptr + 16, hdr.maxLeftXAdjust);  // maxGlyphLeftXI
+      bus.writeU32(ptr + 20, hdr.maxBaseYAdjust);  // maxGlyphBaseYI
+      bus.writeU32(ptr + 24, hdr.minCenterXAdjust);// minGlyphCenterXI
+      bus.writeU32(ptr + 28, hdr.maxTopYAdjust);   // maxGlyphTopYI
+      bus.writeU32(ptr + 32, hdr.maxAdvanceH);     // maxGlyphAdvanceXI
+      bus.writeU32(ptr + 36, hdr.maxAdvanceV);     // maxGlyphAdvanceYI
+      // Float replicas = integer / 64.
+      writeF32(ptr + 40, hdr.maxSizeH / 64, bus);
+      writeF32(ptr + 44, hdr.maxSizeV / 64, bus);
+      writeF32(ptr + 48, hdr.maxAscender / 64, bus);
+      writeF32(ptr + 52, hdr.maxDescender / 64, bus);
+      writeF32(ptr + 56, hdr.maxLeftXAdjust / 64, bus);
+      writeF32(ptr + 60, hdr.maxBaseYAdjust / 64, bus);
+      writeF32(ptr + 64, hdr.minCenterXAdjust / 64, bus);
+      writeF32(ptr + 68, hdr.maxTopYAdjust / 64, bus);
+      writeF32(ptr + 72, hdr.maxAdvanceH / 64, bus);
+      writeF32(ptr + 76, hdr.maxAdvanceV / 64, bus);
+      // Bitmap dimensions (pixels) — the fields games actually allocate from.
+      bus.writeU16(ptr + 80, hdr.maxGlyphWidth);
+      bus.writeU16(ptr + 82, hdr.maxGlyphHeight);
+      bus.writeU32(ptr + 84, hdr.charPointerLength); // numGlyphs
+      bus.writeU32(ptr + 88, 0);                     // shadowMapLength (TODO, like PPSSPP)
+      bus.writeU8 (ptr + 260, hdr.bpp);              // BPP
     };
 
     // Helper: zero a blank glyph into the GlyphImage buffer
@@ -3467,7 +3503,11 @@ export class HLEKernel {
 
     // sceFontGetFontInfo(fontHandle, fontInfoPtr) → 0
     this.register(FONT.sceFontGetFontInfo, (regs, bus) => {
-      if (regs.getGpr(5) !== 0) writeFontInfo(regs.getGpr(5), bus);
+      // Fall back to any loaded font if the handle doesn't resolve, so we still
+      // report real max-glyph metrics (a Latin PGF's dims are close enough) rather
+      // than zeros — keeps games from under-allocating glyph cells.
+      const pgf = getPgf(regs.getGpr(4)) ?? this.pgfFonts.find((p) => p) ?? null;
+      if (regs.getGpr(5) !== 0) writeFontInfo(regs.getGpr(5), bus, pgf);
       regs.setGpr(2, 0);
     });
 

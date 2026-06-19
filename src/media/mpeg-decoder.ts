@@ -33,6 +33,10 @@ export interface DecodedVideoFrame {
 const LOOKAHEAD = 16;
 // Hard cap in case in-flight accounting ever drifts; pacing keeps us well below.
 const MAX_QUEUE = 64;
+// Consecutive decoder errors (no decoded frame in between) before we give up for
+// good. A looping menu video re-sends a keyframe each loop, so a transient error
+// recovers on the next keyframe; only a stream we genuinely can't decode hits this.
+const MAX_RESETS = 8;
 
 export class MpegMediaDecoder {
   private demux = new PsmfDemux();
@@ -44,6 +48,16 @@ export class MpegMediaDecoder {
   private pendingAus: AccessUnit[] = [];
   // Chunks handed to the decoder that haven't produced a frame yet.
   private inFlight = 0;
+  // Consecutive decoder resets without a decoded frame in between (reset on success).
+  private resetCount = 0;
+  // True once we've logged a recovery this session; keeps the console from
+  // filling with one line per dropped frame when a video hiccups every GOP.
+  private warnedRecover = false;
+  // Strictly-increasing timestamp for decode(). The PSP stream only carries a
+  // real PTS about once every 10 frames (the rest are -1), and a long run of
+  // equal/-1 timestamps makes WebCodecs fail to order frames and then error.
+  // We feed in decode order anyway, so a plain counter is the right ordering key.
+  private decodeTs = 0;
   private videoQueue: DecodedVideoFrame[] = [];
   private canvas: OffscreenCanvas | null = null;
   private ctx: OffscreenCanvasRenderingContext2D | null = null;
@@ -111,16 +125,52 @@ export class MpegMediaDecoder {
     if (typeof VideoDecoder === "undefined") { this.failedFlag = true; return false; }
     this.decoder = new VideoDecoder({
       output: (frame) => this.onFrame(frame),
-      error: (e) => { console.warn("[MPEG] VideoDecoder error", e); this.failedFlag = true; },
+      error: (e) => this.recover(e),
     });
     return true;
+  }
+
+  /** A decode failure (corrupt AU, a dropped reference, or a delta arriving
+   *  before a keyframe) kills the VideoDecoder. Instead of giving up forever,
+   *  drop the broken decoder and resync at the next keyframe — a looping video
+   *  re-sends one each loop. This runs from BOTH the async error callback and
+   *  the synchronous decode() throw: the sync path matters because once the
+   *  decoder is bad, decode() rejects every following delta, and without
+   *  resetting our flags here we'd hammer it thousands of times before the async
+   *  error callback gets a turn. Give up only after MAX_RESETS in a row with no
+   *  decoded frame in between (onFrame clears the streak). */
+  private recover(reason: unknown): void {
+    if (this.failedFlag) return;
+    const dec = this.decoder;
+    this.decoder = null;
+    try { if (dec && dec.state !== "closed") dec.close(); } catch { /* already closed */ }
+    this.configured = false;
+    this.firstKeySent = false;
+    this.inFlight = 0;
+    // Drop queued AUs up to the next keyframe; deltas before it can't decode on a
+    // fresh decoder. If none is buffered yet, the next feed() brings one.
+    const nextKey = this.pendingAus.findIndex((a) => a.keyframe);
+    this.pendingAus = nextKey >= 0 ? this.pendingAus.slice(nextKey) : [];
+    this.resetCount++;
+    if (this.resetCount > MAX_RESETS) {
+      this.failedFlag = true;
+      console.warn("[MPEG] video decoder failed repeatedly, showing placeholder", reason);
+    } else if (!this.warnedRecover) {
+      // Log once per session — a looping video that hiccups every GOP would
+      // otherwise spam the console with one line per dropped frame.
+      this.warnedRecover = true;
+      console.warn("[MPEG] video decoder hiccup, resyncing at next keyframe", reason);
+    }
   }
 
   /** Configure on the first SPS, then submit one access unit to the decoder. */
   private tryDecode(au: AccessUnit): void {
     if (!this.paramSets) this.paramSets = extractParamSets(au.data);
     if (!this.configured) {
-      const codec = avcCodecFromAnnexB(au.data);
+      // A mid-stream resync keyframe may not carry its own SPS; fall back to the
+      // SPS we cached from the stream start so we can still derive the codec.
+      const codec = avcCodecFromAnnexB(au.data)
+        ?? (this.paramSets ? avcCodecFromAnnexB(this.paramSets) : null);
       if (!codec) return; // wait for an AU that carries the SPS
       if (!this.ensureDecoder()) return;
       // Annex-B input: omit `description`. Low latency so frames come out fast.
@@ -140,17 +190,22 @@ export class MpegMediaDecoder {
     try {
       this.decoder!.decode(new EncodedVideoChunk({
         type: au.keyframe ? "key" : "delta",
-        timestamp: au.pts,
+        // Monotonic decode-order timestamp, not au.pts (mostly -1 in this stream).
+        timestamp: this.decodeTs++,
         data: data as BufferSource,
       }));
       this.inFlight++;
     } catch (e) {
-      console.warn("[MPEG] decode() rejected a chunk", e);
+      // decode() rejects synchronously when the decoder is in a bad state (most
+      // often a delta reached it before a keyframe after a prior error). Reset
+      // and resync instead of re-throwing on every following delta.
+      this.recover(e);
     }
   }
 
   private onFrame(frame: VideoFrame): void {
     if (this.inFlight > 0) this.inFlight--;
+    this.resetCount = 0; // a decoded frame means we recovered; clear the failure streak
     try {
       const w = frame.displayWidth || frame.codedWidth;
       const h = frame.displayHeight || frame.codedHeight;

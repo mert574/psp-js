@@ -61,6 +61,28 @@ export async function transcodeAt3(at3Data: Uint8Array): Promise<string> {
   }
 }
 
+/**
+ * Decode the audio track of a PSMF (.pmf) to raw PCM (44100 Hz, stereo, s16le
+ * interleaved). Used by the in-game scePsmfPlayer so cutscene audio plays
+ * through the normal sceAudio output path. Returns an empty array if the PMF
+ * has no decodable audio track.
+ */
+export async function decodePmfAudioToPcm(pmfData: Uint8Array): Promise<Int16Array> {
+  const ff = await ensureLoaded();
+  await ff.writeFile("aud.pmf", pmfData);
+  const ret = await ff.exec([
+    "-i", "aud.pmf", "-vn",
+    "-f", "s16le", "-acodec", "pcm_s16le",
+    "-ar", "44100", "-ac", "2",
+    "aud.pcm",
+  ]);
+  if (ret !== 0) return new Int16Array(0);
+  const data = (await ff.readFile("aud.pcm")) as Uint8Array;
+  // Copy out of the (possibly Shared)ArrayBuffer and reinterpret as s16.
+  const copy = data.slice();
+  return new Int16Array(copy.buffer, copy.byteOffset, copy.byteLength >> 1);
+}
+
 /** Extract and transcode the audio track from a PSMF (.pmf) file to a playable URL. */
 export async function transcodePmfAudio(pmfData: Uint8Array): Promise<string> {
   const ff = await ensureLoaded();
