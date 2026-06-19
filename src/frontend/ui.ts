@@ -50,10 +50,19 @@ export function showAudioLoading(): void {
   btn.hidden   = false;
 }
 
+/** Current playback position of the preview audio element, in microseconds.
+ *  Used as the master clock so the PMF video follows the music. Returns 0 when
+ *  nothing is loaded/playing yet. */
+export function gameAudioTimeUs(): number {
+  const audio = document.getElementById("game-audio") as HTMLAudioElement | null;
+  return audio && audio.src ? audio.currentTime * 1_000_000 : 0;
+}
+
 export function playGameAudio(audioUrl: string): void {
   const audio = document.getElementById("game-audio") as HTMLAudioElement;
   const btn   = document.getElementById("audio-btn")  as HTMLButtonElement;
   audio.src = audioUrl;
+  audio.loop = true; // loop with the video preview so they stay in sync
   audio.play().then(() => {
     btn.hidden = true;
   }).catch(() => {
