@@ -18,11 +18,11 @@ hero:
 
 features:
   - title: High-level emulation
-    details: System calls are implemented in TypeScript instead of running a PSP BIOS, the same approach PPSSPP takes. No firmware image is needed.
+    details: Runs without a PSP BIOS. It implements the PSP's system calls in TypeScript.
   - title: Boots real games
-    details: It decrypts KIRK-encrypted EBOOTs, loads ISO and PBP images, and runs the MIPS Allegrex CPU and VFPU. The GE (GPU) renders over WebGL, with a software rasterizer as a fallback.
-  - title: Audio, video, and saves
-    details: ATRAC3+ audio decodes through an AudioWorklet and PSMF video through WebCodecs. Savedata and whole-machine save states persist in the browser.
+    details: It decrypts the KIRK EBOOT, reads the ISO or PBP, and runs the real Allegrex CPU and VFPU, drawing the GE over WebGL.
+  - title: Audio and video
+    details: ATRAC3+ audio decodes through a bundled ffmpeg, and PSMF video through the browser's WebCodecs.
   - title: Browser and headless
-    details: The frontend is built with Vite and Lit. The same emulator core also runs under Node for diagnostics and tests, using the software rasterizer.
+    details: Game saves persist in the browser, whole-machine save states export to a file, and the same core also runs headless under Node.
 ---

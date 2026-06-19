@@ -152,6 +152,9 @@ onMounted(async () => {
   tl.to({}, { duration: 0.9 }, 6.6);
   tl.add(() => resetScene(), 7.7);
 
+  // expose the timeline so a headless capture can step it deterministically
+  (window as unknown as { __fcTimeline?: unknown }).__fcTimeline = tl;
+
   if (reduced) {
     tl.progress(0.46).pause();
   } else if (typeof IntersectionObserver === "function") {
@@ -179,6 +182,14 @@ onBeforeUnmount(() => { cleanup?.(); cleanup = null; });
         <marker id="fc-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
           <path d="M0 0 L10 5 L0 10 z" class="arrow-head" />
         </marker>
+        <!-- soft colored glow: blur a copy of the shape and lay the sharp shape back on top -->
+        <filter id="fc-glow" x="-70%" y="-70%" width="240%" height="240%">
+          <feGaussianBlur stdDeviation="1.9" result="b" />
+          <feMerge>
+            <feMergeNode in="b" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
       </defs>
 
       <!-- ============ connector lines (under the cards) ============ -->
@@ -371,13 +382,13 @@ onBeforeUnmount(() => { cleanup?.(); cleanup = null; });
 .pipe { fill: var(--vp-c-text-1); opacity: 0.35; font-size: 10.5px; }
 .lane { stroke: var(--fc-stroke); stroke-width: 1; opacity: 0.5; }
 
-.instr { fill: var(--fc-cpu); }
+.instr { fill: var(--fc-cpu); filter: url(#fc-glow); }
 .ram-bar { fill: var(--fc-mem); opacity: 0.3; }
-.flow-dot { opacity: 0; }
+.flow-dot { opacity: 0; filter: url(#fc-glow); }
 .syscall-dot { fill: var(--fc-syscall); }
 .kmem-dot { fill: var(--fc-syscall); }
 .ge-dot, .read-dot, .pixel { fill: var(--fc-ge); }
-.gpu-core { fill: var(--fc-ge); opacity: 0.22; }
+.gpu-core { fill: var(--fc-ge); opacity: 0.22; filter: url(#fc-glow); }
 .store-dot, .load-dot { fill: var(--fc-cpu); }
 .scan-dot { fill: var(--fc-present); }
 .vblank-dot, .wake-dot { fill: var(--fc-time); }

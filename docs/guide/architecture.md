@@ -2,6 +2,10 @@
 
 `PSPEmulator` (`src/emulator.ts`) is the top-level facade. It wires the major subsystems together and drives the frame loop.
 
+<ClientOnly>
+  <FrameCycle />
+</ClientOnly>
+
 ```
 PSPEmulator (src/emulator.ts)
 ├── AllegrexCPU    MIPS fetch/decode/execute, branch delay slots, VFPU, syscall dispatch    (src/cpu/)
@@ -20,7 +24,7 @@ The CPU, kernel, memory, and GE are all **renderer-agnostic** and run identicall
 
 ## One frame, step by step
 
-A "frame" here is one call to `runFrame()` followed by presenting the result. There is no single hardware cycle to watch; instead the CPU runs in slices and the GPU and timing run alongside it, thousands of instructions per displayed frame. The animation below is the real dataflow, and the moving dots are data and control passing between the parts (hover any box for a one-line description). Solid arrows carry data; the dashed ones are control signals: the syscall trap, and the timer events that wake the CPU and fire the present.
+A "frame" here is one call to `runFrame()` followed by presenting the result. There is no single hardware cycle to watch; instead the CPU runs in slices and the GPU and timing run alongside it, thousands of instructions per displayed frame. The animation at the top of the page is the real dataflow, and the moving dots are data and control passing between the parts (hover any box for a one-line description). Solid arrows carry data; the dashed ones are control signals: the syscall trap, and the timer events that wake the CPU and fire the present.
 
 Read it as two columns either side of the shared `MemoryBus` (RAM holds code, GE display lists and vertices; VRAM holds the framebuffer):
 
@@ -29,10 +33,6 @@ Read it as two columns either side of the shared `MemoryBus` (RAM holds code, GE
 - **Right, the graphics side.** To draw, the game builds a GE display list in RAM and the kernel dispatches it to the `GEProcessor`, the PSP's GPU. The GPU reads that list and the vertices from RAM and writes pixels into the VRAM framebuffer. The CPU never calls the GPU directly; they meet through the dispatch and shared memory.
 
 `CoreTiming` advances a clock the whole time and only lights up when it signals. When its scheduled VBlank event fires, that both triggers `Present` to scan the VRAM framebuffer out to the screen and wakes the CPU thread for the next frame.
-
-<ClientOnly>
-  <FrameCycle />
-</ClientOnly>
 
 In code, this is `runFrame()` looping `cpu.run(slice)` (each `step()` is fetch, decode, execute, with the `pendingSyscall` flag handing off to `hle.dispatch`), the kernel draining queued GE lists into `GEProcessor.executeCommand`, and `coreTiming.advance(ran)` firing scheduled events. When the VBlank event fires the loop ends, and the frontend presents the framebuffer.
 
@@ -48,7 +48,7 @@ In code, this is `runFrame()` looping `cpu.run(slice)` (each `step()` is fetch, 
 | [Loader & Crypto](/systems/loader-crypto) | `src/loader/`, `src/crypto/` | ELF/PBP loaders, PRX decrypter, and the KIRK/AES/SHA1/AMCTRL primitives behind it. |
 | [ISO & SFO](/systems/iso-sfo) | `src/iso/` | ISO9660 reader, `PARAM.SFO` parser, disc metadata. |
 | [Audio & Media](/systems/audio-media) | `src/audio/`, `src/media/` | ATRAC3+ decode via an AudioWorklet, and MPEG/PSMF video via WebCodecs. |
-| [Storage & Save States](/systems/storage-state) | `src/storage/`, `src/state/` | Browser-persisted savedata/files, and whole-machine `.pspstate` snapshots. |
+| [Storage & Save States](/systems/storage-state) | `src/storage/`, `src/state/` | Browser-persisted savedata and files, plus whole-machine `.pspstate` snapshots you export to a file. |
 | [Frontend](/systems/frontend) | `src/frontend/` | The Lit-based browser UI: game library, input, debug panel, renderer wiring. |
 
 ## Memory map
