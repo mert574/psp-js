@@ -1,65 +1,75 @@
-# Game compatibility & known issues, 2026-06-19
+# Game compatibility (2026-06-19)
 
-Current snapshot of what runs and what's still broken. "Renders" means real
-pixels (not a black framebuffer); WebGL is the default browser renderer, the
-software rasterizer is the headless/fallback path. For the history of how each
-fix landed, read the git log.
+A snapshot of how each tested game runs.
 
-## Per-game status
+## Compatibility ratings
 
-| Game | Status | Notes |
-|---|---|---|
-| puzzle-bobble | **Playable** (full speed + sound, user-confirmed) | Regression test: `test/game-boot-regression.test.ts` |
-| Gran Turismo (UCES01245) | **Plays, renders correctly** | Sky + all textures fixed by the DXT byte-order fix. One known glitch: the HUD/minimap is garbled during the race-start countdown and clears once racing (texture-upload timing). |
-| ridge-racer | **Renders, 3D models visible** | The old "3D never submitted" deadlock no longer applies. |
-| burnout-legends | **Reaches in-game** | The loader busy-spin is gone. Minor bugs may remain. |
-| wipeout-pure | **Intro videos play; menus render** (user-confirmed, browser) | Real WebCodecs H.264 decode. Deeper gameplay less exercised. |
-| gta (GTA3) | **Renders** | MPEG ringbuffer path works. |
-| metal-slug | **Renders** | In-game flip + missing-characters fixed. |
-| cladun-rpg | **Renders, reaches menus** | To start: press UP then X. |
-| puyo-puyo | **Renders** | Menu/logo/text fixed (16-bit depth quantization). |
-| Duke3D (homebrew) | **Boots** (browser, PBP path) | Pass `disc0:/EBOOT.PBP` for PBPs. Not testable in the ISO-only headless harness. |
-| space-invaders | **Black / clears-only** | Event-flag bits never set, then a CPU spin loop. Likely the same intro-video wait as others. |
-| lbp | **Bails at boot** | "pthread API call from non-pthread thread"; our threads aren't registered as SCE pthreads. Also needs sceHttp. |
-| gow-sparta | **Runs but ~1-2 fps** | Not stuck, just slow: host-GPU bound on ~7k micro draw calls/frame. |
+From best to worst:
+
+| Rating | Meaning |
+|---|---|
+| <span class="rt rt-perfect">Perfect</span> | Runs with no noticeable problems. |
+| <span class="rt rt-playable">Playable</span> | Playable start to finish, only minor issues. |
+| <span class="rt rt-ingame">Ingame</span> | Reaches gameplay but with significant glitches or low speed. |
+| <span class="rt rt-menu">Menu/Intro</span> | Reaches menus or intro videos, not gameplay. |
+| <span class="rt rt-noboot">Doesn't Boot</span> | Crashes at boot or shows nothing. |
+
+## Games
+
+| Game | Game ID | Compatibility | Notes |
+|---|---|---|---|
+| Cladun | NPEH00084 | <span class="rt rt-playable">Playable</span> | Low FPS in some scenes. No sound. |
+| Metal Slug XX | ULUS10495 | <span class="rt rt-playable">Playable</span> | Renders correctly. |
+| Puzzle Bobble | ULJM05011 | <span class="rt rt-playable">Playable</span> | Full speed with sound. |
+| Ridge Racer | ULUS10001 | <span class="rt rt-playable">Playable</span> | 3D models render in-race. |
+| Toy Story 3 | ULES01406 | <span class="rt rt-playable">Playable</span> | Visual glitches and a save-game issue. |
+| Burnout Legends | ULES00125 | <span class="rt rt-ingame">Ingame</span> | Graphical glitches. |
+| Duke3D (homebrew) |  | <span class="rt rt-ingame">Ingame</span> | Boots and works without issues, but low FPS. |
+| Gran Turismo | UCES01245 | <span class="rt rt-ingame">Ingame</span> | Graphical glitches and low FPS. |
+| Puyo Puyo | ULJM05058 | <span class="rt rt-ingame">Ingame</span> | Menus, logo, and text render. |
+| Dragon Ball Z Shin Budokai | ULES00309 | <span class="rt rt-menu">Menu/Intro</span> |  |
+| God of War: Ghost of Sparta | UCUS98737 | <span class="rt rt-menu">Menu/Intro</span> | Blank screen after the intro; never reaches the menu. |
+| Wipeout Pure | UCUS98612 | <span class="rt rt-menu">Menu/Intro</span> | Intro videos play (WebCodecs H.264) and menus render. |
+| Grand Theft Auto: Vice City Stories | ULUS10160 | <span class="rt rt-noboot">Doesn't Boot</span> |  |
+| LEGO Batman: The Videogame | ULES01151 | <span class="rt rt-noboot">Doesn't Boot</span> |  |
+| LittleBigPlanet | UCES01264 | <span class="rt rt-noboot">Doesn't Boot</span> | Fails with "pthread API call from non-pthread thread"; our threads are not registered as SCE pthreads. |
+| Space Invaders | ULES01078 | <span class="rt rt-noboot">Doesn't Boot</span> | Black screen. Event-flag bits are never set, then a CPU spin loop. Likely an intro-video wait. |
 
 ## Known issues
 
 **Rendering**
 
-- Gran Turismo race-start HUD/minimap is garbled during the countdown (clears once racing). Texture-upload timing, not the DXT path or depth.
-- Deferred GPU-accuracy gaps from the PPSSPP audit, each with a reason in the code: 16-bit color replication, WebGL doubled-alpha blend, FRAMEBUFWIDTH high bits, morph weights, WebGL CLUT hashing.
-- The software rasterizer mis-projects some games' 3D off-screen (e.g. GT), so it renders black there. WebGL is the path to trust for those; the software path is for headless diagnostics.
+- Deferred GPU-accuracy gaps, each with a reason in the code: 16-bit color replication, WebGL doubled-alpha blend, FRAMEBUFWIDTH high bits, morph weights, WebGL CLUT hashing.
 
 **Performance**
 
-- God of War runs at ~1-2 fps in WebGL. It advances fine, it's just slow: one `drawArrays` per PSP primitive. The fix is batching same-state draws.
+- God of War is slow. WebGL draws are already batched by render state, so the cost that's left is the MIPS interpreter and GE vertex processing.
 
 **Audio**
 
 - SAS (`sceSas`) synthesizes only VAG and PCM voices (plus pitch, L/R volume, ADSR). Not done: ATRAC3 voices, noise/triangle/pulse waveform voices, and the reverb/effect-send path (dry mixing only).
-- No MPEG/SAS reverb. (MPEG cutscene audio via `sceMpegAtracDecode` IS decoded and played, contrary to older notes.)
+- No MPEG or SAS reverb. MPEG cutscene audio via `sceMpegAtracDecode` is decoded and played.
 
-**Per-game blockers**
-
-- Space Invaders: event-flag bits never set, then a spin loop.
-- LBP: SCE pthread registration missing; needs sceHttp.
-
-**Project-level**
-
-- No LICENSE file even though GPL-derived PPSSPP/libkirk code is tracked (NID DB, KIRK ports, keyvault). Needs a GPL-2.0+ license and attribution.
-
-## Planned / remaining work
+## Planned work
 
 1. sceMpeg intro-video handling for the games that still block on it.
-2. God of War draw-call batching (the main perf lever).
-3. Software-renderer perf: decoded-texture cache + incremental barycentric stepping.
-4. Revive the GE Web Worker (currently dead code, disabled over a postMessage/stall race) to offload GE from the main thread, ideally over a SharedArrayBuffer command ring.
-5. Utility dialog status numbering for msgdialog/netconf/osk (align with the savedata fix).
-6. Headless harness support for directory-based homebrew (mount a dir as `ms0:/PSP/GAME/...`).
+2. Speed up God of War: the MIPS interpreter and GE vertex processing are the slow parts now.
+3. Revive the GE Web Worker to move GE work off the main thread, ideally over a SharedArrayBuffer command ring.
+4. Utility dialog status numbering for msgdialog, netconf, and osk.
 
-## Test counts
-
-- Unit tests: 115/115 (verified 2026-06-19, `npx vitest run src/`).
-- pspautotests: 47/47 at last full run (the older 6 GE-signal GPU failures and 2 sysmem failures are fixed). The suite is slow; run it deliberately, not casually.
-- Puzzle Bobble boot regression: passing.
+<style>
+.rt {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-size: 0.85em;
+  font-weight: 600;
+  white-space: nowrap;
+  color: #fff;
+}
+.rt-perfect { background: #15803d; }
+.rt-playable { background: #22a06b; }
+.rt-ingame { background: #eab308; color: #1a1a1a; }
+.rt-menu { background: #ea7317; }
+.rt-noboot { background: #dc2626; }
+</style>
