@@ -18,15 +18,15 @@ From best to worst:
 
 | Game | Game ID | Compatibility | Notes |
 |---|---|---|---|
-| Cladun | NPEH00084 | <span class="rt rt-playable">Playable</span> | Low FPS in some scenes. No sound. |
 | Metal Slug XX | ULUS10495 | <span class="rt rt-playable">Playable</span> | Renders correctly. |
 | Puzzle Bobble | ULJM05011 | <span class="rt rt-playable">Playable</span> | Full speed with sound. |
-| Ridge Racer | ULUS10001 | <span class="rt rt-playable">Playable</span> | 3D models render in-race. |
-| Toy Story 3 | ULES01406 | <span class="rt rt-playable">Playable</span> | Visual glitches and a save-game issue. |
 | Burnout Legends | ULES00125 | <span class="rt rt-ingame">Ingame</span> | Graphical glitches. |
-| Duke3D (homebrew) |  | <span class="rt rt-ingame">Ingame</span> | Boots and works without issues, but low FPS. |
+| Cladun | NPEH00084 | <span class="rt rt-ingame">Ingame</span> | Low FPS in some scenes. No sound. |
+| Duke3D | homebrew | <span class="rt rt-ingame">Ingame</span> | Boots and works without issues, but low FPS. |
 | Gran Turismo | UCES01245 | <span class="rt rt-ingame">Ingame</span> | Graphical glitches and low FPS. |
 | Puyo Puyo | ULJM05058 | <span class="rt rt-ingame">Ingame</span> | Menus, logo, and text render. |
+| Ridge Racer | ULUS10001 | <span class="rt rt-ingame">Ingame</span> | 3D models render in-race. |
+| Toy Story 3 | ULES01406 | <span class="rt rt-ingame">Ingame</span> | Visual glitches and a save-game issue. |
 | Dragon Ball Z Shin Budokai | ULES00309 | <span class="rt rt-menu">Menu/Intro</span> |  |
 | God of War: Ghost of Sparta | UCUS98737 | <span class="rt rt-menu">Menu/Intro</span> | Blank screen after the intro; never reaches the menu. |
 | Wipeout Pure | UCUS98612 | <span class="rt rt-menu">Menu/Intro</span> | Intro videos play (WebCodecs H.264) and menus render. |
