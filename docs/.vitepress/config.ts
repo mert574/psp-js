@@ -15,6 +15,7 @@ export default defineConfig({
     nav: [
       { text: "Introduction", link: "/guide/introduction" },
       { text: "User Guide", link: "/user/running-games" },
+      { text: "Compatibility", link: "/game-status" },
       { text: "Development", link: "/guide/getting-started" },
       { text: "Reference", link: "/reference/syscalls" },
     ],
@@ -30,6 +31,7 @@ export default defineConfig({
         text: "User Guide",
         items: [
           { text: "Running Games", link: "/user/running-games" },
+          { text: "Game Compatibility", link: "/game-status" },
           { text: "Controls", link: "/user/controls" },
           { text: "Settings", link: "/user/settings" },
           { text: "Save States & Savedata", link: "/user/saves" },
