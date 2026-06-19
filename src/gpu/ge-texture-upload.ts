@@ -215,15 +215,17 @@ function decodeDXT(
   }
 }
 
+// PSP DXT blocks are byte-reversed vs PC: index "lines" (one byte per row) at
+// +0..+3, color1 at +4, color2 at +6; DXT3/5 put the color block first then the
+// alpha data. See ppsspp-reference/GPU/Common/TextureDecoder.h:46. Mirrors
+// dxtColorTexel in ge-texture.ts (kept separate to avoid a circular import).
 function decodeDXT1Pixel(bus: MemoryBus, blockAddr: number, px: number, py: number): number {
-  const c0raw = bus.readU16(blockAddr);
-  const c1raw = bus.readU16(blockAddr + 2);
-  const bits = bus.readU32(blockAddr + 4);
+  const c0raw = bus.readU16(blockAddr + 4); // color1
+  const c1raw = bus.readU16(blockAddr + 6); // color2
+  const code = (bus.readU8(blockAddr + py) >> (px * 2)) & 3; // lines[py]
 
   const c0 = color5650to8888(c0raw);
   const c1 = color5650to8888(c1raw);
-  const code = (bits >> ((py * 4 + px) * 2)) & 3;
-
   const r0 = c0 & 0xFF, g0 = (c0 >> 8) & 0xFF, b0 = (c0 >> 16) & 0xFF;
   const r1 = c1 & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = (c1 >> 16) & 0xFF;
 
@@ -242,44 +244,29 @@ function decodeDXT1Pixel(bus: MemoryBus, blockAddr: number, px: number, py: numb
 }
 
 function decodeDXT3Pixel(bus: MemoryBus, blockAddr: number, px: number, py: number): number {
-  const alphaWord = bus.readU16(blockAddr + py * 2);
-  const alpha = ((alphaWord >> (px * 4)) & 0xF) << 4; // PPSSPP WriteColorsDXT3: nibble<<4
-  const color = decodeDXT1Pixel(bus, blockAddr + 8, px, py);
+  // Color block at +0, alphaLines (u16 per row) at +8.
+  const alpha = ((bus.readU16(blockAddr + 8 + py * 2) >> (px * 4)) & 0xF) << 4;
+  const color = decodeDXT1Pixel(bus, blockAddr, px, py);
   return (color & 0x00FFFFFF) | (alpha << 24);
 }
 
 function decodeDXT5Pixel(bus: MemoryBus, blockAddr: number, px: number, py: number): number {
-  const a0 = bus.readU8(blockAddr);
-  const a1 = bus.readU8(blockAddr + 1);
-  const bitIdx = (py * 4 + px) * 3;
-  const byteOff = blockAddr + 2 + (bitIdx >> 3);
-  const bitShift = bitIdx & 7;
-  const rawBits = bus.readU8(byteOff) | (bus.readU8(byteOff + 1) << 8);
-  const code = (rawBits >> bitShift) & 7;
+  // Color block at +0; alphadata2 (u32) at +8, alphadata1 (u16) at +12,
+  // alpha1 at +14, alpha2 at +15. 48-bit alpha index field, 3 bits/pixel.
+  const a0 = bus.readU8(blockAddr + 14);
+  const a1 = bus.readU8(blockAddr + 15);
+  const allAlphaLo = bus.readU32(blockAddr + 8) >>> 0;
+  const allAlphaHi = bus.readU16(blockAddr + 12);
+  const shift = py * 12 + px * 3;
+  const code = Math.floor((allAlphaHi * 0x100000000 + allAlphaLo) / 2 ** shift) & 7;
 
   let alpha: number;
   if (code === 0) alpha = a0;
   else if (code === 1) alpha = a1;
-  else if (a0 > a1) alpha = ((8 - code) * a0 + (code - 1) * a1) / 7 | 0;
-  else if (code <= 5) alpha = ((6 - code) * a0 + (code - 1) * a1) / 5 | 0;
-  else alpha = code === 6 ? 0 : 255;
+  else if (a0 > a1) alpha = ((a0 * ((7 - (code - 1)) << 8) + a1 * ((code - 1) << 8)) / 7 + 31 >> 8) & 0xFF;
+  else if (code === 6) alpha = 0;
+  else if (code === 7) alpha = 255;
+  else alpha = ((a0 * ((5 - (code - 1)) << 8) + a1 * ((code - 1) << 8)) / 5 + 31 >> 8) & 0xFF;
 
-  // Color block at +8, always 4-color mode
-  const c0raw = bus.readU16(blockAddr + 8);
-  const c1raw = bus.readU16(blockAddr + 10);
-  const bits = bus.readU32(blockAddr + 12);
-  const c0 = color5650to8888(c0raw);
-  const c1 = color5650to8888(c1raw);
-  const colorCode = (bits >> ((py * 4 + px) * 2)) & 3;
-
-  const r0 = c0 & 0xFF, g0 = (c0>>8)&0xFF, b0 = (c0>>16)&0xFF;
-  const r1 = c1 & 0xFF, g1 = (c1>>8)&0xFF, b1 = (c1>>16)&0xFF;
-
-  let r: number, g: number, b: number;
-  if (colorCode === 0) { r = r0; g = g0; b = b0; }
-  else if (colorCode === 1) { r = r1; g = g1; b = b1; }
-  else if (colorCode === 2) { r = (2*r0+r1)/3|0; g = (2*g0+g1)/3|0; b = (2*b0+b1)/3|0; }
-  else { r = (r0+2*r1)/3|0; g = (g0+2*g1)/3|0; b = (b0+2*b1)/3|0; }
-
-  return (alpha << 24) | (b << 16) | (g << 8) | r;
+  return (alpha << 24) | (decodeDXT1Pixel(bus, blockAddr, px, py) & 0x00FFFFFF);
 }
