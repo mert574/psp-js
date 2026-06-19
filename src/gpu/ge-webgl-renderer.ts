@@ -261,11 +261,11 @@ export class WebGLGERenderer {
   // program+buffer, so they reset gePipelineBound.
   private geAttribLocs: { pos: number; uv: number; col: number; fog: number; clipw: number } | null = null;
   private gePipelineBound = false;
-  // Last texture + sampler-state (filter/wrap) signature applied, so a run of draws
-  // using the same texture and sampler skips the 4 per-draw texParameteri calls
-  // (those were ~82ms/frame on the same scene).
-  private lastTexParamTex: WebGLTexture | null = null;
-  private lastTexParamKey = -1;
+  // Sampler-state (filter/wrap) signature last applied to each texture, so binding
+  // a texture that already has the wanted sampler skips its 4 texParameteri calls
+  // (those were ~82ms/frame on draw-heavy scenes). Keyed by the texture object so
+  // an A→B→A bind run doesn't re-apply A's params; deleted textures drop out via GC.
+  private texParamApplied = new WeakMap<WebGLTexture, number>();
 
   // GE-program uniform locations (cached once) + last-applied source values, so a
   // run of same-state draws skips the ~17 uniform calls/draw. Uniform values are
@@ -298,6 +298,14 @@ export class WebGLGERenderer {
   private lastBlendFixB = -1;
   private lastCullFace = -1; // gl enum last passed to cullFace, or -1
   private lastColorMaskBits = -1; // 4-bit R|G|B|A enable mask, or -1 if unknown
+  private lastDepthFunc = -1;     // gl enum last passed to depthFunc, or -1
+  private lastDepthMask = -1;     // 1 = writes on, 0 = off, -1 = unknown
+  // Last viewport size set. Viewport is global GL state and every GE batch/VFB uses
+  // fbW x fbH, so a run of draws to the same-size target re-set it ~83x/frame. -1
+  // forces the first set. present()/blitVFB go through setViewport too, so the next
+  // GE batch re-applies after they change it to the canvas/target size.
+  private lastViewportW = -1;
+  private lastViewportH = -1;
 
   // Internal resolution multiplier. VFBs are allocated at scale*512 x scale*272
   // and the viewport/scissor scale with it, so 3D geometry rasterizes at higher
@@ -701,7 +709,7 @@ export class WebGLGERenderer {
       // Open a new batch: do the one-time-per-run GL setup. All appended prims in
       // this batch share the same state, so this runs once per state change.
       this.bindRenderTarget(state.fbPtr, state.fbFormat, state.fbWidth);
-      gl.viewport(0, 0, this.fbW, this.fbH);
+      this.setViewport(this.fbW, this.fbH);
       this.setupUVNormalization(state);
 
       this.applyBlendState(gl, state.fragState);
@@ -721,13 +729,12 @@ export class WebGLGERenderer {
       // Apply texture filtering/wrap, but only when the bound texture or its
       // sampler state actually changed since the last applied texparam.
       if (state.texEnable) {
-        if (tex !== this.lastTexParamTex || texParamKey !== this.lastTexParamKey) {
+        if (this.texParamApplied.get(tex) !== texParamKey) {
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, (texParamKey & 1) ? gl.LINEAR : gl.NEAREST);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, (texParamKey & 2) ? gl.LINEAR : gl.NEAREST);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, (texParamKey & 4) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, (texParamKey & 8) ? gl.CLAMP_TO_EDGE : gl.REPEAT);
-          this.lastTexParamTex = tex;
-          this.lastTexParamKey = texParamKey;
+          this.texParamApplied.set(tex, texParamKey);
         }
       }
 
@@ -831,7 +838,7 @@ export class WebGLGERenderer {
       console.log(`[VFB] Clear 0x${normAddr.toString(16)} rgba(${r},${g},${b},${a})`);
     }
     this.bindRenderTarget(fbPtr, fbFormat, fbStride);
-    gl.viewport(0, 0, this.fbW, this.fbH);
+    this.setViewport(this.fbW, this.fbH);
 
     // Use scissor to limit the clear to the requested rectangle
     gl.enable(gl.SCISSOR_TEST);
@@ -859,6 +866,7 @@ export class WebGLGERenderer {
     gl.colorMask(true, true, true, true);
     this.lastColorMaskBits = 15;
     gl.depthMask(true);
+    this.lastDepthMask = 1; // we just forced depthMask back on, keep the tracker in sync
     gl.clearDepth(1);
     gl.disable(gl.SCISSOR_TEST);
     this.currentScissorEnabled = false;
@@ -896,7 +904,7 @@ export class WebGLGERenderer {
     // next draw to the same address early-returns in bindRenderTarget and
     // renders onto the canvas backbuffer (invisible — present overwrites it).
     this.currentRenderAddr = 0;
-    gl.viewport(0, 0, this.gl.canvas.width, this.gl.canvas.height);
+    this.setViewport(this.gl.canvas.width, this.gl.canvas.height);
 
     // Disable all state for fullscreen blit — and reset tracking flags so
     // the next frame's drawPrimitives re-applies all GE state correctly.
@@ -912,10 +920,10 @@ export class WebGLGERenderer {
     this.currentCullEnabled = false;
     this.currentStencilEnabled = false;
     // Switching to the present program + buffer invalidates the cached GE draw
-    // pipeline and the texParameteri tracking; the next GE draw rebinds them.
+    // pipeline; the next GE draw rebinds it. texParameteri is tracked per texture
+    // object (WeakMap), so it survives the program switch and needs no reset.
     // colorMask was just forced to all-true above, so reflect that in the cache.
     this.gePipelineBound = false;
-    this.lastTexParamTex = null;
     this.lastColorMaskBits = 15;
 
     gl.useProgram(this.presentProgram.program);
@@ -1018,10 +1026,8 @@ export class WebGLGERenderer {
     }
     this.vfbs.clear();
     this.currentRenderAddr = 0; // nothing is bound now; next draw re-creates a target
-    // A VFB texture may have been the last-bound sampler source; those handles
-    // are now deleted, so clear the dirty-track caches and force a pipeline
-    // re-bind on the next draw (same resets present()/blitVFB() do).
-    this.lastTexParamTex = null;
+    // The deleted VFB handles drop out of texParamApplied (WeakMap) on their own;
+    // just force a pipeline re-bind and drop the batch's texture reference.
     this.batchTex = null;
     this.gePipelineBound = false;
   }
@@ -1074,7 +1080,7 @@ export class WebGLGERenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, depthRb);
-    gl.viewport(0, 0, this.fbW, this.fbH);
+    this.setViewport(this.fbW, this.fbH);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1290,7 +1296,7 @@ export class WebGLGERenderer {
     const gl = this.gl;
     // Draw source FBO texture into destination FBO as a fullscreen quad
     gl.bindFramebuffer(gl.FRAMEBUFFER, dstVfb.fbo);
-    gl.viewport(0, 0, this.fbW, this.fbH);
+    this.setViewport(this.fbW, this.fbH);
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
     gl.disable(gl.SCISSOR_TEST);
@@ -1313,9 +1319,9 @@ export class WebGLGERenderer {
     this.currentCullEnabled = false;
     this.currentStencilEnabled = false;
     // Present program + buffer were bound above — invalidate the GE pipeline cache.
+    // (texParameteri is tracked per texture object, so it needs no reset here.)
     // colorMask was forced to all-true, so reflect that in the cache.
     this.gePipelineBound = false;
-    this.lastTexParamTex = null;
     this.lastColorMaskBits = 15;
     this.currentRenderAddr = dstKey;
 
@@ -1552,7 +1558,13 @@ export class WebGLGERenderer {
     const cached = this.texCache.get(key);
     if (cached) {
       if (cached.hash === hash) { this.geGlStats.texHits++; return cached.tex; }
-      gl.deleteTexture(cached.tex); // content changed in place — re-upload
+      // Content changed in place — re-upload. But the open batch may still be
+      // about to draw with this exact texture; deleting it now would leave flush()
+      // drawing from a freed GL texture (garbage — shows as rainbow noise). This is
+      // the norm for reused per-glyph font-cache buffers (same key, new content
+      // each glyph), so flush the pending draw first while the texture is alive.
+      if (this.batchOpen && this.batchTex === cached.tex) this.flush();
+      gl.deleteTexture(cached.tex);
       this.texCache.delete(key);
     }
     this.geGlStats.texMiss++;
@@ -1576,7 +1588,12 @@ export class WebGLGERenderer {
       const firstKey = this.texCache.keys().next().value;
       if (firstKey !== undefined) {
         const old = this.texCache.get(firstKey);
-        if (old) gl.deleteTexture(old.tex);
+        if (old) {
+          // Same use-after-free guard as above: never free a texture the open
+          // batch is about to draw with.
+          if (this.batchOpen && this.batchTex === old.tex) this.flush();
+          gl.deleteTexture(old.tex);
+        }
         this.texCache.delete(firstKey);
       }
     }
@@ -1674,11 +1691,22 @@ export class WebGLGERenderer {
       }
   }
 
+  /** Set the viewport, skipping the GL call when the size is unchanged. Viewport
+   *  is global GL state, so tracking the last size globally (not per-FBO) is correct. */
+  private setViewport(w: number, h: number): void {
+    if (w === this.lastViewportW && h === this.lastViewportH) return;
+    this.gl.viewport(0, 0, w, h);
+    this.lastViewportW = w;
+    this.lastViewportH = h;
+  }
+
   private applyDepthState(gl: WebGLRenderingContext, state: GEDrawState): void {
     if (state.depthTestEnable) {
       if (!this.currentDepthEnabled) { gl.enable(gl.DEPTH_TEST); this.currentDepthEnabled = true; }
-      gl.depthFunc(mapDepthFunc(gl, state.depthFunc));
-      gl.depthMask(!state.depthWriteDisable);
+      const df = mapDepthFunc(gl, state.depthFunc);
+      if (df !== this.lastDepthFunc) { gl.depthFunc(df); this.lastDepthFunc = df; }
+      const dm = state.depthWriteDisable ? 0 : 1;
+      if (dm !== this.lastDepthMask) { gl.depthMask(dm === 1); this.lastDepthMask = dm; }
     } else {
       if (this.currentDepthEnabled) { gl.disable(gl.DEPTH_TEST); this.currentDepthEnabled = false; }
     }
