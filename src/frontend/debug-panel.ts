@@ -8,6 +8,7 @@ import "./debug/gldraw-panel.js";
 import "./debug/threads-panel.js";
 import "./debug/memory-panel.js";
 import "./debug/ge-panel.js";
+import "./debug/render-toggles-panel.js";
 import "./debug/savedata-panel.js";
 import "./debug/savestate-panel.js";
 import "./debug/stubs-panel.js";
@@ -17,6 +18,7 @@ import type { GlDrawPanel } from "./debug/gldraw-panel.js";
 import type { ThreadsPanel } from "./debug/threads-panel.js";
 import type { MemoryPanel } from "./debug/memory-panel.js";
 import type { GePanel } from "./debug/ge-panel.js";
+import type { RenderTogglesPanel } from "./debug/render-toggles-panel.js";
 import type { SavedataPanel } from "./debug/savedata-panel.js";
 import type { SavestatePanel } from "./debug/savestate-panel.js";
 import type { StubsPanel } from "./debug/stubs-panel.js";
@@ -121,6 +123,42 @@ sheet.replaceSync(`
     }
     & .note { color: var(--muted, #8b949e); font-weight: var(--fw-regular); }
   }
+
+  /* Render toggles — two-column grid of checkboxes that force GE features off. */
+  .rtoggles {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 12px;
+  }
+  .rtoggles__row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted, #8b949e);
+    cursor: pointer;
+    user-select: none;
+  }
+  .rtoggles__row input { cursor: pointer; margin: 0; }
+
+  /* Draw-call scrubber — render only the first N draws of a frozen frame. */
+  .rscrub { margin-top: 10px; }
+  .rscrub__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted, #8b949e);
+    margin-bottom: 4px;
+  }
+  .rscrub__head b { color: var(--text, #e6edf3); font-variant-numeric: tabular-nums; }
+  .rscrub__all {
+    margin-left: auto;
+    font-size: 11px;
+    padding: 1px 8px;
+    cursor: pointer;
+  }
+  .rscrub input[type="range"] { width: 100%; cursor: pointer; }
 
   /* Info icon + hover tooltip. position:fixed + anchor positioning so the popup
      escapes the panel's overflow clipping (latest Chrome). */
@@ -502,6 +540,7 @@ export class DebugPanel extends LitElement {
   #threads: ThreadsPanel | null = null;
   #memory: MemoryPanel | null = null;
   #ge: GePanel | null = null;
+  #renderToggles: RenderTogglesPanel | null = null;
   #savedata: SavedataPanel | null = null;
   #savestate: SavestatePanel | null = null;
   #stubs: StubsPanel | null = null;
@@ -526,6 +565,7 @@ export class DebugPanel extends LitElement {
       <threads-panel></threads-panel>
       <memory-panel></memory-panel>
       <ge-panel></ge-panel>
+      <render-toggles-panel></render-toggles-panel>
       <savedata-panel></savedata-panel>
       <savestate-panel></savestate-panel>
       <stubs-panel></stubs-panel>
@@ -540,6 +580,7 @@ export class DebugPanel extends LitElement {
     this.#threads  = r.querySelector("threads-panel");
     this.#memory   = r.querySelector("memory-panel");
     this.#ge       = r.querySelector("ge-panel");
+    this.#renderToggles = r.querySelector("render-toggles-panel");
     this.#savedata = r.querySelector("savedata-panel");
     this.#savestate = r.querySelector("savestate-panel");
     this.#stubs    = r.querySelector("stubs-panel");
@@ -564,6 +605,7 @@ export class DebugPanel extends LitElement {
     this.#threads?.tick(emu, now);
     this.#memory?.tick(emu, now);
     this.#ge?.tick(emu, now);
+    this.#renderToggles?.tick(emu, now);
     this.#savedata?.tick(emu, now);
     this.#savestate?.tick(emu, now);
     this.#stubs?.tick(emu, now);
@@ -586,6 +628,7 @@ export class DebugPanel extends LitElement {
     this.#threads?.reset();
     this.#memory?.reset();
     this.#ge?.reset();
+    this.#renderToggles?.reset();
     this.#savedata?.reset();
     this.#savestate?.reset();
     this.#stubs?.reset();
