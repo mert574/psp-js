@@ -1,18 +1,22 @@
 /**
- * Capture UI screenshots for the docs with Playwright (driving installed Chrome).
+ * Capture screenshots for the docs with Playwright (driving installed Chrome).
  *
  * Prereq: the app dev server must be running. Point BASE_URL at it.
  *   npm run dev                                   # app on :5173
  *   BASE_URL=http://localhost:5173 npm run docs:shots
  *
- * By default it captures only the emulator's own UI with no game content: the
- * landing prompt and the boot-options form. To also capture the debug panel
- * populated by a running game, copy an ISO into public/ and pass its served path
- * as ISO_URL; the ?iso= autoloader boots it. That shot crops to the <debug-panel>
- * element only, so no game imagery is saved.
+ * With no ISO it captures the emulator's own screens: the landing prompt and the
+ * boot-options form. Pass ISO_URL to also boot a game and capture the running
+ * emulator: a gameplay frame (cropped to the canvas) plus the debug panel and one
+ * image per section. Game footage in these images is fine (it shows the emulator
+ * actually working, like any emulator's docs). Shots crop to the relevant element
+ * rather than the whole window so they look clean. The one thing that must never
+ * be committed is the game itself, so stage the ISO somewhere gitignored
+ * (public/*.iso is) and delete it after.
  *
  *   cp game.iso public/_shot.iso
  *   ISO_URL=/_shot.iso BASE_URL=http://localhost:5173 npm run docs:shots
+ *   rm public/_shot.iso
  *
  * Output: docs/public/screenshots/*.png (served by VitePress at /screenshots/).
  */
@@ -22,13 +26,19 @@ import path from "node:path";
 
 const BASE = process.env.BASE_URL || "http://localhost:5173";
 const ISO_URL = process.env.ISO_URL || "";
+// How long to let the game run before the in-game shots. Commercial games show
+// publisher/middleware splashes for the first several seconds, so bump this
+// (e.g. READY_MS=22000) to let a game reach its menu before the gameplay frame.
+const READY_MS = Number(process.env.READY_MS) || 8000;
 const OUT = path.resolve("docs/public/screenshots");
 mkdirSync(OUT, { recursive: true });
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await chromium.launch({ channel: "chrome", headless: true });
-const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 });
+// deviceScaleFactor 1 captures at CSS size; bumping it to 2 would double every
+// image's pixel dimensions (retina). Keep it at 1 so the docs images stay small.
+const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
 const page = await ctx.newPage();
 page.on("console", (m) => { if (m.type() === "error") console.log("  [page error]", m.text()); });
 
@@ -51,8 +61,7 @@ try {
   await shotPage("landing");
 
   // Load a games folder to reach the boot-options screen (renderer / resolution /
-  // audio). The Games column / cover art is never screenshotted, so no game art
-  // lands in the committed images. The folder load routes straight to options.
+  // audio). The folder load routes straight to options.
   const GAMES_DIR = process.env.GAMES_DIR || "test/fixtures";
   try {
     await page.setInputFiles("#file-input-dir", path.resolve(GAMES_DIR));
@@ -64,10 +73,12 @@ try {
     console.log("  options shot skipped:", e.message);
   }
 
-  // 3. Optional debug-panel shot: boot a game and screenshot ONLY the
-  // <debug-panel> element, so the game canvas / imagery is excluded. Set ISO_URL
-  // to a path the dev server serves (copy an ISO into public/ and pass its path,
-  // e.g. ISO_URL=/_shot.iso); the ?iso= autoloader boots it without UI clicks.
+  // 3. Optional in-game shots: boot a game (set ISO_URL to a path the dev server
+  // serves, e.g. ISO_URL=/_shot.iso; the ?iso= autoloader boots it without UI
+  // clicks) and capture the running emulator. We take a gameplay frame plus the
+  // debug panel and its sections. Every shot crops to its element (the canvas, the
+  // panel) rather than the whole window, so they look clean, not because we are
+  // hiding the game.
   if (ISO_URL) {
     try {
       await page.goto(`${BASE}/?iso=${ISO_URL}`, { waitUntil: "load" });
@@ -84,7 +95,10 @@ try {
         const c = document.getElementById("psp-canvas");
         return !!c && c.getBoundingClientRect().width > 0;
       }, { timeout: 30000 });
-      await wait(8000); // render a few frames so the panels have live data
+      await wait(READY_MS); // let the game reach a menu / gameplay (see READY_MS)
+      // Gameplay frame: crop to the canvas, so it is a clean rendered game frame
+      // (no surrounding window chrome). Taken before the debug sidebar opens.
+      await shotEl("gameplay", "#psp-canvas");
       // Open the debug sidebar directly via its open class. The Debug button is in
       // the gameplay HUD (hidden until revealed); the sub-panels populate on the
       // next tick once the class is set.
@@ -92,9 +106,10 @@ try {
       await wait(3000);
       await shotEl("debug-panel", "#debug-panel");
 
-      // Per-section shots: each sub-panel's inner <section> only, so the game canvas
-      // is never captured. The sub-panel host tags are display:contents (no box of
-      // their own), so target the section inside. Playwright CSS pierces the shadow.
+      // Per-section shots: each sub-panel's inner <section>, since these pages
+      // document the panel sections. The sub-panel host tags are display:contents
+      // (no box of their own), so target the section inside. Playwright CSS pierces
+      // the shadow.
       const sections = [
         ["panel-performance",   "perf-panel section"],
         ["panel-ge-draw-stats", "gldraw-panel section"],

@@ -1,6 +1,14 @@
+<script setup>
+import { withBase } from "vitepress";
+</script>
+
 # Introduction
 
 **psp-js** is a PSP emulator written in TypeScript that runs in the browser. It uses **high-level emulation** (HLE), the same approach as [PPSSPP](https://www.ppsspp.org/): instead of running a real PSP BIOS, the system calls a game makes are intercepted and implemented directly in TypeScript. No BIOS ROM is required.
+
+<video :src="withBase('/videos/ridge-racer.mp4')" controls muted autoplay loop playsinline preload="metadata" style="width:100%;max-width:640px;border-radius:8px;display:block;margin:1.5rem auto"></video>
+
+<p style="text-align:center;font-size:13px;opacity:0.7;margin-top:-0.75rem">Ridge Racer running in psp-js, captured from the in-game replay.</p>
 
 ## What it does
 
