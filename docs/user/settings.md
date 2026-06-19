@@ -1,3 +1,7 @@
+<script setup>
+import { withBase } from "vitepress";
+</script>
+
 # Settings
 
 The options screen (open a game's gear from the library, or the options before booting) has these settings. The renderer choice and resolution apply at boot; the renderer can also be changed live from the [debug panel](/user/debug-panel).
@@ -14,6 +18,10 @@ All four boot options (renderer, resolution, disable audio, profiler) are saved 
 | **Software** | Rasterizes on the CPU into memory. Much slower, useful for comparing output or debugging a rendering issue. |
 
 You can switch between them mid-game from the debug panel's Performance section without rebooting (expect a frame or two of stale image while the game redraws). See [GPU (GE)](/systems/gpu-ge) for what differs.
+
+<video :src="withBase('/videos/metal-slug.mp4')" controls muted autoplay loop playsinline preload="metadata" style="width:100%;max-width:480px;border-radius:8px;display:block;margin:1.5rem auto"></video>
+
+<p style="text-align:center;font-size:13px;opacity:0.7;margin-top:-0.75rem">Metal Slug XX on the software rasterizer, at native 480×272.</p>
 
 ## Resolution
 
