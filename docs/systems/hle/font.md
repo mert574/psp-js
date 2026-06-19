@@ -78,7 +78,7 @@ Registered in `registerFontHandlers()`. Signatures below are the PSP signatures 
 
 | Signature | What it does |
 | --- | --- |
-| `sceFontGetFontInfo(fontHandle: u32, fontInfoPtr: u32): int` | Fills the 264-byte `PGFFontInfo` at `fontInfoPtr` with dummy 12x14px metrics in 26.6 fixed point. |
+| `sceFontGetFontInfo(fontHandle: u32, fontInfoPtr: u32): int` | Fills the 264-byte `PGFFontInfo` at `fontInfoPtr` from the bound font's real header (max glyph width/height, ascender/descender, advances, glyph count, BPP), matching PPSSPP `PGF::GetFontInfo`. Games size their glyph-cache cells from `maxGlyphWidth`, so reporting the true value (not a fixed 12px) is what keeps wide glyphs like `m`/`w` from being clipped. Falls back to any loaded font when the handle doesn't resolve. |
 | `sceFontGetFontInfoByIndexNumber(libHandle: u32, fontInfoPtr: u32, index: u32): int` | Zero-fills the 168-byte `PGFFontStyle` at `fontInfoPtr`. |
 | `sceFontGetFontList(fontLibHandle: u32, fontStylePtr: u32, numFonts: int): int` | Zero-fills one 168-byte `PGFFontStyle` at `fontStylePtr` (it ignores `numFonts` rather than filling the whole list). |
 | `sceFontGetCharInfo(fontHandle: u32, charCode: u32, charInfoPtr: u32): int` | Fills the 60-byte `PGFCharInfo` from the real glyph (width/height, bearing, advance) when a PGF is bound, otherwise writes plausible 12x14px fallback metrics. |

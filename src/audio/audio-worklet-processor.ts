@@ -1,42 +1,79 @@
 /**
  * PSP AudioWorkletProcessor — runs in AudioWorkletGlobalScope.
  *
- * Per-channel queue mode: each logical PSP channel (0-8) has its own PCM
- * queue.  The process() callback mixes all channels together on output,
- * enabling simultaneous BGM + SFX playback without serialisation artefacts.
+ * Per-channel queue mode: each logical PSP channel (0-9) has its own PCM
+ * queue.  process() mixes all channels together on output, enabling
+ * simultaneous BGM + SFX without serialisation artefacts.
+ *
+ * Clock handling: the emulator produces audio paced to EMULATED time (the
+ * game's audio thread blocks for the sample duration in CoreTiming cycles),
+ * while this processor consumes at the AudioContext's WALL-CLOCK 44100 Hz.
+ * Those clocks only match when the emulator runs at exactly real time, so we
+ * cap the per-channel backlog: if a channel runs too far ahead (emulator burst
+ * / faster than real time) we drop the oldest frames so audio can't fall
+ * seconds behind the picture. We do NOT gate playback on a minimum buffer —
+ * samples play as soon as they arrive (short one-shot SFX must not be held
+ * back), and an underrun simply outputs silence until more data arrives.
  *
  * AudioWorkletGlobalScope types are declared in audioworklet-env.d.ts.
  */
 
+const SAMPLE_RATE = 44_100;
+/** Drop oldest frames once a channel's backlog passes this (~200 ms) so audio
+ *  can't drift unboundedly behind the game. */
+const MAX_LATENCY_FRAMES = Math.round(SAMPLE_RATE * 0.2);
+/** When trimming, leave this much queued (~70 ms) instead of emptying. */
+const TRIM_TARGET_FRAMES = Math.round(SAMPLE_RATE * 0.07);
+
+interface ChannelQueue {
+  chunks: Int16Array[];
+  /** Read offset, in stereo frames, into the front chunk. */
+  offset: number;
+  /** Total frames currently queued (across all chunks, minus offset). */
+  frames: number;
+}
+
 class PspAudioProcessor extends AudioWorkletProcessor {
-  /** Per-channel PCM chunk queues.  Key = channel index (0-8). */
-  private readonly channelQueues: Map<number, Int16Array[]>;
-  /** Read offset (in stereo frames) into the front chunk of each channel. */
-  private readonly channelOffsets: Map<number, number>;
+  private readonly channels = new Map<number, ChannelQueue>();
   /** Emulation-speed multiplier: consume this many input frames per output frame
-   *  so audio fast-forwards in step with 2×/4× game speed (and drains its backlog
-   *  instead of lagging). 1 = real-time. */
+   *  so audio fast-forwards in step with 2×/4× game speed. 1 = real-time. */
   private speed = 1;
 
   constructor(_options?: AudioWorkletNodeOptions) {
     super();
 
-    this.channelQueues  = new Map();
-    this.channelOffsets = new Map();
-
-    this.port.onmessage = (e: MessageEvent<{channel: number; pcm: Int16Array} | {speed: number}>) => {
+    this.port.onmessage = (e: MessageEvent<{ channel: number; pcm: Int16Array } | { speed: number }>) => {
       if ("speed" in e.data) {
         this.speed = e.data.speed > 0 ? e.data.speed : 1;
         return;
       }
       const { channel, pcm } = e.data;
-      let queue = this.channelQueues.get(channel);
-      if (!queue) {
-        queue = [];
-        this.channelQueues.set(channel, queue);
-        this.channelOffsets.set(channel, 0);
+      let q = this.channels.get(channel);
+      if (!q) {
+        q = { chunks: [], offset: 0, frames: 0 };
+        this.channels.set(channel, q);
       }
-      queue.push(pcm);
+      q.chunks.push(pcm);
+      q.frames += pcm.length >> 1;
+
+      // Latency cap: if the producer ran ahead, drop oldest frames so playback
+      // tracks the game instead of lagging further behind every burst.
+      if (q.frames > MAX_LATENCY_FRAMES) {
+        let drop = q.frames - TRIM_TARGET_FRAMES;
+        while (drop > 0 && q.chunks.length > 0) {
+          const avail = (q.chunks[0]!.length >> 1) - q.offset;
+          if (drop >= avail) {
+            q.chunks.shift();
+            q.offset = 0;
+            q.frames -= avail;
+            drop -= avail;
+          } else {
+            q.offset += drop;
+            q.frames -= drop;
+            drop = 0;
+          }
+        }
+      }
     };
   }
 
@@ -45,41 +82,44 @@ class PspAudioProcessor extends AudioWorkletProcessor {
     outputs: Float32Array[][],
     _params: Record<string, Float32Array>,
   ): boolean {
-    const out   = outputs[0];
-    const left  = out?.[0];
+    const out = outputs[0];
+    const left = out?.[0];
     const right = out?.[1] ?? left;
     if (!left || !right) return true;
 
-    const frameCount = left.length;
+    const n = left.length;
+    left.fill(0);
+    right.fill(0);
 
-    for (let i = 0; i < frameCount; i++) {
-      let sumL = 0;
-      let sumR = 0;
-
-      for (const [channel, queue] of this.channelQueues) {
-        // Advance past exhausted chunks. With speed>1 the offset can jump several
-        // frames at once, so subtract each consumed chunk's length rather than
-        // resetting to 0 (which would drop the overflow).
-        let offset = this.channelOffsets.get(channel) ?? 0;
-        while (queue.length > 0) {
-          const head = queue[0]!;
-          if (offset < head.length / 2) break;
-          queue.shift();
-          offset -= head.length / 2;
+    const speed = this.speed;
+    // Channel-outer: add each channel's contribution across the whole buffer in
+    // one pass (no per-sample Map iteration on the realtime thread).
+    for (const q of this.channels.values()) {
+      let off = q.offset;
+      let consumed = 0;
+      for (let i = 0; i < n; i++) {
+        // Skip past exhausted chunks (speed>1 can cross several frames at once).
+        while (q.chunks.length > 0 && off >= (q.chunks[0]!.length >> 1)) {
+          off -= q.chunks[0]!.length >> 1;
+          q.chunks.shift();
         }
-        this.channelOffsets.set(channel, offset);
-
-        const chunk = queue[0];
-        if (chunk) {
-          sumL += (chunk[offset * 2]     ?? 0) / 32768.0;
-          sumR += (chunk[offset * 2 + 1] ?? 0) / 32768.0;
-          this.channelOffsets.set(channel, offset + this.speed);
-        }
+        const chunk = q.chunks[0];
+        if (!chunk) break; // underrun — rest of the buffer stays silent for this channel
+        left[i]! += chunk[off * 2]! / 32768.0;
+        right[i]! += chunk[off * 2 + 1]! / 32768.0;
+        off += speed;
+        consumed += speed;
       }
+      q.offset = off;
+      q.frames = q.frames > consumed ? q.frames - consumed : 0;
+    }
 
-      // Clamp mixed output to [-1, 1]
-      left[i]  = Math.max(-1, Math.min(1, sumL));
-      right[i] = Math.max(-1, Math.min(1, sumR));
+    // Clamp the summed output once.
+    for (let i = 0; i < n; i++) {
+      const l = left[i]!;
+      const r = right[i]!;
+      left[i] = l < -1 ? -1 : l > 1 ? 1 : l;
+      right[i] = r < -1 ? -1 : r > 1 ? 1 : r;
     }
 
     return true;

@@ -358,6 +358,12 @@ export function registerThreadHLE(kernel: HLEKernel): void {
         if (current && current.priority > thread.priority) {
           kernel.reschedule(regs);
         }
+        // PPSSPP sceKernelThread.cpp:1958-1962 — starting a thread whose priority
+        // is worse-or-equal to the current one re-enables dispatch as a side
+        // effect. ("Seems strange but also seems reproducible.")
+        if (current && current.priority <= thread.priority) {
+          kernel.dispatchEnabled = true;
+        }
       }
       return;
     }
@@ -1643,8 +1649,6 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelGetThreadStackFreeSize);
   kernel.stub(KERNEL.sceKernelGetThreadmanIdType);
   kernel.stub(KERNEL.sceKernelGetTlsAddr, 1);
-  kernel.stub(KERNEL.sceKernelGetVTimerBaseWide);
-  kernel.stub(KERNEL.sceKernelGetVTimerTimeWide);
   kernel.stub(KERNEL.sceKernelGzipDecompress);
   kernel.stub(KERNEL.sceKernelIsCpuIntrSuspended);
   kernel.stub(KERNEL.sceKernelIsSubInterruptOccurred);
@@ -1669,7 +1673,6 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelReferThreadProfiler);
   kernel.stub(KERNEL.sceKernelReferThreadRunStatus);
   kernel.stub(KERNEL.sceKernelReferTlsplStatus);
-  kernel.stub(KERNEL.sceKernelReferVTimerStatus);
   kernel.stub(KERNEL.sceKernelReferVplStatus);
   kernel.stub(KERNEL.sceKernelRegisterDefaultExceptionHandler, 1);
   kernel.stub(KERNEL.sceKernelRegisterExceptionHandler, 1);
@@ -1685,7 +1688,6 @@ export function registerThreadHLE(kernel: HLEKernel): void {
   kernel.stub(KERNEL.sceKernelResumeSubIntr);
   kernel.stub(KERNEL.sceKernelSendMsgPipeCB);
   kernel.stub(KERNEL.sceKernelSetSysClockAlarm);
-  kernel.stub(KERNEL.sceKernelSetVTimerTimeWide);
   kernel.stub(KERNEL.sceKernelStopModule);
   kernel.stub(KERNEL.sceKernelStopUnloadSelfModule, 1);
   kernel.stub(KERNEL.sceKernelSuspendSubIntr);

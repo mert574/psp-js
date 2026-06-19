@@ -4,16 +4,20 @@
 
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel } from "./hle-kernel.js";
-import { SAS, PSMF, RTC, VTIMER, DEFLT, G729, CCC, JPEG, P3DA, REG } from "./nids.js";
+import type { AllegrexRegisters } from "../cpu/registers.js";
+import { SAS, PSMF, RTC, VTIMER, KERNEL, DEFLT, G729, CCC, JPEG, P3DA, REG } from "./nids.js";
+import { SasInstance, SAS_VOICES_MAX } from "../audio/sas-core.js";
 import { lookupCategory, REG_TYPE_DIR, REG_TYPE_INT, REG_TYPE_STR, REG_TYPE_BIN, SCE_REG_ERROR_CATEGORY_NOT_FOUND } from "./psp-registry.js";
 
 const log = Logger.get("HLE-MEDIA");
 
 export function registerMediaHLE(kernel: HLEKernel): void {
 
-  let sasGrainSize = 256;
-
-  // ── sceSas ──────────────────────────────────────────────────────────────
+  // ── sceSas — voice synthesizer (port of PPSSPP Core/HW/SasAudio.cpp) ──────
+  // One global SAS core, like PPSSPP. Created on __sceSasInit.
+  const sas = new SasInstance();
+  const INVALID_VOICE = 0x80260002; // SCE_SAS_ERROR_INVALID_VOICE
+  const validVoice = (v: number): boolean => v >= 0 && v < SAS_VOICES_MAX;
 
   // __sceSasInit(core, grainSize, maxVoices, outputMode, sampleRate)
   // PPSSPP sceSas.cpp:213-250: validates core addr (64-byte aligned, valid RAM),
@@ -24,103 +28,185 @@ export function registerMediaHLE(kernel: HLEKernel): void {
     const maxVoices = regs.getGpr(6);
     const outputMode = regs.getGpr(7);
     const sampleRate = regs.getGpr(8);
-    // PPSSPP sceSas.cpp:214: Memory::IsValidAddress(core) + alignment
     if (core < 0x08000000 || core >= 0x0C000000 || (core & 0x3F) !== 0) {
       log.warn(`__sceSasInit: bad core addr 0x${core.toString(16)}`);
       regs.setGpr(2, 0x80260001); // SCE_SAS_ERROR_BAD_ADDRESS
       return;
     }
-    if (maxVoices === 0 || maxVoices > 32) {
-      regs.setGpr(2, 0x80260003); return; // SCE_SAS_ERROR_INVALID_MAX_VOICES
-    }
-    if (grainSize < 0x40 || grainSize > 0x800 || (grainSize & 0x1F) !== 0) {
-      regs.setGpr(2, 0x80260005); return; // SCE_SAS_ERROR_INVALID_GRAIN
-    }
-    if (outputMode !== 0 && outputMode !== 1) {
-      regs.setGpr(2, 0x80260004); return; // SCE_SAS_ERROR_INVALID_OUTPUT_MODE
-    }
-    if (sampleRate !== 44100) {
-      regs.setGpr(2, 0x80260008); return; // SCE_SAS_ERROR_INVALID_SAMPLE_RATE
-    }
-    sasGrainSize = grainSize;
+    if (maxVoices === 0 || maxVoices > 32) { regs.setGpr(2, 0x80260003); return; }
+    if (grainSize < 0x40 || grainSize > 0x800 || (grainSize & 0x1F) !== 0) { regs.setGpr(2, 0x80260005); return; }
+    if (outputMode !== 0 && outputMode !== 1) { regs.setGpr(2, 0x80260004); return; }
+    if (sampleRate !== 44100) { regs.setGpr(2, 0x80260008); return; }
+    sas.setGrainSize(grainSize);
+    sas.outputMode = outputMode;
+    for (const v of sas.voices) { v.type = 0; v.playing = false; v.on = false; }
     log.info(`__sceSasInit: core=0x${core.toString(16)} grain=${grainSize} voices=${maxVoices} mode=${outputMode} rate=${sampleRate}`);
     regs.setGpr(2, 0);
   });
 
-  // __sceSasCore(core, outAddr) — synthesize one grain of audio
-  // We don't emulate SAS voices, so write silence to outAddr.
-  // Games read from outAddr after this call and feed it to sceAudioOutput.
+  // __sceSasCore(core, outAddr) — synthesize one grain into outAddr.
   kernel.register(SAS.__sceSasCore, (regs, bus) => {
     const outAddr = regs.getGpr(5);
-    if (outAddr !== 0) {
-      // Stereo s16 silence: 4 bytes per frame × grainSize frames
-      for (let i = 0; i < sasGrainSize * 4; i++) bus.writeU8(outAddr + i, 0);
-    }
+    if (outAddr !== 0) sas.mix(bus, outAddr, 0, 0, 0, false);
     regs.setGpr(2, 0);
-    kernel.blockForAudio(regs, sasGrainSize, 44_100);
+    kernel.blockForAudio(regs, sas.grainSize, 44_100);
   });
 
-  // __sceSasCoreWithMix — mix into existing buffer (additive)
-  // Since we have no voices, mixing nothing doesn't change the buffer.
-  kernel.register(SAS.__sceSasCoreWithMix, (regs) => {
+  // __sceSasCoreWithMix(core, inoutAddr, leftVol, rightVol) — synthesize and
+  // add into the existing buffer (single in/out buffer). PPSSPP sceSas.cpp.
+  kernel.register(SAS.__sceSasCoreWithMix, (regs, bus) => {
+    const inout = regs.getGpr(5);
+    const leftVol = regs.getGpr(6) | 0;
+    const rightVol = regs.getGpr(7) | 0;
+    if (inout !== 0) sas.mix(bus, inout, inout, leftVol, rightVol, false);
     regs.setGpr(2, 0);
-    kernel.blockForAudio(regs, sasGrainSize, 44_100);
+    kernel.blockForAudio(regs, sas.grainSize, 44_100);
   });
 
   // __sceSasGetGrain / __sceSasSetGrain
-  kernel.register(SAS.__sceSasGetGrain,              (regs) => { regs.setGpr(2, sasGrainSize); });
-  kernel.register(SAS.__sceSasSetGrain,              (regs) => { sasGrainSize = regs.getGpr(5) || 256; regs.setGpr(2, 0); });
+  kernel.register(SAS.__sceSasGetGrain, (regs) => { regs.setGpr(2, sas.grainSize); });
+  kernel.register(SAS.__sceSasSetGrain, (regs) => { sas.setGrainSize(regs.getGpr(5) || 256); regs.setGpr(2, 0); });
 
-  // __sceSasGetEndFlag — return 0xFFFFFFFF (all voices ended, we don't emulate SAS voices)
-  kernel.register(SAS.__sceSasGetEndFlag, (regs) => {
-    regs.setGpr(2, 0xFFFFFFFF);
-  });
+  // __sceSasGetEndFlag — bitmask of voices that have finished playing.
+  kernel.register(SAS.__sceSasGetEndFlag, (regs) => { regs.setGpr(2, sas.getEndFlag()); });
 
-  // __sceSasRevType(core, type) — set reverb type, return 0
-  kernel.register(SAS.__sceSasRevType, (regs) => {
+  // __sceSasSetVoice(core, voiceNum, vagAddr, size, loop)
+  kernel.register(SAS.__sceSasSetVoice, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    const v = sas.voices[vn]!;
+    let size = regs.getGpr(7) | 0;
+    if (size < 0) size = 0;
+    v.type = 1; // VOICETYPE_VAG
+    v.vagAddr = regs.getGpr(6) >>> 0;
+    v.vagSize = size;
+    v.loop = (regs.getGpr(8) | 0) !== 0;
     regs.setGpr(2, 0);
   });
 
-  // __sceSasRevVON(core, dry, wet) — set reverb voice on, return 0
-  kernel.register(SAS.__sceSasRevVON, (regs) => {
+  // __sceSasSetVoicePCM(core, voiceNum, pcmAddr, size, loopPos)
+  kernel.register(SAS.__sceSasSetVoicePCM, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    const size = regs.getGpr(7) | 0;
+    if (size <= 0 || size > 0x10000) { regs.setGpr(2, 0x80260015); return; } // INVALID_PCM_SIZE
+    const loopPos = regs.getGpr(8) | 0;
+    if (loopPos >= size) { regs.setGpr(2, 0x80260016); return; } // INVALID_LOOP_POS
+    const v = sas.voices[vn]!;
+    v.type = 5; // VOICETYPE_PCM
+    v.pcmAddr = regs.getGpr(6) >>> 0;
+    v.pcmSize = size;
+    v.pcmIndex = 0;
+    v.pcmLoopPos = loopPos >= 0 ? loopPos : 0;
+    v.loop = loopPos >= 0;
+    v.playing = true;
     regs.setGpr(2, 0);
   });
 
-  // __sceSasRevEVOL(core, lv, rv) — set reverb effect volume, return 0
-  kernel.register(SAS.__sceSasRevEVOL, (regs) => {
+  // __sceSasSetPitch(core, voiceNum, pitch)
+  kernel.register(SAS.__sceSasSetPitch, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    sas.voices[vn]!.pitch = regs.getGpr(6) | 0;
     regs.setGpr(2, 0);
   });
 
-  // __sceSasRevParam(core, delay, feedback) — set reverb params, return 0
-  // PPSSPP sceSas.cpp:638
-  kernel.register(SAS.__sceSasRevParam, (regs) => {
+  // __sceSasSetVolume(core, voiceNum, leftVol, rightVol, effectLeft, effectRight)
+  kernel.register(SAS.__sceSasSetVolume, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    const v = sas.voices[vn]!;
+    v.volumeLeft = regs.getGpr(6) | 0;
+    v.volumeRight = regs.getGpr(7) | 0;
+    v.effectLeft = regs.getGpr(8) | 0;
+    v.effectRight = regs.getGpr(9) | 0;
     regs.setGpr(2, 0);
   });
 
-  // __sceSasGetOutputmode(core) — return 0 (PSP_SAS_OUTPUTMODE_MIXED)
-  // PPSSPP sceSas.cpp:651
-  kernel.register(SAS.__sceSasGetOutputmode, (regs) => {
-    regs.setGpr(2, 0); // PSP_SAS_OUTPUTMODE_MIXED
+  // __sceSasSetSimpleADSR(core, voiceNum, ADSREnv1, ADSREnv2)
+  kernel.register(SAS.__sceSasSetSimpleADSR, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    sas.voices[vn]!.envelope.setSimple(regs.getGpr(6) & 0xFFFF, regs.getGpr(7) & 0xFFFF);
+    regs.setGpr(2, 0);
   });
 
-  // Remaining sceSas stubs
-  kernel.stub(SAS.__sceSasSetOutputmode);
-  kernel.stub(SAS.__sceSasSetADSR);
-  kernel.stub(SAS.__sceSasSetADSRmode);
-  kernel.stub(SAS.__sceSasSetSL);
-  kernel.stub(SAS.__sceSasGetEnvelopeHeight);
-  kernel.stub(SAS.__sceSasSetSimpleADSR);
-  kernel.stub(SAS.__sceSasSetKeyOn);
-  kernel.stub(SAS.__sceSasSetKeyOff);
-  kernel.stub(SAS.__sceSasSetVoice);
-  kernel.stub(SAS.__sceSasSetVolume);
+  // __sceSasSetADSR(core, voiceNum, flag, attackRate, decayRate, sustainRate, releaseRate)
+  kernel.register(SAS.__sceSasSetADSR, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    sas.voices[vn]!.envelope.setRate(regs.getGpr(6) | 0, regs.getGpr(7) | 0, regs.getGpr(8) | 0, regs.getGpr(9) | 0, regs.getGpr(10) | 0);
+    regs.setGpr(2, 0);
+  });
+
+  // __sceSasSetADSRmode(core, voiceNum, flag, attackType, decayType, sustainType, releaseType)
+  kernel.register(SAS.__sceSasSetADSRmode, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    sas.voices[vn]!.envelope.setEnvelope(regs.getGpr(6) | 0, regs.getGpr(7) | 0, regs.getGpr(8) | 0, regs.getGpr(9) | 0, regs.getGpr(10) | 0);
+    regs.setGpr(2, 0);
+  });
+
+  // __sceSasSetSL(core, voiceNum, sustainLevel)
+  kernel.register(SAS.__sceSasSetSL, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    sas.voices[vn]!.envelope.sustainLevel = regs.getGpr(6) | 0;
+    regs.setGpr(2, 0);
+  });
+
+  // __sceSasGetEnvelopeHeight(core, voiceNum)
+  kernel.register(SAS.__sceSasGetEnvelopeHeight, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    regs.setGpr(2, sas.voices[vn]!.envelope.getHeight() >>> 0);
+  });
+
+  // __sceSasSetKeyOn(core, voiceNum)
+  kernel.register(SAS.__sceSasSetKeyOn, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    sas.voices[vn]!.keyOn();
+    regs.setGpr(2, 0);
+  });
+
+  // __sceSasSetKeyOff(core, voiceNum)
+  kernel.register(SAS.__sceSasSetKeyOff, (regs) => {
+    const vn = regs.getGpr(5) | 0;
+    if (!validVoice(vn)) { regs.setGpr(2, INVALID_VOICE); return; }
+    sas.voices[vn]!.keyOff();
+    regs.setGpr(2, 0);
+  });
+
+  // __sceSasSetPause(core, voiceBitmask, pause)
+  kernel.register(SAS.__sceSasSetPause, (regs) => {
+    const mask = regs.getGpr(5) >>> 0;
+    const pause = (regs.getGpr(6) | 0) !== 0;
+    for (let i = 0; i < SAS_VOICES_MAX; i++) {
+      if (mask & (1 << i)) sas.voices[i]!.paused = pause;
+    }
+    regs.setGpr(2, 0);
+  });
+
+  // __sceSasGetPauseFlag — bitmask of paused voices.
+  kernel.register(SAS.__sceSasGetPauseFlag, (regs) => {
+    let flag = 0;
+    for (let i = 0; i < SAS_VOICES_MAX; i++) if (sas.voices[i]!.paused) flag |= (1 << i);
+    regs.setGpr(2, flag >>> 0);
+  });
+
+  // Reverb / output-mode: accepted but not synthesized (reverb deferred).
+  kernel.register(SAS.__sceSasRevType, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(SAS.__sceSasRevVON, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(SAS.__sceSasRevEVOL, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(SAS.__sceSasRevParam, (regs) => { regs.setGpr(2, 0); });
+  kernel.register(SAS.__sceSasGetOutputmode, (regs) => { regs.setGpr(2, sas.outputMode); });
+  kernel.register(SAS.__sceSasSetOutputmode, (regs) => { sas.outputMode = regs.getGpr(5) | 0; regs.setGpr(2, 0); });
+
+  // Not synthesized: noise/triangle/pulse waveforms and ATRAC3 voices.
   kernel.stub(SAS.__sceSasSetTrianglarWave);
   kernel.stub(SAS.__sceSasSetSteepWave);
   kernel.stub(SAS.__sceSasSetNoise);
-  kernel.stub(SAS.__sceSasSetPause);
-  kernel.stub(SAS.__sceSasGetPauseFlag);
-  kernel.stub(SAS.__sceSasSetPitch);
-  kernel.stub(SAS.__sceSasSetVoicePCM);
   kernel.stub(SAS.__sceSasSetVoiceATRAC3);
   kernel.stub(SAS.__sceSasConcatenateATRAC3);
   kernel.stub(SAS.__sceSasUnsetATRAC3);
@@ -212,6 +298,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // ── sceKernel VTimer (PPSSPP sceKernelVTimer.cpp) ────────────────────────
 
   interface VTimerState {
+    name: string;         // up to 31 chars, dumped by sceKernelReferVTimerStatus
     active: number;       // 0 or 1
     base: number;         // global time (us) when started
     current: number;      // accumulated time (us) from previous runs
@@ -221,7 +308,12 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   }
   const vtimers = new Map<number, VTimerState>();
 
-  const SCE_KERNEL_ERROR_UNKNOWN_VTID = 0x80020082;
+  const SCE_KERNEL_ERROR_UNKNOWN_VTID = 0x800201be;
+  const SCE_KERNEL_ERROR_ILLEGAL_VTID = 0x800201bf;
+  // The uid whose handler is currently running (0 = none). PPSSPP rejects
+  // start/stop/set-handler/cancel on this uid with ILLEGAL_VTID; since our uids
+  // are never 0, the "null vtimer" (uid 0) case also lands here, matching tests.
+  let runningVTimer = 0;
 
   const getVTimerRunningTime = (vt: VTimerState): number => {
     if (!vt.active) return 0;
@@ -318,6 +410,10 @@ export function registerMediaHLE(kernel: HLEKernel): void {
     regs.pc = vt.handlerAddr;
     cpu.inDelaySlot = false;
 
+    // Mark this uid as running so syscalls made from inside the handler reject
+    // start/stop/set-handler/cancel on it with ILLEGAL_VTID (PPSSPP runningVTimer).
+    runningVTimer = uid;
+
     // Run CPU until callback returns
     let returned = false;
     const prevOnBreak = cpu.onBreak;
@@ -338,6 +434,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
 
     // Restore registers
     cpu.onBreak = prevOnBreak;
+    runningVTimer = 0;
     for (let i = 0; i < 32; i++) regs.setGpr(i, savedGpr[i]!);
     regs.hi = savedHi;
     regs.lo = savedLo;
@@ -360,14 +457,19 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // it at a safe boundary (like GE signals are handled between CPU slices).
   const pendingVTimerTriggers: number[] = []; // UIDs to invoke
   let vtimerEventId = -1;
-  if (kernel.coreTiming) {
-    vtimerEventId = kernel.coreTiming.registerEventType("VTimer", (_cyclesLate, uid) => {
+  // Register the event type once CoreTiming exists. registerMediaHLE runs from
+  // the HLEKernel constructor, before initTiming, so coreTiming is null here;
+  // doing this eagerly meant vtimerEventId stayed -1 forever and scheduleVTimer
+  // always early-returned, so VTimers never fired. onTimingReady also runs once
+  // at boot before any loadState, so a restored "VTimer" event remaps by name.
+  kernel.onTimingReady(() => {
+    vtimerEventId = kernel.coreTiming!.registerEventType("VTimer", (_cyclesLate, uid) => {
       const vt = vtimers.get(uid);
       if (vt && vt.active && vt.handlerAddr !== 0) {
         pendingVTimerTriggers.push(uid);
       }
     });
-  }
+  });
 
   /** Process pending VTimer handler callbacks. Call from a safe boundary (not inside cpu.run). */
   kernel.processVTimerCallbacks = () => {
@@ -380,11 +482,44 @@ export function registerMediaHLE(kernel: HLEKernel): void {
     }
   };
 
-  // sceKernelCreateVTimer(name, optParam)
+  // sceKernelCreateVTimer(name, optParam) — PPSSPP rejects a null name pointer,
+  // stores the name (max 31 chars), and ignores optParam.
   kernel.register(VTIMER.sceKernelCreateVTimer, (regs) => {
+    const namePtr = regs.getGpr(4);
+    if (namePtr === 0) { regs.setGpr(2, 0x80020001 >>> 0); return; } // SCE_KERNEL_ERROR_ERROR
+    const name = kernel.readCString(kernel.bus, namePtr).slice(0, 31);
     const uid = kernel.nextBlockId++;
-    vtimers.set(uid, { active: 0, base: 0, current: 0, schedule: 0, handlerAddr: 0, commonAddr: 0 });
+    vtimers.set(uid, { name, active: 0, base: 0, current: 0, schedule: 0, handlerAddr: 0, commonAddr: 0 });
     regs.setGpr(2, uid);
+  });
+
+  // sceKernelReferVTimerStatus(uid, statusAddr) — copy the 72-byte NativeVTimer
+  // into the guest buffer, with current refreshed to live time. PPSSPP reads the
+  // caller's size field and copies min(size, 72) bytes (sceKernelVTimer.cpp:457).
+  kernel.register(KERNEL.sceKernelReferVTimerStatus, (regs) => {
+    const uid = regs.getGpr(4);
+    const addr = regs.getGpr(5);
+    const vt = vtimers.get(uid);
+    if (!vt) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    if (addr !== 0) {
+      const buf = new Uint8Array(72);
+      const dv = new DataView(buf.buffer);
+      // u64 times can exceed 32 bits and current can go negative, so keep full
+      // width and wrap negatives into the u64 like the raw little-endian store.
+      const u64 = (off: number, val: number): void =>
+        dv.setBigUint64(off, BigInt.asUintN(64, BigInt(Math.trunc(val))), true);
+      dv.setUint32(0, 72, true);                                  // size
+      for (let i = 0; i < vt.name.length && i < 31; i++) buf[4 + i] = vt.name.charCodeAt(i) & 0xff;
+      dv.setInt32(36, vt.active, true);                           // active
+      u64(40, vt.base);                                           // base
+      u64(48, getVTimerCurrentTime(vt));                          // current (live)
+      u64(56, vt.schedule);                                       // schedule
+      dv.setUint32(64, vt.handlerAddr >>> 0, true);               // handlerAddr
+      dv.setUint32(68, vt.commonAddr >>> 0, true);                // commonAddr
+      const n = Math.min(kernel.bus.readU32(addr) >>> 0, 72);
+      for (let i = 0; i < n; i++) kernel.bus.writeU8(addr + i, buf[i]!);
+    }
+    regs.setGpr(2, 0);
   });
 
   // sceKernelDeleteVTimer(uid)
@@ -398,6 +533,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // sceKernelStartVTimer(uid) — PPSSPP: __startVTimer sets active+base, schedules if handler exists
   kernel.register(VTIMER.sceKernelStartVTimer, (regs) => {
     const uid = regs.getGpr(4);
+    if (uid === runningVTimer) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_VTID); return; }
     const vt = vtimers.get(uid);
     if (!vt) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     if (vt.active) { regs.setGpr(2, 1); return; } // already running
@@ -410,6 +546,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // sceKernelStopVTimer(uid) — PPSSPP: accumulate elapsed, clear active
   kernel.register(VTIMER.sceKernelStopVTimer, (regs) => {
     const uid = regs.getGpr(4);
+    if (uid === runningVTimer) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_VTID); return; }
     const vt = vtimers.get(uid);
     if (!vt) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     if (!vt.active) { regs.setGpr(2, 0); return; } // already stopped
@@ -423,6 +560,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // PPSSPP: always reads u64 schedule from scheduleAddr, stores handler, calls __KernelScheduleVTimer
   kernel.register(VTIMER.sceKernelSetVTimerHandler, (regs) => {
     const uid = regs.getGpr(4);
+    if (uid === runningVTimer) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_VTID); return; }
     const scheduleAddr = regs.getGpr(5);
     const handlerAddr  = regs.getGpr(6);
     const commonAddr   = regs.getGpr(7);
@@ -445,6 +583,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // PPSSPP reads all syscall args from sequential registers: PARAM(n) = r[A0+n]
   kernel.register(VTIMER.sceKernelSetVTimerHandlerWide, (regs) => {
     const uid = regs.getGpr(4);
+    if (uid === runningVTimer) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_VTID); return; }
     const scheduleLo = regs.getGpr(6) >>> 0;
     const scheduleHi = regs.getGpr(7) >>> 0;
     const handlerAddr = regs.getGpr(8); // PARAM(4) = $t0
@@ -465,6 +604,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   // sceKernelCancelVTimerHandler(uid)
   kernel.register(VTIMER.sceKernelCancelVTimerHandler, (regs) => {
     const uid = regs.getGpr(4);
+    if (uid === runningVTimer) { regs.setGpr(2, SCE_KERNEL_ERROR_ILLEGAL_VTID); return; }
     const vt = vtimers.get(uid);
     if (!vt) { regs.setGpr(2, SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     vt.handlerAddr = 0;
@@ -505,6 +645,43 @@ export function registerMediaHLE(kernel: HLEKernel): void {
     scheduleVTimer(uid, vt, vt.schedule);
     if (addr !== 0) writeU64(kernel.bus, addr, oldTime);
     regs.setGpr(2, 0);
+  });
+
+  // The "Wide" getters return the u64 directly in v0:v1 instead of writing to a
+  // pointer. PPSSPP returns -1 (all ones) on a bad uid (sceKernelVTimer.cpp:270,
+  // 294, 330 — "strange error code, but it matches tests").
+  const setU64Return = (regs: AllegrexRegisters, val: number): void => {
+    // Wrap into a real u64 so a -1 error becomes 0xFFFFFFFFFFFFFFFF, not just the
+    // low word (and so times past 2^32 keep their high bits).
+    const u = BigInt.asUintN(64, BigInt(Math.trunc(val)));
+    regs.setGpr(2, Number(u & 0xFFFFFFFFn));
+    regs.setGpr(3, Number(u >> 32n));
+  };
+
+  // sceKernelGetVTimerBaseWide(uid) → u64 base
+  kernel.register(KERNEL.sceKernelGetVTimerBaseWide, (regs) => {
+    const vt = vtimers.get(regs.getGpr(4));
+    if (!vt) { setU64Return(regs, -1); return; }
+    setU64Return(regs, vt.base);
+  });
+
+  // sceKernelGetVTimerTimeWide(uid) → u64 current time
+  kernel.register(KERNEL.sceKernelGetVTimerTimeWide, (regs) => {
+    const vt = vtimers.get(regs.getGpr(4));
+    if (!vt) { setU64Return(regs, -1); return; }
+    setU64Return(regs, getVTimerCurrentTime(vt));
+  });
+
+  // sceKernelSetVTimerTimeWide(uid, u64 timeClock) → previous u64 time.
+  // u64 arg aligns to a2:a3 (regs 6:7), like sceKernelSetVTimerHandlerWide above.
+  kernel.register(KERNEL.sceKernelSetVTimerTimeWide, (regs) => {
+    const vt = vtimers.get(regs.getGpr(4));
+    if (!vt) { setU64Return(regs, -1); return; }
+    const newTime = (regs.getGpr(7) >>> 0) * 0x100000000 + (regs.getGpr(6) >>> 0);
+    const oldTime = getVTimerCurrentTime(vt);
+    vt.current = newTime - getVTimerRunningTime(vt);
+    scheduleVTimer(regs.getGpr(4), vt, vt.schedule);
+    setU64Return(regs, oldTime);
   });
 
   // sceKernelUSec2SysClock(usec, clock*)
@@ -906,7 +1083,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
   kernel.registerStateModule("media", {
     save() {
       return {
-        sasGrainSize,
+        sasGrainSize: sas.grainSize,
         vtimers: [...vtimers.entries()],
         vtimerTrampolineWritten,
         pendingVTimerTriggers: pendingVTimerTriggers.slice(),
@@ -923,7 +1100,7 @@ export function registerMediaHLE(kernel: HLEKernel): void {
         regCatHandleGen: number;
         regOpenCategories: [number, string][];
       };
-      sasGrainSize = d.sasGrainSize;
+      sas.setGrainSize(d.sasGrainSize || 256);
       vtimers.clear();
       for (const [k, v] of d.vtimers) vtimers.set(k, v);
       vtimerTrampolineWritten = d.vtimerTrampolineWritten;
