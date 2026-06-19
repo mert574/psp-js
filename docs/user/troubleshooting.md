@@ -33,4 +33,4 @@ The dev/preview server sets these automatically. If you self-host the build, you
 
 ## Saves disappeared
 
-Savedata and save-state files live in the browser's storage (IndexedDB). Clearing site data, or private/incognito mode, wipes them. Export important save states to `.pspstate` files to keep them. See [Saves](/user/saves).
+Your savedata (the game's own in-game saves) lives in the browser's storage (IndexedDB), so clearing site data or using private/incognito mode wipes it. Save states are separate: they are `.pspstate` files you export and keep on your own machine, so they are not affected. See [Saves](/user/saves).

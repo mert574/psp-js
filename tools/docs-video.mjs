@@ -29,7 +29,8 @@ const OUT = path.resolve(process.env.OUT || "docs/public/videos/ridge-racer.mp4"
 const FPS = Number(process.env.FPS) || 60;
 const RES = Number(process.env.RES) || 3; // WebGL render scale (3x = 1440x816 backing store)
 const RENDERER = process.env.RENDERER || "webgl"; // "webgl" or "software"
-const CRF = Number(process.env.CRF) || 25; // x264 quality (higher = smaller file)
+const CRF = Number(process.env.CRF) || 25; // x264 quality (lower = better, bigger file)
+const UPSCALE = Number(process.env.UPSCALE) || 1; // nearest-neighbor output upscale (keeps 2D pixels crisp)
 const HOLD_KEY = process.env.HOLD_KEY || ""; // key code held down while recording, e.g. ArrowLeft
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -114,10 +115,12 @@ try {
 await new Promise((res) => webm.end(res));
 console.log("webm:", webmPath, (statSync(webmPath).size / 1e6).toFixed(1), "MB");
 
-console.log("transcoding to", OUT);
+console.log("transcoding to", OUT, UPSCALE > 1 ? `(${UPSCALE}x neighbor)` : "");
+const vf = UPSCALE > 1 ? ["-vf", `scale=iw*${UPSCALE}:ih*${UPSCALE}:flags=neighbor`] : [];
 execFileSync("ffmpeg", [
   "-y", "-i", webmPath,
   "-an",                       // no audio
+  ...vf,                       // nearest-neighbor upscale keeps pixel art crisp
   "-c:v", "libx264", "-preset", "slow", "-crf", String(CRF),
   "-pix_fmt", "yuv420p",       // broad browser compatibility
   "-movflags", "+faststart",   // web streaming
