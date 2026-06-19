@@ -1,7 +1,7 @@
 import { Logger } from "../utils/logger.js";
 import { parseIso, parseIsoFromFile, readFile, readFileFromIso, type IsoVolume, type IsoFile } from "../iso/iso9660.js";
 import type { PspFileSystem } from "../kernel/psp-filesystem.js";
-import { setStatus, showError, clearError, showGameView, showFilePicker, showFileTree, clearGameVideo, clearGameAudio, playGameAudio, showAudioLoading, showAudioError, setMediaLoading, setGameCanvas, unlockAudio, showGameplayView, exitGameplayView, toggleGameplayHud, showAt3Loading, hideAt3Loading } from "./ui.js";
+import { setStatus, showError, clearError, showGameView, showFilePicker, showFileTree, clearGameVideo, clearGameAudio, playGameAudio, showAudioLoading, showAudioError, setMediaLoading, setGameCanvas, unlockAudio, showGameplayView, exitGameplayView, toggleGameplayHud, showAt3Loading, hideAt3Loading, gameAudioTimeUs } from "./ui.js";
 import { InputHandler } from "./input.js";
 import { transcodeAt3, transcodePmfAudio } from "./pmf.js";
 import { warmupAtracDecode, getDecodeConcurrency } from "../audio/atrac-decoder.js";
@@ -21,7 +21,7 @@ import type { SavedataList } from "./savedata-list.js";
 import "./game-library.js";
 import "./app-bar.js"; // registers the <app-bar> custom element
 import { initWaveBackground } from "./wave-background.js";
-import { computeFramesToRun, FRAMESKIP_AUTO, FRAMESKIP_OFF, type FrameSkipMode } from "./frameskip.js";
+import { FRAMESKIP_AUTO, FRAMESKIP_OFF, type FrameSkipMode } from "./frameskip.js";
 
 initWaveBackground();
 
@@ -231,6 +231,7 @@ function setupRenderer(canvas: HTMLCanvasElement): void {
   } else {
     geRenderer = new WebGLGERenderer(canvas);
     geRenderer.setResolutionScale(resolutionScale());
+    (window as unknown as { _dbgGeRenderer?: WebGLGERenderer })._dbgGeRenderer = geRenderer; // debug
   }
 }
 
@@ -352,8 +353,14 @@ function bootGame(): void {
   emulator = new PSPEmulator();
   window._dbgEmu = emulator; // debug: expose for console inspection
   window._dbgLogger = Logger;  // debug: window._dbgLogger.minLevel = "debug"
-  (window as unknown as { _dbgStep?: (n?: number) => number })._dbgStep = (n = 1) => { // debug: run+present N frames manually (beats backgrounded rAF)
-    for (let i = 0; i < n; i++) runOneFrame();
+  // debug: run+present N displayed frames synchronously (the preview/background tab
+  // throttles rAF, so the play loop stalls; this drives runOneFrame directly).
+  // framesPerStep>1 simulates a frame-skip batch (run that many PSP frames, draw the
+  // last) so the skip path can be exercised without the rAF timer. Returns vblanks.
+  // skipN>0 applies the fixed-skip render schedule (render 1 of every skipN+1) so the
+  // integrated skip path can be exercised without the rAF timer.
+  (window as unknown as { _dbgStep?: (n?: number, framesPerStep?: number, skipN?: number) => number })._dbgStep = (n = 1, framesPerStep = 1, skipN = 0) => {
+    for (let i = 0; i < n; i++) runOneFrame(framesPerStep, skipN <= 0 || i % (skipN + 1) === 0);
     return emulator ? emulator.hle.vblankCount : -1;
   };
   window._dbgPauseAt = (frame: number) => { _pauseAtFrame = frame > 0 ? Math.floor(frame) : 0; }; // debug: auto-pause at a frame
@@ -576,13 +583,15 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-speed]")) 
 // skip to hold 1× real time. 1/2/3 always skip that many between renders. Unlike
 // the speed buttons this keeps audio at 1× — it is not fast-forward.
 let _frameSkipMode: FrameSkipMode = FRAMESKIP_AUTO; // default: Auto (per-session)
-let _accumulator = 0;
 let _lastSkipCount = 0;
+let _displayedFrames = 0; // counts displayed-frame ticks; drives the fixed-skip render schedule
+let _renderedLastFrame = true; // Auto: don't skip two renders in a row
+let _lastFrameMs = 0; // cost of the last RENDERED frame; Auto uses it to detect render-bound
 for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-frameskip]")) {
   btn.addEventListener("click", () => {
     const v = btn.dataset.frameskip;
     _frameSkipMode = v === "auto" ? FRAMESKIP_AUTO : Number(v) || FRAMESKIP_OFF;
-    _accumulator = 0; // reset so a mode change doesn't burst-run frames
+    _displayedFrames = 0; _renderedLastFrame = true; // reset the render schedule
     for (const b of document.querySelectorAll<HTMLButtonElement>("[data-frameskip]")) {
       b.classList.toggle("seg__btn--active", b === btn);
     }
@@ -737,7 +746,6 @@ let _hudFrame: HTMLElement | null = null;
 let _hudTid: HTMLElement | null = null;
 let _hudPc: HTMLElement | null = null;
 let _hudSkip: HTMLElement | null = null;
-let _lastDisplayTime = 0; // real-time anchor for the Auto accumulator
 let _lastHudUpdate = 0;
 const HUD_UPDATE_MS = 200;
 
@@ -749,8 +757,6 @@ function setPaused(paused: boolean): void {
   if (stepBtn) stepBtn.disabled = !_paused;
   if (!_paused && rafHandle === 0) {
     _lastFrameTime = performance.now();
-    _lastDisplayTime = performance.now();
-    _accumulator = 0;
     rafHandle = requestAnimationFrame(frameLoop);
   }
 }
@@ -764,9 +770,11 @@ function doSingleFrame(): void {
   runOneFrame();
 }
 
-/** Run one displayed frame and render (shared between frame loop and step).
- *  framesToRun > 1 means frame-skip: run that many PSP frames, draw only the last. */
-function runOneFrame(framesToRun = 1): void {
+/** Run one displayed frame (shared between frame loop and step).
+ *  framesToRun > 1 means the host fell behind: run that many PSP frames, draw only
+ *  the last. render=false (fixed-skip non-render tick) advances game time but draws
+ *  nothing and skips the present, so the last presented frame stays on screen. */
+function runOneFrame(framesToRun = 1, render = true): void {
   if (!emulator) return;
   // Auto-pause once we've run _pauseAtFrame frames (debug/measurement). Checked
   // before running more, so exactly _pauseAtFrame frames execute, then the loop
@@ -794,7 +802,9 @@ function runOneFrame(framesToRun = 1): void {
     for (let f = 0; f < framesToRun; f++) {
       const isLast = f === framesToRun - 1;
       const ge = emulator.hle.geProcessor;
-      if (ge) ge.skipDraw = !isLast;
+      // Skip the GE draws on every frame we won't present (all of them on a
+      // non-render tick; all but the last of a catch-up batch).
+      if (ge) ge.skipDraw = !render || !isLast;
       // Invalidate textures modified in RAM since last frame. Run each iteration so
       // VFB decimation tracking stays correct across skipped frames.
       geRenderer?.onFrameStart();
@@ -816,24 +826,33 @@ function runOneFrame(framesToRun = 1): void {
     showError(`CPU error: ${String(err)}`, err);
     return;
   }
-  _lastSkipCount = framesToRun - 1;
+  // HUD "Skip": the configured count in fixed mode, else 1 when Auto dropped this draw.
+  _lastSkipCount = _frameSkipMode > 0 ? _frameSkipMode : (render ? 0 : 1);
 
   const hle = emulator.hle;
   const fbAddr = hle.framebufAddr !== 0 ? hle.framebufAddr : hle.geFbAddr;
 
-  // Present: WebGL GE renderer → screen (GPU-accelerated path)
+  // Present: WebGL GE renderer → screen (GPU-accelerated path). Skipped on a
+  // non-render frame-skip tick — the game advanced but we leave the last frame up.
   const presentStart = performance.now();
-  if (geRenderer) {
+  if (render && geRenderer) {
     geRenderer.setDisplayFramebuf(fbAddr, hle.framebufWidth, hle.framebufFormat);
-    geRenderer.presentToScreen();
+    // With frame-skip on, the game flips the display to the back buffer at frame end,
+    // so the current display address often points at a buffer whose draw we skipped
+    // (stale or black). Present the buffer we actually drew this tick instead. When
+    // skip is Off every buffer is drawn every frame, so the plain display addr is fine.
+    geRenderer.presentToScreen(_frameSkipMode !== FRAMESKIP_OFF);
     // Profiler: stall on the GPU so present/GPU captures the host-GPU render time
     // (WebGL draws are async, otherwise hidden in the idle/vsync gap).
     if (_perfEnabled) geRenderer.finishGpu();
-  } else if (fbAddr !== 0 && renderer) {
+  } else if (render && fbAddr !== 0 && renderer) {
     // Fallback: upload VRAM bytes as texture
     renderer.render(emulator.bus.vramBuffer, fbAddr, hle.framebufWidth, hle.framebufFormat);
   }
   presentMs = performance.now() - presentStart;
+  // Track the cost of a RENDERED frame so Auto can tell when rendering is the
+  // bottleneck (interpreter-only frames are cheaper and shouldn't trigger a skip).
+  if (render) _lastFrameMs = cpuMs + presentMs;
   if (_perfEnabled) {
     _perfFrames.push(_frameCount, frameStart, cpuMs, geMs, presentMs);
   }
@@ -920,8 +939,8 @@ function startRafLoop(): void {
   _frameCount = 0;
   _fpsLastTime = performance.now();
   _lastFrameTime = performance.now();
-  _lastDisplayTime = performance.now();
-  _accumulator = 0;
+  _displayedFrames = 0;
+  _renderedLastFrame = true;
   _lastSkipCount = 0;
   _fpsFrames = 0;
   _fpsValue = 0;
@@ -945,36 +964,39 @@ function frameLoop(): void {
 
   const now = performance.now();
 
-  // Off mode keeps the legacy ~60fps throttle so high-refresh displays don't run
-  // the game fast. Auto / fixed modes pace via the accumulator / fixed count.
-  if (_frameSkipMode === FRAMESKIP_OFF) {
-    const elapsed = now - _lastFrameTime;
-    if (elapsed < FRAME_INTERVAL) {
-      rafHandle = requestAnimationFrame(frameLoop);
-      return;
-    }
-    _lastFrameTime = now - (elapsed % FRAME_INTERVAL);
+  // Throttle to ~60fps in EVERY mode (also caps high-refresh displays). The game
+  // advances exactly one PSP frame per displayed frame regardless of frame-skip, so
+  // frame-skip never changes game speed — it only changes how often we render.
+  const elapsed = now - _lastFrameTime;
+  if (elapsed < FRAME_INTERVAL) {
+    rafHandle = requestAnimationFrame(frameLoop);
+    return;
+  }
+  _lastFrameTime = now - (elapsed % FRAME_INTERVAL);
+
+  // Decide whether to draw this frame. The game runs one frame either way; skipping
+  // a draw just makes the tick cheaper (helps a render-bound game stay near 60fps).
+  let render = true;
+  if (_frameSkipMode > 0) {
+    // Fixed N: render 1 of every N+1 displayed frames.
+    render = (_displayedFrames % (_frameSkipMode + 1)) === 0;
+  } else if (_frameSkipMode === FRAMESKIP_AUTO) {
+    // Auto: when the last drawn frame overran the 60fps budget we're render-bound,
+    // so drop this draw to recover — but never two in a row, so the screen still
+    // updates at least every other frame.
+    render = !(_lastFrameMs > FRAME_INTERVAL && _renderedLastFrame);
+  }
+  _displayedFrames++;
+  _renderedLastFrame = render;
+
+  _fpsFrames++;
+  if (now - _fpsLastTime >= 1000) {
+    _fpsValue = _fpsFrames;
+    _fpsFrames = 0;
+    _fpsLastTime = now;
   }
 
-  const realDelta = now - _lastDisplayTime;
-  _lastDisplayTime = now;
-
-  const { frames, accumulator } = computeFramesToRun(_frameSkipMode, _accumulator, realDelta);
-  _accumulator = accumulator;
-
-  // Auto can return 0 when less than one PSP frame of real time has passed (e.g. a
-  // 120Hz rAF tick): present nothing new this tick, just keep the loop alive. This
-  // is what stops the game running faster than real time on high-refresh displays.
-  if (frames > 0) {
-    _fpsFrames++;
-    // FPS counter
-    if (now - _fpsLastTime >= 1000) {
-      _fpsValue = _fpsFrames;
-      _fpsFrames = 0;
-      _fpsLastTime = now;
-    }
-    runOneFrame(frames);
-  }
+  runOneFrame(1, render);
 
   if (!emulator?.halted && !_paused) {
     rafHandle = requestAnimationFrame(frameLoop);
@@ -1153,6 +1175,8 @@ function playGameMedia(pmfData?: Uint8Array, at3Data?: Uint8Array): void {
           const audioUrl = await transcodePmfAudio(pmfData);
           if (abort.signal.aborted) { URL.revokeObjectURL(audioUrl); return; }
           playGameAudio(audioUrl);
+          // Lock the video to the audio clock so they don't drift / loop apart.
+          pmfPlayer?.setClock(gameAudioTimeUs);
         } catch (err) {
           if (abort.signal.aborted) return;
           log.warn("PMF audio extract failed:", err);
