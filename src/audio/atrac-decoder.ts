@@ -233,3 +233,35 @@ export async function decodeAtrac(data: Uint8Array, info: AtracInfo, cache = tru
     }
   });
 }
+
+/**
+ * Decode the audio track of a PSMF/PMF (PSMF header + MPEG-PS payload) to
+ * interleaved s16 stereo PCM at 44100 Hz via FFmpeg `-vn`. Returns an empty array
+ * if there's no decodable audio. Runs on the shared pool so a trapped decode is
+ * dropped and replaced rather than poisoning later calls. Used by the sceMpeg
+ * cutscene-audio path, which re-decodes a growing accumulation as the stream
+ * arrives.
+ */
+export async function decodePsmfAudioToPcm(pmf: Uint8Array): Promise<Int16Array> {
+  return getPool().exec(async (ff) => {
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const inputName  = `mpegaud_in_${id}.pmf`;
+    const outputName = `mpegaud_out_${id}.raw`;
+    try {
+      await ff.writeFile(inputName, pmf.slice());
+      const ret = await ff.exec([
+        "-i", inputName, "-vn",
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", "44100", "-ac", "2",
+        outputName,
+      ]);
+      if (ret !== 0) return new Int16Array(0);
+      const raw = await ff.readFile(outputName) as Uint8Array;
+      const plain = raw.slice();
+      return new Int16Array(plain.buffer, plain.byteOffset, plain.byteLength >> 1);
+    } finally {
+      try { await ff.deleteFile(inputName);  } catch { /* ignore */ }
+      try { await ff.deleteFile(outputName); } catch { /* ignore */ }
+    }
+  });
+}

@@ -1,9 +1,15 @@
 /**
  * HLE sceMpeg implementation — PPSSPP sceMpeg.cpp semantics WITHOUT real video
  * decode. Ringbuffer accounting, PSMF header analysis, AU bookkeeping, and the
- * ringbuffer-fill MipsCall are faithful; AvcDecode writes black frames and
- * AtracDecode writes silence. Games see correct buffer flow, advancing pts,
- * and a clean end-of-stream, so intro videos "play" (black) and finish.
+ * ringbuffer-fill MipsCall are faithful; AvcDecode writes black frames.
+ *
+ * Audio (AtracDecode) DELIBERATELY DIVERGES from PPSSPP. PPSSPP demuxes one AT3+
+ * frame per call inside MediaEngine and decodes it with a stateful AT3+ decoder.
+ * We take the easier path for now: accumulate the whole muxed Program Stream the
+ * game feeds, reconstruct a PMF (captured PSMF header + payload), and let FFmpeg
+ * demux + decode the entire audio track at once, then serve it frame-by-frame.
+ * This reuses the proven scePsmfPlayer FFmpeg audio path; a real per-frame
+ * demux/decoder (matching PPSSPP) is the eventual correct version.
  *
  * Reference: ppsspp-reference/Core/HLE/sceMpeg.cpp
  */
@@ -15,6 +21,7 @@ import { PSMF } from "./nids.js";
 import { drawText, textWidth, GLYPH_H } from "../gpu/text-overlay.js";
 import { MpegMediaDecoder } from "../media/mpeg-decoder.js";
 import { packRgbaToFrame } from "../media/frame-pack.js";
+import { decodePsmfAudioToPcm } from "../audio/atrac-decoder.js";
 
 // Real video decode is browser-only (libav.js/WASM). In Node (tests, headless
 // tools) we skip it and keep the placeholder black-frame path.
@@ -28,6 +35,10 @@ const MPEG_AVC_ES_SIZE = 2048;
 const MPEG_ATRAC_ES_SIZE = 2112;
 const MPEG_ATRAC_ES_OUTPUT_SIZE = 8192;
 const MPEG_DATA_ES_BUFFERS = 2;
+// Max packets fed to the ringbuffer fill callback per _invokeGeCb call. The
+// callback copies ~16k interpreted steps/packet; 8 packets stays well under
+// _invokeGeCb's 200k step limit so the copy never gets cut off mid-way.
+const MAX_FILL_PACKETS_PER_CALL = 8;
 const PSMF_MAGIC = 0x464d5350; // "PSMF" read as LE u32
 const VIDEO_TIMESTAMP_STEP = 3003;  // 90000 / 29.97 fps
 const AUDIO_TIMESTAMP_STEP = 4180;  // 2048 samples / 44100 Hz * 90000
@@ -79,6 +90,19 @@ interface MpegContext {
   // framebuffer. `null` means "decoded but no real frame, draw placeholder".
   pendingFrame?: { rgba: Uint8Array | Uint8ClampedArray; width: number; height: number } | null;
   hasPendingFrame?: boolean;
+
+  // ── Cutscene audio (Option B, intentional divergence from PPSSPP) ──────────
+  // Captured PSMF header (first mpegOffset bytes) so we can rebuild a full PMF.
+  psmfHeader: Uint8Array | null;
+  // The muxed Program Stream the game has fed, accumulated in arrival order.
+  audioPsChunks: Uint8Array[];
+  audioPsLen: number;
+  // Whole-track PCM (interleaved s16 stereo @ 44100) decoded from the PMF so far.
+  audioPcm: Int16Array | null;
+  audioCursor: number;          // stereo frames already served to the game
+  audioDecoding: boolean;       // a decode is in flight (one at a time per ctx)
+  audioDecodedFromLen: number;  // audioPsLen the current audioPcm was decoded from
+  audioGen: number;             // bumped on flush; a decode from an old gen is dropped
 }
 
 /** SceMpegAu: pts/dts stored high-word-first (PPSSPP SceMpegAu::read/write). */
@@ -106,8 +130,11 @@ function readAuEs(bus: MemoryBus, addr: number): { esBuffer: number; esSize: num
 export function registerMpegHLE(kernel: HLEKernel): void {
   const contexts = new Map<number, MpegContext>();
 
-  function getCtx(mpeg: number): MpegContext | undefined {
-    return contexts.get(mpeg >>> 0);
+  // PPSSPP getMpegCtx: the address the game holds (mpegAddr) stores a pointer to
+  // the real handle struct (dataPtr+0x30, written in sceMpegCreate). Read that
+  // pointer and look the context up by it.
+  function getCtx(mpegAddr: number): MpegContext | undefined {
+    return contexts.get(kernel.bus.readU32(mpegAddr >>> 0) >>> 0);
   }
 
   /** AnalyzeMpeg (PPSSPP sceMpeg.cpp:259): parse the 2048-byte PSMF header. */
@@ -132,10 +159,44 @@ export function registerMpegHLE(kernel: HLEKernel): void {
     // roughly the real stream rate (we have no demuxer).
     const totalFrames = Math.max(1, Math.round((ctx.mpegLastTimestamp - ctx.mpegFirstTimestamp) / VIDEO_TIMESTAMP_STEP));
     ctx.packetsPerVideoFrame = Math.max(1, Math.round(ctx.mpegStreamSize / 2048 / totalFrames));
+    // Keep the PSMF header so the audio path can rebuild a full PMF for FFmpeg
+    // (the raw ring payload alone doesn't say the private stream is AT3+).
+    if (CAN_DECODE && ctx.mpegOffset > 0 && ctx.mpegOffset <= 0x10000) {
+      ctx.psmfHeader = bus.readBytes(bufferAddr, ctx.mpegOffset).slice();
+    }
     ctx.isAnalyzed = true;
     log.info(`AnalyzeMpeg: offset=0x${ctx.mpegOffset.toString(16)} size=0x${ctx.mpegStreamSize.toString(16)} ` +
       `ts=${ctx.mpegFirstTimestamp}..${ctx.mpegLastTimestamp} ${ctx.frameWidth}x${ctx.frameHeight} pkts/frame=${ctx.packetsPerVideoFrame}`);
     return true;
+  }
+
+  // Re-decode after ~64 new packets so we don't re-run FFmpeg on the whole
+  // growing accumulation every frame (it's O(n^2) over the stream).
+  const AUDIO_REDECODE_BYTES = 64 * 2048;
+
+  /** Lazily (re)decode the accumulated Program Stream's audio track to PCM.
+   *  One decode in flight per context; throttled by how much new data arrived;
+   *  keeps the largest result. See the MpegContext audio note for the design. */
+  function ensureAudioDecode(ctx: MpegContext): void {
+    if (!CAN_DECODE || ctx.audioDecoding || !ctx.psmfHeader || ctx.audioPsLen === 0) return;
+    if (ctx.audioPcm && (ctx.audioPsLen - ctx.audioDecodedFromLen) < AUDIO_REDECODE_BYTES) return;
+    const fromLen = ctx.audioPsLen;
+    const gen = ctx.audioGen;
+    const pmf = new Uint8Array(ctx.psmfHeader.length + fromLen);
+    pmf.set(ctx.psmfHeader, 0);
+    let off = ctx.psmfHeader.length;
+    for (const c of ctx.audioPsChunks) { pmf.set(c, off); off += c.length; }
+    ctx.audioDecoding = true;
+    decodePsmfAudioToPcm(pmf).then((pcm) => {
+      ctx.audioDecoding = false;
+      if (ctx.audioGen !== gen) return; // a flush replaced the stream; drop stale PCM
+      if (pcm.length === 0) { log.debug(`sceMpeg: cutscene audio decode produced no PCM (psLen=${fromLen})`); return; }
+      if (!ctx.audioPcm) log.info(`sceMpeg: cutscene audio decoded ${(pcm.length / 2) | 0} frames from ${fromLen} PS bytes`);
+      if (pcm.length >= (ctx.audioPcm?.length ?? 0)) {
+        ctx.audioPcm = pcm;
+        ctx.audioDecodedFromLen = fromLen;
+      }
+    }).catch(() => { ctx.audioDecoding = false; });
   }
 
   // sceMpegInit() — PPSSPP returns 0 after delay
@@ -177,22 +238,42 @@ export function registerMpegHLE(kernel: HLEKernel): void {
 
   // sceMpegCreate(mpeg, data, size, rbAddr, frameWidth, mode, ddrtop)
   kernel.register(PSMF.sceMpegCreate, (regs, bus) => {
-    const mpeg = regs.getGpr(4) >>> 0;
+    const mpegAddr = regs.getGpr(4) >>> 0;
+    const dataPtr = regs.getGpr(5) >>> 0;
     const size = regs.getGpr(6) | 0;
     const rbAddr = regs.getGpr(7) >>> 0;
     const frameWidth = regs.getGpr(8) | 0; // $t0
     if (size < MPEG_MEMSIZE) { regs.setGpr(2, SCE_MPEG_ERROR_NO_MEMORY); return; }
-    // Fake mpeg struct (PPSSPP writes these markers)
-    const magic = "LIBMPEG\x00001\x00";
-    for (let i = 0; i < 12; i++) bus.writeU8(mpeg + i, magic.charCodeAt(i));
-    bus.writeU32(mpeg + 12, 0xffffffff);
+    // PPSSPP sceMpeg.cpp:491 — the fake mpeg handle struct lives inside the work
+    // buffer at dataPtr+0x30; mpegAddr only holds a pointer to it. Writing the
+    // markers AT mpegAddr (as we used to) clobbers whatever follows it: burnout
+    // places its ringbuffer struct 12 bytes after mpegAddr, so the old code
+    // overwrote packets/packetsRead/packetsWritePos and AvailableSize returned -1.
+    const mpegHandle = (dataPtr + 0x30) >>> 0;
     if (rbAddr !== 0) {
-      bus.writeU32(mpeg + 16, rbAddr);
-      bus.writeU32(mpeg + 20, bus.readU32(rbAddr + RB_DATA_UPPER_BOUND));
-      bus.writeU32(rbAddr + RB_MPEG, mpeg);
+      // PPSSPP sceMpeg.cpp:482-487: recompute packetsAvail, then store mpegAddr.
+      const packetSize = bus.readU32(rbAddr + RB_PACKET_SIZE) | 0;
+      if (packetSize === 0) {
+        bus.writeU32(rbAddr + RB_PACKETS_AVAIL, 0);
+      } else {
+        const packets = bus.readU32(rbAddr + RB_PACKETS) | 0;
+        const data = bus.readU32(rbAddr + RB_DATA) >>> 0;
+        const upper = bus.readU32(rbAddr + RB_DATA_UPPER_BOUND) >>> 0;
+        bus.writeU32(rbAddr + RB_PACKETS_AVAIL, packets - Math.floor((upper - data) / packetSize));
+      }
+      bus.writeU32(rbAddr + RB_MPEG, mpegAddr);
     }
-    contexts.set(mpeg, {
-      mpegAddr: mpeg,
+    // Store the handle pointer at mpegAddr, then write the markers into the buffer.
+    bus.writeU32(mpegAddr, mpegHandle);
+    const magic = "LIBMPEG\x00001\x00";
+    for (let i = 0; i < 12; i++) bus.writeU8(mpegHandle + i, magic.charCodeAt(i));
+    bus.writeU32(mpegHandle + 12, 0xffffffff);
+    if (rbAddr !== 0) {
+      bus.writeU32(mpegHandle + 16, rbAddr);
+      bus.writeU32(mpegHandle + 20, bus.readU32(rbAddr + RB_DATA_UPPER_BOUND));
+    }
+    contexts.set(mpegHandle, {
+      mpegAddr,
       ringbufferAddr: rbAddr,
       defaultFrameWidth: frameWidth,
       videoPixelMode: 3,
@@ -207,14 +288,17 @@ export function registerMpegHLE(kernel: HLEKernel): void {
       streamIdGen: 1,
       isAnalyzed: false,
       decoder: CAN_DECODE ? new MpegMediaDecoder() : null,
+      psmfHeader: null,
+      audioPsChunks: [], audioPsLen: 0,
+      audioPcm: null, audioCursor: 0, audioDecoding: false, audioDecodedFromLen: 0, audioGen: 0,
     });
-    log.info(`sceMpegCreate: mpeg=0x${mpeg.toString(16)} rb=0x${rbAddr.toString(16)} frameWidth=${frameWidth}`);
+    log.info(`sceMpegCreate: mpeg=0x${mpegAddr.toString(16)} handle=0x${mpegHandle.toString(16)} rb=0x${rbAddr.toString(16)} frameWidth=${frameWidth}`);
     regs.setGpr(2, 0);
   });
 
-  kernel.register(PSMF.sceMpegDelete, (regs) => {
-    const handle = regs.getGpr(4) >>> 0;
-    getCtx(handle)?.decoder?.dispose();
+  kernel.register(PSMF.sceMpegDelete, (regs, bus) => {
+    const handle = bus.readU32(regs.getGpr(4) >>> 0) >>> 0;
+    contexts.get(handle)?.decoder?.dispose();
     contexts.delete(handle);
     regs.setGpr(2, 0);
   });
@@ -339,9 +423,18 @@ export function registerMpegHLE(kernel: HLEKernel): void {
     let firstError = 0;
     let writeOffset = (bus.readU32(rbAddr + RB_PACKETS_WRITE_POS) | 0) % packets;
     while (numPackets > 0) {
-      const packetsThisRound = Math.min(numPackets, packets - writeOffset);
+      // The fill callback copies its packets byte-by-byte in interpreted MIPS
+      // (~16k steps/packet). Asking for a whole 256-packet ring at once blows
+      // past _invokeGeCb's step limit, so the callback gets cut off mid-copy and
+      // returns garbage in $v0. Cap each call to a chunk that finishes well under
+      // the limit; the callback tracks its own file position, so looping over
+      // small chunks reads the same data (PPSSPP's useRingbufferPutCallbackMulti).
+      const packetsThisRound = Math.min(numPackets, packets - writeOffset, MAX_FILL_PACKETS_PER_CALL);
       kernel._invokeGeCb(cbAddr, (data + writeOffset * 2048) >>> 0, packetsThisRound, cbArg);
-      const added = kernel.lastGuestCallReturnValue | 0;
+      // Clamp: the callback can't have added more than we asked for. Guards a
+      // truncated/garbage return from corrupting the ring or overrunning readBytes.
+      let added = kernel.lastGuestCallReturnValue | 0;
+      if (added > packetsThisRound) added = packetsThisRound;
       if (added > 0) {
         const rbRead = bus.readU32(rbAddr + RB_PACKETS_READ) | 0;
         const rbWrite = bus.readU32(rbAddr + RB_PACKETS_WRITE_POS) | 0;
@@ -350,10 +443,16 @@ export function registerMpegHLE(kernel: HLEKernel): void {
         bus.writeU32(rbAddr + RB_PACKETS_WRITE_POS, rbWrite + added);
         bus.writeU32(rbAddr + RB_PACKETS_AVAIL, Math.min(packets, rbAvail + added));
         totalAdded += added;
-        // Feed the freshly written Program Stream bytes to the real decoder.
+        // Feed the freshly written Program Stream bytes to the video decoder and
+        // accumulate them for the audio path (see the MpegContext audio note).
         const ctx = getCtx(bus.readU32(rbAddr + RB_MPEG) >>> 0);
-        if (ctx?.decoder) {
-          ctx.decoder.feed(bus.readBytes((data + writeOffset * 2048) >>> 0, added * 2048));
+        if (ctx) {
+          const psBytes = bus.readBytes((data + writeOffset * 2048) >>> 0, added * 2048);
+          ctx.decoder?.feed(psBytes);
+          if (CAN_DECODE && ctx.psmfHeader) {
+            ctx.audioPsChunks.push(psBytes.slice());
+            ctx.audioPsLen += psBytes.length;
+          }
         }
       } else if (added < 0 && firstError === 0) {
         firstError = added;
@@ -583,19 +682,36 @@ export function registerMpegHLE(kernel: HLEKernel): void {
   });
 
   // sceMpegAtracDecode(mpeg, auAddr, bufferAddr, init)
+  // Diverges from PPSSPP: instead of demuxing+decoding one AT3+ frame here, we
+  // serve the next 2048-sample stereo frame (8192 bytes) from the whole-track PCM
+  // FFmpeg decodes off the accumulated Program Stream. Silence until the decode
+  // catches up; the cursor holds at the start so the intro isn't skipped.
+  const ATRAC_FRAME_SAMPLES = 2048; // stereo frames per AU (PPSSPP MediaEngine)
   kernel.register(PSMF.sceMpegAtracDecode, (regs, bus) => {
     const ctx = getCtx(regs.getGpr(4));
     const auAddr = regs.getGpr(5) >>> 0;
     const bufferAddr = regs.getGpr(6) >>> 0;
     if (!ctx) { regs.setGpr(2, -1 >>> 0); return; }
-    // Consume one packet per audio AU
+    // Consume one packet per audio AU (drives the ringbuffer drain).
     const rbAddr = ctx.ringbufferAddr;
     const avail = bus.readU32(rbAddr + RB_PACKETS_AVAIL) | 0;
     bus.writeU32(rbAddr + RB_PACKETS_AVAIL, Math.max(0, avail - 1));
-    // Write silence
-    if (bufferAddr) {
-      for (let i = 0; i < MPEG_ATRAC_ES_OUTPUT_SIZE; i += 4) bus.writeU32(bufferAddr + i, 0);
+
+    ensureAudioDecode(ctx);
+    const out = new Int16Array(ATRAC_FRAME_SAMPLES * 2);
+    const pcm = ctx.audioPcm;
+    const start = ctx.audioCursor;
+    let advance = true;
+    if (pcm && (start + ATRAC_FRAME_SAMPLES) * 2 <= pcm.length) {
+      out.set(pcm.subarray(start * 2, (start + ATRAC_FRAME_SAMPLES) * 2));
+    } else if (!pcm) {
+      advance = false; // nothing decoded yet — hold so we don't skip the intro
     }
+    if (bufferAddr) {
+      bus.writeBytes(bufferAddr, new Uint8Array(out.buffer, out.byteOffset, out.byteLength));
+    }
+    if (advance) ctx.audioCursor += ATRAC_FRAME_SAMPLES;
+
     ctx.audioFrameCount++;
     const { esBuffer } = readAuEs(bus, auAddr);
     const pts = ctx.mpegFirstTimestamp + (ctx.audioFrameCount - 1) * AUDIO_TIMESTAMP_STEP;
@@ -615,6 +731,13 @@ export function registerMpegHLE(kernel: HLEKernel): void {
       ctx.audioFrameCount = 0;
       ctx.endOfVideoReached = false;
       ctx.endOfAudioReached = false;
+      // Stream restart: drop accumulated audio and invalidate any in-flight decode.
+      ctx.audioPsChunks = [];
+      ctx.audioPsLen = 0;
+      ctx.audioPcm = null;
+      ctx.audioCursor = 0;
+      ctx.audioDecodedFromLen = 0;
+      ctx.audioGen++;
     }
     regs.setGpr(2, 0);
   });
