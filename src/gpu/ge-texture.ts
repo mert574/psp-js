@@ -285,23 +285,23 @@ export function lookupCLUT(state: GETextureState, bus: MemoryBus, index: number)
 }
 
 // ── DXT compressed texture support ───────────────────────────────────────
+// PSP DXT blocks are byte-reversed vs PC: the 2-bit color indices ("lines",
+// one byte per row) come FIRST at offsets 0-3, then color1 at +4 and color2 at
+// +6. PC DXT puts the two colors first and the index bits after. DXT3/DXT5 put
+// the whole color block first, then the alpha data — also reversed vs PC.
+// See ppsspp-reference/GPU/Common/TextureDecoder.h:46 and .cpp DecodeColors /
+// WriteColorsDXT1. Reading the PC layout here turns every DXT texture into
+// rainbow noise (colors read from the index bytes, indices from the colors).
 
-/** Sample DXT1 compressed texture. */
-export function sampleDXT1(bus: MemoryBus, u: number, v: number, bw: number, addr: number): number {
-  const blockX = u >> 2, blockY = v >> 2;
-  const blocksPerRow = (bw + 3) >> 2;
-  const blockAddr = addr + (blockY * blocksPerRow + blockX) * 8;
-
-  const c0raw = bus.readU16(blockAddr);
-  const c1raw = bus.readU16(blockAddr + 2);
-  const bits = bus.readU32(blockAddr + 4);
+/** Decode one texel of a DXT color block (PSP layout) to ABGR8888.
+ *  alpha is 255 except the transparent code-3 case when color1 <= color2. */
+function dxtColorTexel(bus: MemoryBus, blockAddr: number, px: number, py: number): number {
+  const c0raw = bus.readU16(blockAddr + 4); // color1
+  const c1raw = bus.readU16(blockAddr + 6); // color2
+  const code = (bus.readU8(blockAddr + py) >> (px * 2)) & 3; // lines[py], 2 bits/pixel from LSB
 
   const c0 = color5650to8888(c0raw);
   const c1 = color5650to8888(c1raw);
-
-  const px = u & 3, py = v & 3;
-  const code = (bits >> ((py * 4 + px) * 2)) & 3;
-
   const r0 = c0 & 0xFF, g0 = (c0 >> 8) & 0xFF, b0 = (c0 >> 16) & 0xFF;
   const r1 = c1 & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = (c1 >> 16) & 0xFF;
 
@@ -319,19 +319,25 @@ export function sampleDXT1(bus: MemoryBus, u: number, v: number, bw: number, add
   return (a << 24) | (b << 16) | (g << 8) | r;
 }
 
-/** Sample DXT3 compressed texture (explicit alpha). */
+/** Sample DXT1 compressed texture. */
+export function sampleDXT1(bus: MemoryBus, u: number, v: number, bw: number, addr: number): number {
+  const blockX = u >> 2, blockY = v >> 2;
+  const blocksPerRow = (bw + 3) >> 2;
+  const blockAddr = addr + (blockY * blocksPerRow + blockX) * 8;
+  return dxtColorTexel(bus, blockAddr, u & 3, v & 3);
+}
+
+/** Sample DXT3 compressed texture (explicit 4-bit alpha). */
 export function sampleDXT3(bus: MemoryBus, u: number, v: number, bw: number, addr: number): number {
   const blockX = u >> 2, blockY = v >> 2;
   const blocksPerRow = (bw + 3) >> 2;
   const blockAddr = addr + (blockY * blocksPerRow + blockX) * 16;
-
-  // Alpha: 8 bytes of 4-bit alpha per pixel
   const px = u & 3, py = v & 3;
-  const alphaWord = bus.readU16(blockAddr + py * 2);
-  const alpha = ((alphaWord >> (px * 4)) & 0xF) << 4; // 4-bit to 8-bit (PPSSPP WriteColorsDXT3: nibble<<4)
 
-  // Color: same as DXT1 at offset +8
-  const color = sampleDXT1(bus, u, v, bw, addr + 8);
+  // PSP DXT3: color block at +0, alphaLines (u16 per row) at +8. PPSSPP
+  // WriteColorsDXT3: alpha = (alphaLines[y] >> (x*4)) & 0xF, then << 28.
+  const alpha = ((bus.readU16(blockAddr + 8 + py * 2) >> (px * 4)) & 0xF) << 4;
+  const color = dxtColorTexel(bus, blockAddr, px, py);
   return (color & 0x00FFFFFF) | (alpha << 24);
 }
 
@@ -340,41 +346,33 @@ export function sampleDXT5(bus: MemoryBus, u: number, v: number, bw: number, add
   const blockX = u >> 2, blockY = v >> 2;
   const blocksPerRow = (bw + 3) >> 2;
   const blockAddr = addr + (blockY * blocksPerRow + blockX) * 16;
-
-  const a0 = bus.readU8(blockAddr);
-  const a1 = bus.readU8(blockAddr + 1);
-
-  // 6 bytes of 3-bit alpha indices
   const px = u & 3, py = v & 3;
-  const bitIdx = (py * 4 + px) * 3;
-  const byteOff = blockAddr + 2 + (bitIdx >> 3);
-  const bitShift = bitIdx & 7;
-  const rawBits = bus.readU8(byteOff) | (bus.readU8(byteOff + 1) << 8);
-  const code = (rawBits >> bitShift) & 7;
 
-  let alpha: number;
-  if (code === 0) alpha = a0;
-  else if (code === 1) alpha = a1;
-  else if (a0 > a1) alpha = ((8 - code) * a0 + (code - 1) * a1) / 7 | 0;
-  else if (code <= 5) alpha = ((6 - code) * a0 + (code - 1) * a1) / 5 | 0;
-  else alpha = code === 6 ? 0 : 255;
+  // PSP DXT5: color block at +0, then alphadata2 (u32) at +8, alphadata1 (u16)
+  // at +12, alpha1 at +14, alpha2 at +15. The 48-bit alpha index field packs
+  // 3 bits/pixel, 12 bits/row. PPSSPP DecodeAlphaDXT5 / WriteColorsDXT5.
+  const a0 = bus.readU8(blockAddr + 14);
+  const a1 = bus.readU8(blockAddr + 15);
+  const allAlphaLo = bus.readU32(blockAddr + 8) >>> 0;
+  const allAlphaHi = bus.readU16(blockAddr + 12);
+  const shift = py * 12 + px * 3;
+  // 48-bit value won't fit a 32-bit shift; use float math (exact below 2^53).
+  const code = Math.floor((allAlphaHi * 0x100000000 + allAlphaLo) / 2 ** shift) & 7;
+  const alpha = dxt5Alpha(code, a0, a1);
 
-  // Color: DXT1 at offset +8 (but always 4-color mode)
-  const c0raw = bus.readU16(blockAddr + 8);
-  const c1raw = bus.readU16(blockAddr + 10);
-  const bits = bus.readU32(blockAddr + 12);
-  const c0 = color5650to8888(c0raw);
-  const c1 = color5650to8888(c1raw);
-  const colorCode = (bits >> ((py * 4 + px) * 2)) & 3;
+  return (alpha << 24) | (dxtColorTexel(bus, blockAddr, px, py) & 0x00FFFFFF);
+}
 
-  const r0 = c0 & 0xFF, g0 = (c0>>8)&0xFF, b0 = (c0>>16)&0xFF;
-  const r1 = c1 & 0xFF, g1 = (c1>>8)&0xFF, b1 = (c1>>16)&0xFF;
-
-  let r: number, g: number, b: number;
-  if (colorCode === 0) { r = r0; g = g0; b = b0; }
-  else if (colorCode === 1) { r = r1; g = g1; b = b1; }
-  else if (colorCode === 2) { r = (2*r0+r1)/3|0; g = (2*g0+g1)/3|0; b = (2*b0+b1)/3|0; }
-  else { r = (r0+2*r1)/3|0; g = (g0+2*g1)/3|0; b = (b0+2*b1)/3|0; }
-
-  return (alpha << 24) | (b << 16) | (g << 8) | r;
+/** PPSSPP DecodeAlphaDXT5 lerp8/lerp6 table lookup for one 3-bit index. */
+function dxt5Alpha(code: number, a0: number, a1: number): number {
+  if (code === 0) return a0;
+  if (code === 1) return a1;
+  if (a0 > a1) {
+    // lerp8: weights (7-n):n over 7, n = code-1
+    return ((a0 * ((7 - (code - 1)) << 8) + a1 * ((code - 1) << 8)) / 7 + 31 >> 8) & 0xFF;
+  }
+  if (code === 6) return 0;
+  if (code === 7) return 255;
+  // lerp6: weights (5-n):n over 5, n = code-1
+  return ((a0 * ((5 - (code - 1)) << 8) + a1 * ((code - 1) << 8)) / 5 + 31 >> 8) & 0xFF;
 }
