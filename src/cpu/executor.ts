@@ -1147,7 +1147,10 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
   if (rs >= 16 && rs <= 19) {
     const src = readVecS(r, vs, sz);
     const imm = (raw >>> 16) & 0x1F;
-    const mult = (1 << imm);
+    // 2**imm, not (1 << imm): JS `<<` is signed 32-bit, so 1 << 31 is negative.
+    // Color packing uses scale 2^31 (vf2in then vi2uc), which would flip sign and
+    // clamp every channel to 0 — turning lit colors black.
+    const mult = 2 ** imm;
     const dst = new Uint32Array(sz);
     for (let j = 0; j < sz; j++) {
       const s = src[j]!;
@@ -1173,7 +1176,7 @@ function execVFPU4Jump(cpu: AllegrexCPU, i: Instruction): void {
   if (rs === 20) {
     const srcBits = vfpuReadVecBits(r, vs, sz);
     const imm = (raw >>> 16) & 0x1F;
-    const scale = 1.0 / (1 << imm);
+    const scale = 1.0 / (2 ** imm); // 2**imm, not (1 << imm): see vf2in note above
     const dst = new Float32Array(sz);
     for (let j = 0; j < sz; j++) dst[j] = (srcBits[j]! | 0) * scale;
     writeVecD(r, vd, sz, dst);

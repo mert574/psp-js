@@ -390,6 +390,22 @@ describe("AllegrexCPU — VFPU", () => {
     view.setUint32(0, cpu.bus.readU32(addr), true);
     expect(view.getFloat32(0, true)).toBeCloseTo(42.0);
   });
+
+  // Regression: vf2in with scale 2^31 (the common color-pack scale). The scale
+  // must be 2**imm, not (1 << imm) — JS `<<` is signed 32-bit, so 1 << 31 is
+  // negative, which flipped color channels negative and clamped them to 0 in
+  // vi2uc. That blacked out lit geometry in Toy Story 3 (and any game packing
+  // colors this way).
+  it("vf2in scales by +2^31, not a negative (1<<31)", () => {
+    cpu.regs.vfpr[0] = 0.5;
+    // opcode 0x34 (VFPU4), rs=16 (vf2in), imm=31 (scale 2^31), vs=0, vd=0, size S
+    const vf2in = ((0x34 << 26) | (16 << 21) | (31 << 16) | (0 << 8) | 0) >>> 0;
+    loadProgram(cpu, [vf2in]);
+    cpu.step();
+    // 0.5 * 2^31 = 0x40000000. The bug produced 0xC0000000 (negative).
+    const bits = new Uint32Array(cpu.regs.vfpr.buffer)[0]!;
+    expect(bits >>> 0).toBe(0x40000000);
+  });
 });
 
 describe("AllegrexCPU — SPECIAL (CLZ, MADD)", () => {
