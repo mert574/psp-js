@@ -8,11 +8,6 @@ It boots real games: decrypts KIRK-encrypted EBOOTs, loads ISO/PBP, runs the MIP
 
 Work in progress. Several commercial games boot to their menus and render, and the pspautotests CPU/kernel suite passes. Per-game status is on the [compatibility list](https://mert574.github.io/psp-js/docs/game-status).
 
-## Development status
-
-See [LICENSING.md](LICENSING.md) for the source-provenance review and separate
-artwork/font terms. Gameplay demonstrations remain available below.
-
 ## Demos
 
 Click a thumbnail to play (video only, no audio).
