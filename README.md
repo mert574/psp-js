@@ -2,11 +2,11 @@
 
 A PSP emulator written in TypeScript that runs in the browser. It uses HLE (High-Level Emulation) like PPSSPP, so there's no BIOS ROM. PSP syscalls are reimplemented in TypeScript instead.
 
-**[Try the emulator](https://mert.js.org/psp-js/)** · [Documentation](https://mert.js.org/psp-js/docs/) · [Compatibility list](https://mert.js.org/psp-js/docs/game-status)
+**[Try the emulator](https://mert574.github.io/psp-js/)** · [Documentation](https://mert574.github.io/psp-js/docs/) · [Compatibility list](https://mert574.github.io/psp-js/docs/game-status)
 
 It boots real games: decrypts KIRK-encrypted EBOOTs, loads ISO/PBP, runs the MIPS Allegrex CPU and VFPU, renders the GE over WebGL, decodes ATRAC3+ audio and MPEG/PSMF video, and saves game data in the browser.
 
-Work in progress. Several commercial games boot to their menus and render, and the pspautotests CPU/kernel suite passes. Per-game status is on the [compatibility list](https://mert.js.org/psp-js/docs/game-status).
+Work in progress. Several commercial games boot to their menus and render, and the pspautotests CPU/kernel suite passes. Per-game status is on the [compatibility list](https://mert574.github.io/psp-js/docs/game-status).
 
 ## Demos
 
@@ -14,9 +14,9 @@ Click a thumbnail to play (video only, no audio).
 
 <table>
 <tr>
-<td><a href="https://mert.js.org/psp-js/docs/videos/ridge-racer.mp4"><img src="docs/public/screenshots/demo-ridge-racer.jpg" width="260" alt="Ridge Racer"></a></td>
-<td><a href="https://mert.js.org/psp-js/docs/videos/metal-slug.mp4"><img src="docs/public/screenshots/demo-metal-slug.jpg" width="260" alt="Metal Slug"></a></td>
-<td><a href="https://mert.js.org/psp-js/docs/videos/cladun.mp4"><img src="docs/public/screenshots/demo-cladun.jpg" width="260" alt="Cladun"></a></td>
+<td><a href="https://mert574.github.io/psp-js/docs/videos/ridge-racer.mp4"><img src="docs/public/screenshots/demo-ridge-racer.jpg" width="260" alt="Ridge Racer"></a></td>
+<td><a href="https://mert574.github.io/psp-js/docs/videos/metal-slug.mp4"><img src="docs/public/screenshots/demo-metal-slug.jpg" width="260" alt="Metal Slug"></a></td>
+<td><a href="https://mert574.github.io/psp-js/docs/videos/cladun.mp4"><img src="docs/public/screenshots/demo-cladun.jpg" width="260" alt="Cladun"></a></td>
 </tr>
 <tr>
 <td align="center">Ridge Racer (60s replay)</td>
@@ -27,7 +27,7 @@ Click a thumbnail to play (video only, no audio).
 
 ## Documentation
 
-The [full documentation](https://mert.js.org/psp-js/docs/) covers the user guide, architecture, and a per-subsystem and per-HLE-module reference. Run it locally with `npm run docs:dev`, or `npm run dev:all` to serve the app and docs side by side.
+The [full documentation](https://mert574.github.io/psp-js/docs/) covers the user guide, architecture, and a per-subsystem and per-HLE-module reference. Run it locally with `npm run docs:dev`, or `npm run dev:all` to serve the app and docs side by side.
 
 ## Quick start
 
@@ -65,9 +65,9 @@ The node path has no GE worker, so it's for CPU/kernel/boot diagnostics, not ren
 
 ## Layout
 
-How one frame runs (the CPU runs in slices, the GE draws inline, and CoreTiming fires the VBlank that presents). Animated version of the [architecture page](https://mert.js.org/psp-js/docs/guide/architecture):
+How one frame runs (the CPU runs in slices, the GE draws inline, and CoreTiming fires the VBlank that presents). Animated version of the [architecture page](https://mert574.github.io/psp-js/docs/guide/architecture):
 
-[![How one frame runs](docs/public/architecture.gif)](https://mert.js.org/psp-js/docs/guide/architecture)
+[![How one frame runs](docs/public/architecture.gif)](https://mert574.github.io/psp-js/docs/guide/architecture)
 
 ```
 PSPEmulator (src/emulator.ts)
