@@ -13,7 +13,7 @@ const log = Logger.get("HLE-MEDIA");
 
 export function registerMediaHLE(kernel: HLEKernel): void {
 
-  // ── sceSas — voice synthesizer (port of PPSSPP Core/HW/SasAudio.cpp) ──────
+  // ── sceSas — voice synthesizer (see ../audio/sas-core.ts) ──────
   // One global SAS core, like PPSSPP. Created on __sceSasInit.
   const sas = new SasInstance();
   const INVALID_VOICE = 0x80260002; // SCE_SAS_ERROR_INVALID_VOICE

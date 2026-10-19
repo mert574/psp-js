@@ -1,8 +1,7 @@
 /**
  * Streaming MPEG-2 Program Stream demuxer for PSP PSMF video.
  *
- * The default libav.js build has no MPEG-PS demuxer, so we split the stream
- * ourselves and hand H.264 access units to WebCodecs. The PSP feeds the PS
+ * We split the MPEG Program Stream into H.264 access units for WebCodecs. The PSP feeds the PS
  * incrementally through the sceMpeg ringbuffer, so this parses what it can and
  * keeps the incomplete tail for the next feed.
  *

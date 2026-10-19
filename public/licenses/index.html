@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PSP.js licenses</title>
+<style>body{max-width:52rem;margin:3rem auto;padding:0 1rem;font:16px/1.6 system-ui;color:#eee;background:#141414}a{color:#9bcfff}h1,h2{line-height:1.2}</style>
+<h1>PSP.js licenses</h1>
+<p>Original PSP.js code: <a href="psp-js-MIT.txt">MIT License</a>, Mert Yildiz.</p>
+<h2>Audio and video decoding</h2>
+<p>FFmpeg 5.1.4, distributed as <code>@ffmpeg/core 0.12.10</code>, is a separate WebAssembly runtime under <a href="ffmpeg-core-GPL-2.0.txt">GPL-2.0-or-later</a>. Its build enables GPL components. It is not covered by PSP.js's MIT license.</p>
+<ul>
+<li><a href="https://github.com/ffmpegwasm/ffmpeg.wasm/tree/71aa99d37c02a7b4c435275ca9ef50e612f6efa1">Runtime source and build recipe</a></li>
+<li><a href="https://github.com/FFmpeg/FFmpeg/tree/n5.1.4">FFmpeg source</a></li>
+<li><a href="https://github.com/ffmpegwasm/ffmpeg.wasm/blob/71aa99d37c02a7b4c435275ca9ef50e612f6efa1/Dockerfile">Codec dependencies and build configuration</a></li>
+<li><a href="runtime.json">Runtime versions and SHA-256 hashes</a></li>
+</ul>
+<p>The ffmpeg.wasm JavaScript wrapper and utility code use the <a href="ffmpeg-wasm-MIT.txt">MIT License</a>, copyright Jerome Wu.</p>
+<h2>Fonts and cryptography</h2>
+<p>Saira/PSP.js Sans and Inconsolata/PSP.js Mono retain their <a href="OFL-Sans.txt">Sans</a> and <a href="OFL-Mono.txt">Mono</a> SIL Open Font License notices. Replacement PGFs contain glyphs generated from these fonts.</p>
+<p>The Rijndael implementation retains its <a href="rijndael-public-domain.txt">authors' public-domain declaration and disclaimer</a>.</p>
+<p>Lit, TWGL, Vue and other bundled dependencies retain their <a href="dependency-notices.txt">license notices</a>. Gameplay screenshots and recordings retain the rights of their respective owners.</p>
+</html>

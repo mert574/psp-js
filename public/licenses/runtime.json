@@ -1,0 +1,32 @@
+{
+  "runtime": [
+    {
+      "package": "@ffmpeg/core",
+      "version": "0.12.10",
+      "license": "GPL-2.0-or-later",
+      "ffmpegVersion": "5.1.4",
+      "sourceRevision": "71aa99d37c02a7b4c435275ca9ef50e612f6efa1",
+      "sourceUrl": "https://github.com/ffmpegwasm/ffmpeg.wasm/tree/71aa99d37c02a7b4c435275ca9ef50e612f6efa1",
+      "files": [
+        {
+          "url": "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.js",
+          "sha256": "67a48f11645f85439f3fde4f2119042c16b374b910206b7a7a24f342e28dcae3"
+        },
+        {
+          "url": "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.wasm",
+          "sha256": "9f57947a5bd530d8f00c5b3f2cb2a3492faa7e5d823315342d6a8656d0a6b7b7"
+        }
+      ]
+    },
+    {
+      "package": "@ffmpeg/ffmpeg",
+      "version": "0.12.15",
+      "license": "MIT"
+    },
+    {
+      "package": "@ffmpeg/util",
+      "version": "0.12.2",
+      "license": "MIT"
+    }
+  ]
+}

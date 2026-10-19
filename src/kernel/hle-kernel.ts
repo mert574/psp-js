@@ -407,7 +407,7 @@ export class HLEKernel {
   private static readonly SYSCALL_CB_RETURN = 0xFFFFE; // reserved syscall code
 
   /**
-   * User memory allocator — port of PPSSPP's userMemory BlockAllocator.
+   * User memory allocator for partition memory, stacks and heaps.
    * Grain=256 matches PPSSPP's `BlockAllocator userMemory(256)`.
    * Range: [0x08800000, 0x0C000000) for 64MB PSP (set in setHeapBase).
    */

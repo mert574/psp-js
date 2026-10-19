@@ -75,4 +75,4 @@ Thread stacks, partition memory, and heaps all allocate from one pool: `HLEKerne
 
 ## Verifying behaviour
 
-Behavior is matched against PPSSPP. The `ppsspp_niddb.xml` database and the `ppsspp-reference/Core/HLE/sce*.cpp` source are the references, and the source wins where they disagree. See [Conventions](/reference/conventions#ppsspp-as-the-reference).
+Behavior is matched against PPSSPP. `ppsspp_niddb.xml` is generated from the project's NID constants; `ppsspp-reference/Core/HLE/sce*.cpp` is available separately for comparison of hardware behavior. See [Conventions](/reference/conventions#ppsspp-as-the-reference).

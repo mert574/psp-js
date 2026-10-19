@@ -22,6 +22,7 @@ import "./game-library.js";
 import "./app-bar.js"; // registers the <app-bar> custom element
 import { initWaveBackground } from "./wave-background.js";
 import { FRAMESKIP_AUTO, FRAMESKIP_OFF, type FrameSkipMode } from "./frameskip.js";
+import { loadBundledFonts } from "./bundled-fonts.js";
 
 initWaveBackground();
 
@@ -57,8 +58,14 @@ const bootBtn    = document.getElementById("boot-btn")!;
 const backToLibBtn = document.getElementById("back-to-library-btn")!;
 const errorClose = document.getElementById("error-close")!;
 
-/** flash0 font data fetched from bundled assets at startup */
+/** Bundled OFL replacement fonts. */
 const flash0Fonts = new Map<string, Uint8Array>();
+let bundledFontError = "";
+const bundledFontsReady = loadBundledFonts(import.meta.env.BASE_URL).then((fonts) => {
+  for (const [path, bytes] of fonts) flash0Fonts.set(path, bytes);
+}).catch((error: unknown) => {
+  bundledFontError = error instanceof Error ? error.message : "Could not load replacement fonts.";
+});
 
 // ── Game library event ────────────────────────────────────────────────────────
 // mode "boot" (default for a card click) loads the game and jumps straight into
@@ -88,23 +95,6 @@ void (async () => {
   } catch (err) {
     log.error(`?iso= autoload failed: ${err}`);
   }
-})();
-
-// Load bundled PPSSPP open-source replacement PGF fonts eagerly
-void (async () => {
-  const names = [
-    "ltn0","ltn1","ltn2","ltn3","ltn4","ltn5","ltn6","ltn7",
-    "ltn8","ltn9","ltn10","ltn11","ltn12","ltn13","ltn14","ltn15",
-  ];
-  const results = await Promise.allSettled(
-    names.map(n => fetch(`${import.meta.env.BASE_URL}flash0/font/${n}.pgf`).then(r => r.arrayBuffer()).then(b => ({ n, b })))
-  );
-  for (const r of results) {
-    if (r.status === "fulfilled") {
-      flash0Fonts.set(`flash0:/font/${r.value.n}.pgf`, new Uint8Array(r.value.b));
-    }
-  }
-  log.info(`Bundled PGF fonts loaded: ${flash0Fonts.size}`);
 })();
 
 function isAudioDisabled(): boolean {
@@ -408,6 +398,13 @@ function bootGame(): void {
 
   void (async () => {
     // Register ISO filesystem for lazy file access by HLE
+    await bundledFontsReady;
+    if (bundledFontError && flash0Fonts.size < 16) {
+      showError(bundledFontError);
+      teardownGameplay();
+      exitGameplayView();
+      return;
+    }
     if (lastIsoVolume && lastIsoFile) {
       await registerIsoFileSystem(emulator!.hle.pspFs, emulator!.hle.fileData, lastIsoFile);
     }
@@ -434,7 +431,7 @@ function bootGame(): void {
       log.info(`Starting directory: ${pendingStartDir}`);
     }
 
-    // Register any PSP flash0 font files the user loaded
+    // Register bundled replacements, including any session-local overrides.
     for (const [key, val] of flash0Fonts) {
       emulator!.hle.fileData.set(key, val);
     }

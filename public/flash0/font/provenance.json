@@ -1,0 +1,187 @@
+{
+  "generator": "tools/generate-pgf-fonts.mjs",
+  "renderer": "155.0.8059.85",
+  "license": "OFL-1.1",
+  "modifiedNames": [
+    "PSP.js Sans",
+    "PSP.js Mono"
+  ],
+  "fonts": [
+    {
+      "file": "ltn0.pgf",
+      "slot": 0,
+      "size": 18,
+      "family": "Sans",
+      "style": "Regular",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "cf8a038112b81930bf5991e76669f44830602447628263e7d09b6ba8e4725ac4"
+    },
+    {
+      "file": "ltn1.pgf",
+      "slot": 1,
+      "size": 18,
+      "family": "Mono",
+      "style": "Regular",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "128b89de195a65678fabafe251d8be4e91199cae867b47a5c210995f2942c9b8"
+    },
+    {
+      "file": "ltn2.pgf",
+      "slot": 2,
+      "size": 18,
+      "family": "Sans",
+      "style": "Italic",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "0862e70ef452f40fdd712f588abe2091132ddd9a76f0267731aad69a5c5a7f33"
+    },
+    {
+      "file": "ltn3.pgf",
+      "slot": 3,
+      "size": 18,
+      "family": "Mono",
+      "style": "Italic",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "d200d5e6b937aec2931bdf5a6bfb55c642cfa7e94bdf7fac015c2c2ff35dbb25"
+    },
+    {
+      "file": "ltn4.pgf",
+      "slot": 4,
+      "size": 18,
+      "family": "Sans",
+      "style": "Bold",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "1e265e36011a2e37c0b84c4438600fc8c2f68ff2fa9369a70de2313f37827c6e"
+    },
+    {
+      "file": "ltn5.pgf",
+      "slot": 5,
+      "size": 18,
+      "family": "Mono",
+      "style": "Bold",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "0bc4a71ad7b0c589f97407e4bea01bde301841ab0617038b43e54c8fb60dc937"
+    },
+    {
+      "file": "ltn6.pgf",
+      "slot": 6,
+      "size": 18,
+      "family": "Sans",
+      "style": "Bold Italic",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "a4aa9ec5ce06cf27dc9ef04ac2645a572648759124ccf12c507be75b76369768"
+    },
+    {
+      "file": "ltn7.pgf",
+      "slot": 7,
+      "size": 18,
+      "family": "Mono",
+      "style": "Bold Italic",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "ec5cf93e3ff5c186e6347c9593c6319cb8c5afd7af7b01f31a8df7c91e4ec96e"
+    },
+    {
+      "file": "ltn8.pgf",
+      "slot": 8,
+      "size": 13,
+      "family": "Sans",
+      "style": "Regular",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "1b00d3862cb1d72d0dc4e88939c6584f9e4e97d916f4b92ece4898ab315dd51f"
+    },
+    {
+      "file": "ltn9.pgf",
+      "slot": 9,
+      "size": 13,
+      "family": "Mono",
+      "style": "Regular",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "986538c905e064c00586dbccfd4c608305fcba80b9c77de9b108f7c368f2e2a6"
+    },
+    {
+      "file": "ltn10.pgf",
+      "slot": 10,
+      "size": 13,
+      "family": "Sans",
+      "style": "Regular",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "1b00d3862cb1d72d0dc4e88939c6584f9e4e97d916f4b92ece4898ab315dd51f"
+    },
+    {
+      "file": "ltn11.pgf",
+      "slot": 11,
+      "size": 13,
+      "family": "Mono",
+      "style": "Regular",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "986538c905e064c00586dbccfd4c608305fcba80b9c77de9b108f7c368f2e2a6"
+    },
+    {
+      "file": "ltn12.pgf",
+      "slot": 12,
+      "size": 13,
+      "family": "Sans",
+      "style": "Bold",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "30f0c4bd26b3b5c48dbbcf101f94caf8583bf7e04f565e03cced4e99614c7ba1"
+    },
+    {
+      "file": "ltn13.pgf",
+      "slot": 13,
+      "size": 13,
+      "family": "Mono",
+      "style": "Bold",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "c11e27b5ac4f8335b8b30a3a33c0946400c092d00b95b8582c2bd74ca5aecf71"
+    },
+    {
+      "file": "ltn14.pgf",
+      "slot": 14,
+      "size": 13,
+      "family": "Sans",
+      "style": "Italic",
+      "glyphs": 431,
+      "source": "src/frontend/fonts/Saira.ttf",
+      "sourceSha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "sha256": "d37d667992c18a2f6a50ef32dd2d6f5adbdf6e0b7cd3617fd276c6de900f6a01"
+    },
+    {
+      "file": "ltn15.pgf",
+      "slot": 15,
+      "size": 13,
+      "family": "Mono",
+      "style": "Italic",
+      "glyphs": 403,
+      "source": "src/frontend/fonts/Inconsolata.ttf",
+      "sourceSha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "sha256": "d575b71322c2bb99e6505a34361f0e5ae9d186c38800d5d514f7f4890e31a167"
+    }
+  ]
+}

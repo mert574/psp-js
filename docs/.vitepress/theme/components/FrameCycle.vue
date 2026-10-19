@@ -1,8 +1,6 @@
 <script setup lang="ts">
 // Browser-only animated diagram of one runFrame() of the emulator.
-// GSAP and the DOM are only touched inside onMounted, so this is safe to
-// import at build time but it never runs during SSR (the page wraps it in
-// <ClientOnly>, and the timeline is built after mount).
+// Browser animation runs only after mount; the SVG remains safe for SSR.
 import { onMounted, onBeforeUnmount, ref } from "vue";
 
 // ---- shared grid geometry (VRAM grid, screen grid, present flash derive from
@@ -34,141 +32,77 @@ const ramRows = [96, 72, 88, 60, 80, 68];
 const root = ref<HTMLElement | null>(null);
 let cleanup: (() => void) | null = null;
 
-onMounted(async () => {
+onMounted(() => {
   const el = root.value;
   if (!el) return;
-
-  const { gsap } = await import("gsap");
   const svg = el.querySelector("svg")!;
-  const q = gsap.utils.selector(svg);
-
-  const reduced =
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-  const vramCells = q(".vram-cell");
-  const screenCells = q(".screen-cell");
-
-  const resetScene = () => {
-    gsap.set(vramCells, { fill: "var(--fc-grid)", opacity: 0.18 });
-    gsap.set(screenCells, { fill: "var(--fc-grid)", opacity: 0.12 });
-    gsap.set(q(".ram-bar"), { opacity: 0.3 });
-    gsap.set(q(".flow-dot"), { opacity: 0, x: 0, y: 0 }); // every moving token
-    gsap.set(q(".instr"), { opacity: 0 });
-    gsap.set(q(".gpu-core"), { opacity: 0.22 });
-    gsap.set(q(".present-flash"), { opacity: 0 });
-    gsap.set(q(".pipe"), { opacity: 0.35 });
-    gsap.set(q(".clock-hand"), { rotation: 0, transformOrigin: "50% 100%" });
+  const cache = new Map<string, SVGElement[]>();
+  const nodes = (selector: string): SVGElement[] => {
+    if (!cache.has(selector)) cache.set(selector, Array.from(svg.querySelectorAll<SVGElement>(selector)));
+    return cache.get(selector)!;
   };
-
-  const activate = (sel: string, at: number, dur: number) => {
-    tl.to(sel, { opacity: 0.9, duration: 0.25 }, at);
-    tl.to(sel, { opacity: 0, duration: 0.35 }, at + dur);
+  const clamp = (n: number): number => Math.max(0, Math.min(1, n));
+  const cycle = 7.7;
+  const opacity = (selector: string, value: number) => nodes(selector).forEach(node => { node.style.opacity = String(value); });
+  const draw = (time: number) => {
+    const pulse = (start: number, duration: number): number => Math.min(clamp((time-start)/.25), clamp((start+duration+.35-time)/.35)) * .9;
+    const glow = (selector: string, start: number, duration: number) => opacity(selector, pulse(start,duration));
+    nodes(".flow-dot,.instr").forEach(node => { node.style.opacity="0";node.style.transform="translate(0px,0px)"; });
+    const travel = (selector: string, start: number, x: number, y: number, duration=.4) => {
+      const phase=time-start;
+      if(phase<0 || phase>duration+.12)return;
+      const progress=clamp(phase/duration);
+      nodes(selector).forEach(node=>{node.style.opacity=String(1-clamp((phase-duration)/.12));node.style.transform=`translate(${x*progress}px,${y*progress}px)`;});
+    };
+    glow(".glow-time",0,.5);if(time>1)glow(".glow-time",5.2,.6);
+    glow(".glow-cpu",.3,4.4);glow(".glow-hle",1.6,1.4);glow(".glow-ge",2.7,2);glow(".glow-present",5.5,1.3);
+    travel(".wake-dot",0,0,-42);
+    nodes(".instr").forEach((node,i)=>{
+      const t=time-.4-i*.21;
+      if(t<0 || t>.8)return;
+      let x:number;
+      if(t<.21)x=-56+56*clamp(t/.14);
+      else if(t<.42)x=63*clamp((t-.21)/.15);
+      else if(t<.63)x=63+63*clamp((t-.42)/.15);
+      else x=126+63*clamp((t-.63)/.17);
+      node.style.transform=`translateX(${x}px)`;node.style.opacity=String(t<.63?clamp(t/.14):1-clamp((t-.63)/.17));
+    });
+    [".pipe-fetch",".pipe-decode",".pipe-exec"].forEach((selector,i)=>opacity(selector,.35+.65*clamp((time-.45-i*.21)/.2)));
+    for(let i=0;i<5;i++){travel(".store-dot",.6+i*.78,108,0,.34);travel(".load-dot",1+i*.78,-108,0,.34);travel(".pixel",3.25+i*.3,0,165,.34);}
+    travel(".syscall-dot",1.6,0,-170,.55);
+    if(time>=2.6 && time<3.35)nodes(".syscall-dot").forEach(node=>{node.style.opacity=String(1-clamp((time-3.15)/.2));node.style.transform=`translateY(${-170*(1-clamp((time-2.6)/.55))}px)`;});
+    travel(".kmem-dot",2.05,122,88);
+    if(time>=2.55 && time<3.07)nodes(".kmem-dot").forEach(node=>{const p=1-clamp((time-2.55)/.4);node.style.opacity=String(1-clamp((time-2.95)/.12));node.style.transform=`translate(${122*p}px,${88*p}px)`;});
+    travel(".ge-dot",2.7,108,0,.42);
+    for(let i=0;i<4;i++)travel(".read-dot",2.95+i*.32,0,-86,.3);
+    nodes(".ram-bar").forEach((node,i)=>{node.style.opacity=String(.25+.45*(.5+.5*Math.sin(time*4-i)));});
+    nodes(".gpu-core").forEach((node,i)=>{node.style.opacity=String(time>=2.95 && time<4.75?.45+.55*(.5+.5*Math.sin(time*36+i)):.22);});
+    for(const [selector,start,step,color,idle] of [[".vram-cell",3.3,.3,"var(--fc-ge)",.18],[".screen-cell",5.6,.12,"var(--fc-present)",.12]] as const){
+      nodes(selector).forEach((node,i)=>{const lit=cells[i]!.lit,progress=clamp((time-start-Math.floor(i/COLS)*step)/.2);node.style.fill=lit && progress>0?color:"var(--fc-grid)";node.style.opacity=String(lit?idle+(1-idle)*progress:idle);});
+    }
+    nodes(".clock-hand").forEach(node=>{node.style.transformBox="fill-box";node.style.transformOrigin="50% 100%";node.style.transform=`rotate(${time<5.2?330*clamp((time-.2)/5):330+30*clamp((time-5.2)/.4)}deg)`;});
+    nodes(".tick").forEach((node,i)=>{node.style.opacity=String(.9*clamp(Math.sin((time-.2-i*.4)*Math.PI/.4)));});
+    travel(".vblank-dot",5.2,108,0);
+    opacity(".present-flash",.5*Math.min(clamp((time-5.55)/.25),1-clamp((time-5.85)/.55)));
+    for(let i=0;i<3;i++)travel(".scan-dot",5.5+i*.22,3,86,.36);
   };
-  // a token that travels along an axis from its base, used for ambient motion
-  const travel = (sel: string, at: number, dx: number, dy: number, dur = 0.4) => {
-    tl.set(q(sel), { opacity: 1, x: 0, y: 0 }, at)
-      .to(q(sel), { x: dx, y: dy, duration: dur, ease: "none" }, at)
-      .to(q(sel), { opacity: 0, duration: 0.12 }, at + dur);
+  let frame=0, elapsed=0, last=0, running=false;
+  const tick=(now:number)=>{if(!running)return;elapsed=(elapsed+(now-last)/1000)%cycle;last=now;draw(elapsed);frame=requestAnimationFrame(tick);};
+  const timeline={
+    play(){if(!running){running=true;last=performance.now();frame=requestAnimationFrame(tick);}return this;},
+    pause(){running=false;cancelAnimationFrame(frame);return this;},
+    progress(value:number){elapsed=clamp(value)*cycle;draw(elapsed);return this;},
+    kill(){this.pause();},
   };
-
-  const tl = gsap.timeline({ repeat: -1, paused: true, defaults: { ease: "power2.inOut" } });
-  resetScene();
-
-  // continuous RAM shimmer (memory is always busy)
-  tl.to(q(".ram-bar"), { opacity: "random(0.25, 0.7)", duration: 0.5, stagger: { each: 0.2, repeat: 16, yoyo: true } }, 0);
-
-  // ----- stage 1: CoreTiming wakes the CPU thread, then instructions run -----
-  activate(".glow-time", 0, 0.5);
-  travel(".wake-dot", 0, 0, -42, 0.4);
-  activate(".glow-cpu", 0.3, 4.4);
-  // a proper pipeline: each instruction slides into fetch, then steps to decode
-  // and execute one stage at a time; staggered so the three lanes stay busy at once
-  q(".instr").forEach((node, i) => {
-    const start = 0.4 + i * 0.21;
-    tl.fromTo(node, { opacity: 0, x: -56 }, { opacity: 1, x: 0, duration: 0.14, ease: "power2.out" }, start);
-    tl.to(node, { x: 63, duration: 0.15, ease: "power2.inOut" }, start + 0.21);
-    tl.to(node, { x: 126, duration: 0.15, ease: "power2.inOut" }, start + 0.42);
-    tl.to(node, { x: 189, opacity: 0, duration: 0.17, ease: "power1.in" }, start + 0.63);
-  });
-  tl.to(q(".pipe-fetch"), { opacity: 1, duration: 0.2 }, 0.45)
-    .to(q(".pipe-decode"), { opacity: 1, duration: 0.2 }, 0.66)
-    .to(q(".pipe-exec"), { opacity: 1, duration: 0.2 }, 0.87);
-  // CPU <-> RAM: stores flow out, loads flow back (both directions move)
-  for (let k = 0; k < 5; k++) {
-    travel(".store-dot", 0.6 + k * 0.78, 108, 0, 0.34);
-    travel(".load-dot", 1.0 + k * 0.78, -108, 0, 0.34);
-  }
-
-  // ----- stage 2: a SYSCALL peels off into the HLE kernel and returns -----
-  activate(".glow-hle", 1.6, 1.4);
-  tl.set(q(".syscall-dot"), { opacity: 1, x: 0, y: 0, fill: "var(--fc-syscall)" }, 1.6)
-    .to(q(".syscall-dot"), { y: -170, duration: 0.55 }, 1.6)
-    .to(q(".syscall-dot"), { y: 0, duration: 0.55 }, 2.6)
-    .to(q(".glow-cpu"), { opacity: 0.9, duration: 0.2 }, 3.15)
-    .to(q(".glow-cpu"), { opacity: 0, duration: 0.3 }, 3.4)
-    .to(q(".syscall-dot"), { opacity: 0, duration: 0.2 }, 3.15);
-  // the kernel handler reads args from RAM and writes results back
-  travel(".kmem-dot", 2.05, 122, 88, 0.4); // kernel -> RAM (read args)
-  tl.set(q(".kmem-dot"), { opacity: 1, x: 122, y: 88 }, 2.55)
-    .to(q(".kmem-dot"), { x: 0, y: 0, duration: 0.4, ease: "none" }, 2.55)
-    .to(q(".kmem-dot"), { opacity: 0, duration: 0.12 }, 2.95);
-
-  // ----- stage 3: kernel dispatches the GE list; GPU reads RAM, writes VRAM -----
-  activate(".glow-ge", 2.7, 2.0);
-  travel(".ge-dot", 2.7, 108, 0, 0.42);
-  for (let k = 0; k < 4; k++) travel(".read-dot", 2.95 + k * 0.32, 0, -86, 0.3);
-  // the GPU's many lanes shade in parallel: cores flicker together while it works
-  tl.to(q(".gpu-core"), { opacity: "random(0.45, 1)", duration: 0.16, stagger: { each: 0.02, from: "random", repeat: 8, yoyo: true } }, 2.95);
-  tl.to(q(".gpu-core"), { opacity: 0.22, duration: 0.3 }, 4.75); // settle to idle once rasterizing is done
-  // pixel tokens fan into VRAM in parallel bursts (the three .pixel dots move together)
-  for (let k = 0; k < 5; k++) travel(".pixel", 3.25 + k * 0.3, 0, 165, 0.34);
-  // framebuffer fills a whole row at a time (parallel), not cell-by-cell
-  vramCells.forEach((cell, i) => {
-    const lit = (cell as HTMLElement).dataset.lit === "1";
-    const row = Math.floor(i / COLS);
-    tl.to(cell, { fill: lit ? "var(--fc-ge)" : "var(--fc-grid)", opacity: lit ? 1 : 0.18, duration: 0.2 }, 3.3 + row * 0.3);
-  });
-
-  // ----- stage 4: CoreTiming advances; it only lights when it fires a signal -----
-  tl.to(q(".clock-hand"), { rotation: 330, duration: 5.0, ease: "none" }, 0.2);
-  tl.to(q(".tick"), { opacity: 0.9, duration: 0.12, stagger: { each: 0.4, repeat: 11, yoyo: true } }, 0.2);
-
-  // ----- VBlank fires (CoreTiming) and triggers the present -----
-  activate(".glow-time", 5.2, 0.6);
-  tl.to(q(".clock-hand"), { rotation: 360, duration: 0.4, ease: "power3.out" }, 5.2);
-  travel(".vblank-dot", 5.2, 108, 0, 0.4);
-  activate(".glow-present", 5.5, 1.3);
-  tl.fromTo(q(".present-flash"), { opacity: 0 }, { opacity: 0.5, duration: 0.25 }, 5.55)
-    .to(q(".present-flash"), { opacity: 0, duration: 0.55 }, 5.85);
-  for (let k = 0; k < 3; k++) travel(".scan-dot", 5.5 + k * 0.22, 3, 86, 0.36);
-  vramCells.forEach((cell, i) => {
-    const lit = (cell as HTMLElement).dataset.lit === "1";
-    const screen = screenCells[i];
-    if (!screen) return;
-    const row = Math.floor(i / COLS);
-    tl.to(screen, { fill: lit ? "var(--fc-present)" : "var(--fc-grid)", opacity: lit ? 1 : 0.12, duration: 0.18 }, 5.6 + row * 0.12);
-  });
-  tl.to({}, { duration: 0.9 }, 6.6);
-  tl.add(() => resetScene(), 7.7);
-
-  // expose the timeline so a headless capture can step it deterministically
-  (window as unknown as { __fcTimeline?: unknown }).__fcTimeline = tl;
-
-  if (reduced) {
-    tl.progress(0.46).pause();
-  } else if (typeof IntersectionObserver === "function") {
-    const io = new IntersectionObserver(
-      (entries) => { for (const e of entries) (e.isIntersecting ? tl.play() : tl.pause()); },
-      { threshold: 0.2 },
-    );
-    io.observe(el);
-    cleanup = () => { io.disconnect(); tl.kill(); };
-  } else {
-    tl.play();
-    cleanup = () => tl.kill();
-  }
-  if (!cleanup) cleanup = () => tl.kill();
+  (window as unknown as {__fcTimeline?: typeof timeline}).__fcTimeline=timeline;
+  draw(0);
+  const reduced=window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  let observer:IntersectionObserver|undefined;
+  if(reduced)timeline.progress(.46);
+  else if(typeof IntersectionObserver==="function"){
+    observer=new IntersectionObserver(entries=>{for(const entry of entries)entry.isIntersecting?timeline.play():timeline.pause();},{threshold:.2});observer.observe(el);
+  }else timeline.play();
+  cleanup=()=>{observer?.disconnect();timeline.kill();delete (window as unknown as {__fcTimeline?:unknown}).__fcTimeline;};
 });
 
 onBeforeUnmount(() => { cleanup?.(); cleanup = null; });

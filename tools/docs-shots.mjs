@@ -8,8 +8,8 @@
  * With no ISO it captures the emulator's own screens: the landing prompt and the
  * boot-options form. Pass ISO_URL to also boot a game and capture the running
  * emulator: a gameplay frame (cropped to the canvas) plus the debug panel and one
- * image per section. Game footage in these images is fine (it shows the emulator
- * actually working, like any emulator's docs). Shots crop to the relevant element
+ * image per section. These are emulator demonstrations; underlying game content
+ * keeps its separate rights (see ASSETS.md). Shots crop to the relevant element
  * rather than the whole window so they look clean. The one thing that must never
  * be committed is the game itself, so stage the ISO somewhere gitignored
  * (public/*.iso is) and delete it after.

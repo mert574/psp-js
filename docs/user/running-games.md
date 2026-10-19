@@ -10,8 +10,13 @@ psp-js runs in your browser. You point it at a game image and run it.
 
 ## What you need
 
-- A game in **ISO** or **PBP** (`EBOOT.PBP`) form. You provide your own dumps; none are bundled.
+- A game or homebrew program in **ISO** or **PBP** (`EBOOT.PBP`) form that you are entitled to use. None are bundled.
 - A browser with WebGL and `SharedArrayBuffer` support (current Chrome, Edge, Firefox, Safari).
+
+## Font files
+
+Replacement Latin fonts are bundled and load automatically.
+The bundled replacements have different metrics and no CJK/shadow glyph coverage.
 
 ## Loading a game
 

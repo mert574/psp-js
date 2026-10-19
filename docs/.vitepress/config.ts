@@ -89,6 +89,7 @@ export default defineConfig({
           { text: "GE Opcodes", link: "/reference/ge-opcodes" },
           { text: "Testing", link: "/reference/testing" },
           { text: "Conventions", link: "/reference/conventions" },
+          { text: "Licenses", link: "/reference/licenses" },
         ],
       },
     ],

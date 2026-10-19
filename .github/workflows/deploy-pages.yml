@@ -25,6 +25,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run check:assets
+      - run: npm run typecheck
+      - run: npx vitest run src/
       - run: npm run build:web
       # Build the docs and place them under /psp-js/docs/ alongside the app. The
       # docs base is set to /psp-js/docs/ when GITHUB_ACTIONS is set (see

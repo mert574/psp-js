@@ -51,7 +51,7 @@ import { THREAD, KERNEL } from "./nids.js";
 kernel.register(THREAD.sceKernelCreateThread, handler);
 ```
 
-When verifying a NID, cross-reference both `ppsspp_niddb.xml` and the PPSSPP `sce*.cpp` source (the source wins on conflict). Run `npx tsx tools/find-dup-nids.ts` to check for duplicate values.
+`ppsspp_niddb.xml` indexes the constants in `src/kernel/nids.ts`. Regenerate it with `npm run nids:generate`; check hardware behavior against the reference source when needed. Run `npx tsx tools/find-dup-nids.ts` to check for duplicate values.
 
 ## register vs stub
 

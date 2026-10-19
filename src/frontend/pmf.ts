@@ -1,8 +1,8 @@
 /**
  * Audio transcoding for PSP media files.
  *
- * AT3 (ATRAC3) is a proprietary Sony codec not supported by libav.js pre-built
- * variants. We use @ffmpeg/ffmpeg (full FFmpeg WASM) as a fallback for audio.
+ * ATRAC3 audio is decoded by the separately licensed FFmpeg WebAssembly core.
+ * Runtime license and source: public/licenses/.
  */
 
 import { FFmpeg } from "@ffmpeg/ffmpeg";

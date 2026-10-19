@@ -1,3 +1,5 @@
+// Rijndael implementation by Vincent Rijmen, Antoon Bosselaers, and Paulo Barreto.
+// Public-domain declaration and disclaimer: ../../LICENSES/rijndael-public-domain.txt
 /**
  * AES-128 (Rijndael) — faithful port of PPSSPP ext/libkirk/AES.c
  * Supports: key setup, single-block encrypt/decrypt, CBC encrypt/decrypt, CMAC.

@@ -23,7 +23,7 @@ import { MpegMediaDecoder } from "../media/mpeg-decoder.js";
 import { packRgbaToFrame } from "../media/frame-pack.js";
 import { decodePsmfAudioToPcm } from "../audio/atrac-decoder.js";
 
-// Real video decode is browser-only (libav.js/WASM). In Node (tests, headless
+// Real video decode is browser-only (WebCodecs). In Node (tests, headless
 // tools) we skip it and keep the placeholder black-frame path.
 const CAN_DECODE = typeof window !== "undefined";
 

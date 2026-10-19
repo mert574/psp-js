@@ -7,3 +7,20 @@ docs/.vitepress/cache/
 test/fixtures/
 public/*.iso
 public/Duke3D/
+
+# Local game/firmware/font inputs are never source assets.
+*.iso
+*.ISO
+*.cso
+*.CSO
+*.pbp
+*.PBP
+*.prx
+*.PRX
+*.pgf
+*.PGF
+!public/flash0/font/ltn*.pgf
+*.pspstate
+.env
+.env.*
+!.env.example

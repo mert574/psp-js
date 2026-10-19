@@ -1,12 +1,10 @@
-/**
- * amctrl — PGD decryption. Faithful port of PPSSPP ext/libkirk/amctrl.c
+/** PGD authentication and counter-stream decoding using AES-CMAC and CBC.
+ * Format constants are separated from the implementation. No shared KIRK
+ * workspace or streaming-MAC scratch-buffer pipeline is used here.
  */
-
-import { aesCreateCtx, aesSetKey, aesEncryptBlock } from "./aes.js";
-import { type KirkState, kirkSceUtilsBufferCopyWithRange } from "./kirk.js";
-
-// ── Constants from amctrl.c ──────────────────────────────────────────
-
+import { aesCreateCtx, aesSetKey, aesCbcEncrypt, aesCbcDecrypt, aesCmac } from "./aes.js";
+import { type KirkState } from "./kirk.js";
+import { keyvault } from "./kirk-keys.js";
 const loc_1CD4 = new Uint8Array([0xe3, 0x50, 0xed, 0x1d, 0x91, 0x0a, 0x1f, 0xd0, 0x29, 0xbb, 0x1c, 0x3e, 0xf3, 0x40, 0x77, 0xfb]);
 const loc_1CE4 = new Uint8Array([0x13, 0x5f, 0xa4, 0x7c, 0xab, 0x39, 0x5b, 0xa4, 0x76, 0xb8, 0xcc, 0xa9, 0x8f, 0x3a, 0x04, 0x45]);
 const loc_1CF4 = new Uint8Array([0x67, 0x8d, 0x7f, 0xa3, 0x2a, 0x9c, 0xa0, 0xd1, 0x50, 0x8a, 0xd8, 0x38, 0x5e, 0x4b, 0x01, 0x7e]);
@@ -22,363 +20,6 @@ const key_357C = new Uint8Array([
 
 const key_363C = new Uint8Array([0x38, 0x20, 0xd0, 0x11, 0x07, 0xa3, 0xff, 0x3e, 0x0a, 0x4c, 0x20, 0x85, 0x39, 0x10, 0xb5, 0x54]);
 
-// ── Helpers ──────────────────────────────────────────────────────────
-
-function readU32LE(buf: Uint8Array, off: number): number {
-  return (buf[off]! | (buf[off + 1]! << 8) | (buf[off + 2]! << 16) | (buf[off + 3]! << 24)) >>> 0;
-}
-
-function writeU32LE(buf: Uint8Array, off: number, val: number): void {
-  buf[off] = val & 0xff;
-  buf[off + 1] = (val >>> 8) & 0xff;
-  buf[off + 2] = (val >>> 16) & 0xff;
-  buf[off + 3] = (val >>> 24) & 0xff;
-}
-
-// ── MAC_KEY / CIPHER_KEY ─────────────────────────────────────────────
-
-interface MacKey {
-  type: number;
-  key: Uint8Array;  // 16
-  pad: Uint8Array;  // 16
-  padSize: number;
-}
-
-interface CipherKey {
-  type: number;
-  seed: number;
-  key: Uint8Array;  // 16
-}
-
-// ── Internal kirk wrappers (matching amctrl.c do_kirk4/7/kirk5/kirk8/kirk14) ──
-
-function doKirk4(kirk: KirkState, buf: Uint8Array, size: number, type: number): number {
-  // Write KIRK_AES128CBC_HEADER at buf[0..19]
-  writeU32LE(buf, 0, 4);      // mode = KIRK_MODE_ENCRYPT_CBC
-  writeU32LE(buf, 4, 0);
-  writeU32LE(buf, 8, 0);
-  writeU32LE(buf, 12, type);  // keyseed
-  writeU32LE(buf, 16, size);  // data_size
-  const ret = kirkSceUtilsBufferCopyWithRange(kirk, buf, size + 0x14, buf, size, 4);
-  return ret ? 0x80510311 : 0;
-}
-
-function doKirk7(kirk: KirkState, buf: Uint8Array, size: number, type: number): number {
-  writeU32LE(buf, 0, 5);      // mode = KIRK_MODE_DECRYPT_CBC
-  writeU32LE(buf, 4, 0);
-  writeU32LE(buf, 8, 0);
-  writeU32LE(buf, 12, type);
-  writeU32LE(buf, 16, size);
-  const ret = kirkSceUtilsBufferCopyWithRange(kirk, buf, size + 0x14, buf, size, 7);
-  return ret ? 0x80510311 : 0;
-}
-
-function kirk5(kirk: KirkState, buf: Uint8Array, size: number): number {
-  writeU32LE(buf, 0, 4);
-  writeU32LE(buf, 4, 0);
-  writeU32LE(buf, 8, 0);
-  writeU32LE(buf, 12, 0x0100);
-  writeU32LE(buf, 16, size);
-  const ret = kirkSceUtilsBufferCopyWithRange(kirk, buf, size + 0x14, buf, size, 5);
-  return ret ? 0x80510312 : 0;
-}
-
-function kirk8(kirk: KirkState, buf: Uint8Array, size: number): number {
-  writeU32LE(buf, 0, 5);
-  writeU32LE(buf, 4, 0);
-  writeU32LE(buf, 8, 0);
-  writeU32LE(buf, 12, 0x0100);
-  writeU32LE(buf, 16, size);
-  const ret = kirkSceUtilsBufferCopyWithRange(kirk, buf, size + 0x14, buf, size, 8);
-  return ret ? 0x80510312 : 0;
-}
-
-function kirk14(kirk: KirkState, buf: Uint8Array): number {
-  const ret = kirkSceUtilsBufferCopyWithRange(kirk, buf, 0x14, new Uint8Array(0), 0, 14);
-  return ret ? 0x80510315 : 0;
-}
-
-// ── sub_158: encrypt buf and update key (amctrl.c:119-135) ───────────
-
-function sub158(kirk: KirkState, buf: Uint8Array, size: number, key: Uint8Array, keyType: number): number {
-  for (let i = 0; i < 16; i++) buf[0x14 + i] = buf[0x14 + i]! ^ key[i]!;
-  const ret = doKirk4(kirk, buf, size, keyType);
-  if (ret) return ret;
-  key.set(buf.subarray(size + 4, size + 4 + 16));
-  return 0;
-}
-
-// ── sceDrmBBMacInit/Update/Final/Final2/getkey ───────────────────────
-
-function sceDrmBBMacInit(mkey: MacKey, type: number): number {
-  mkey.type = type;
-  mkey.padSize = 0;
-  mkey.key.fill(0);
-  mkey.pad.fill(0);
-  return 0;
-}
-
-function sceDrmBBMacUpdate(kirk: KirkState, mkey: MacKey, buf: Uint8Array, bufOff: number, size: number): number {
-  if (mkey.padSize > 16) return 0x80510302;
-
-  if (mkey.padSize + size <= 16) {
-    mkey.pad.set(buf.subarray(bufOff, bufOff + size), mkey.padSize);
-    mkey.padSize += size;
-    return 0;
-  }
-
-  const kbuf = kirk.kirk_buf;
-  kbuf.set(mkey.pad.subarray(0, mkey.padSize), 0x14);
-
-  let p = mkey.padSize;
-  mkey.padSize = (mkey.padSize + size) & 0x0f;
-  if (mkey.padSize === 0) mkey.padSize = 16;
-  size -= mkey.padSize;
-  mkey.pad.set(buf.subarray(bufOff + size, bufOff + size + mkey.padSize));
-
-  const type = mkey.type === 2 ? 0x3a : 0x38;
-  let off = bufOff;
-  while (size > 0) {
-    const ksize = (size + p >= 0x0800) ? 0x0800 : size + p;
-    kbuf.set(buf.subarray(off, off + ksize - p), 0x14 + p);
-    const ret = sub158(kirk, kbuf, ksize, mkey.key, type);
-    if (ret) return ret;
-    size -= (ksize - p);
-    off += ksize - p;
-    p = 0;
-  }
-  return 0;
-}
-
-function sceDrmBBMacFinal(kirk: KirkState, mkey: MacKey, out: Uint8Array, outOff: number, vkey: Uint8Array | null): number {
-  if (mkey.padSize > 16) return 0x80510302;
-
-  const code = mkey.type === 2 ? 0x3a : 0x38;
-  const kbuf = kirk.kirk_buf;
-
-  kbuf.fill(0, 0x14, 0x14 + 16);
-  let ret = doKirk4(kirk, kbuf, 16, code);
-  if (ret) return ret;
-
-  const tmp = new Uint8Array(16);
-  tmp.set(kbuf.subarray(0x14, 0x14 + 16));
-
-  // left shift tmp 1 bit
-  let t0 = (tmp[0]! & 0x80) ? 0x87 : 0;
-  for (let i = 0; i < 15; i++) {
-    tmp[i] = ((tmp[i]! << 1) | (tmp[i + 1]! >>> 7)) & 0xff;
-  }
-  tmp[15] = ((tmp[15]! << 1) ^ t0) & 0xff;
-
-  if (mkey.padSize < 16) {
-    // left shift tmp 1 bit again
-    t0 = (tmp[0]! & 0x80) ? 0x87 : 0;
-    for (let i = 0; i < 15; i++) {
-      tmp[i] = ((tmp[i]! << 1) | (tmp[i + 1]! >>> 7)) & 0xff;
-    }
-    tmp[15] = ((tmp[15]! << 1) ^ t0) & 0xff;
-
-    mkey.pad[mkey.padSize] = 0x80;
-    if (mkey.padSize + 1 < 16) mkey.pad.fill(0, mkey.padSize + 1, 16);
-  }
-
-  for (let i = 0; i < 16; i++) mkey.pad[i] = mkey.pad[i]! ^ tmp[i]!;
-
-  kbuf.set(mkey.pad, 0x14);
-  const tmp1 = new Uint8Array(16);
-  tmp1.set(mkey.key);
-
-  ret = sub158(kirk, kbuf, 0x10, tmp1, code);
-  if (ret) return ret;
-
-  for (let i = 0; i < 0x10; i++) tmp1[i] = tmp1[i]! ^ loc_1CD4[i]!;
-
-  if (mkey.type === 2) {
-    kbuf.set(tmp1, 0x14);
-    ret = kirk5(kirk, kbuf, 0x10);
-    if (ret) return ret;
-    ret = doKirk4(kirk, kbuf, 0x10, code);
-    if (ret) return ret;
-    tmp1.set(kbuf.subarray(0x14, 0x14 + 16));
-  }
-
-  if (vkey) {
-    for (let i = 0; i < 0x10; i++) tmp1[i] = tmp1[i]! ^ vkey[i]!;
-    kbuf.set(tmp1, 0x14);
-    ret = doKirk4(kirk, kbuf, 0x10, code);
-    if (ret) return ret;
-    tmp1.set(kbuf.subarray(0x14, 0x14 + 16));
-  }
-
-  out.set(tmp1, outOff);
-  mkey.key.fill(0);
-  mkey.pad.fill(0);
-  mkey.padSize = 0;
-  mkey.type = 0;
-  return 0;
-}
-
-function sceDrmBBMacFinal2(kirk: KirkState, mkey: MacKey, expected: Uint8Array, expectedOff: number, vkey: Uint8Array | null): number {
-  const type = mkey.type;
-  const tmp = new Uint8Array(16);
-  const ret = sceDrmBBMacFinal(kirk, mkey, tmp, 0, vkey);
-  if (ret) return ret;
-
-  const kbuf = kirk.kirk_buf;
-  if (type === 3) {
-    kbuf.set(expected.subarray(expectedOff, expectedOff + 0x10), 0x14);
-    doKirk7(kirk, kbuf, 0x10, 0x63);
-  } else {
-    kbuf.set(expected.subarray(expectedOff, expectedOff + 0x10));
-  }
-
-  for (let i = 0; i < 0x10; i++) {
-    if (kbuf[i] !== tmp[i]) return 0x80510300;
-  }
-  return 0;
-}
-
-function bbmacGetkey(kirk: KirkState, mkey: MacKey, bbmac: Uint8Array, bbmacOff: number, vkey: Uint8Array): number {
-  const type = mkey.type;
-  const tmp = new Uint8Array(16);
-  const ret = sceDrmBBMacFinal(kirk, mkey, tmp, 0, null);
-  if (ret) return ret;
-
-  const kbuf = kirk.kirk_buf;
-  if (type === 3) {
-    kbuf.set(bbmac.subarray(bbmacOff, bbmacOff + 0x10), 0x14);
-    doKirk7(kirk, kbuf, 0x10, 0x63);
-  } else {
-    kbuf.set(bbmac.subarray(bbmacOff, bbmacOff + 0x10));
-  }
-
-  const tmp1 = new Uint8Array(16);
-  tmp1.set(kbuf.subarray(0, 16));
-  kbuf.set(tmp1, 0x14);
-
-  const code = type === 2 ? 0x3a : 0x38;
-  doKirk7(kirk, kbuf, 0x10, code);
-
-  for (let i = 0; i < 0x10; i++) vkey[i] = tmp[i]! ^ kbuf[i]!;
-  return 0;
-}
-
-// ── sub_1F8: decrypt buf and XOR with key (amctrl.c:378-398) ─────────
-
-function sub1F8(kirk: KirkState, buf: Uint8Array, size: number, key: Uint8Array, keyType: number): number {
-  const tmp = new Uint8Array(16);
-  tmp.set(buf.subarray(size + 0x14 - 16, size + 0x14));
-  const ret = doKirk7(kirk, buf, size, keyType);
-  if (ret) return ret;
-  for (let i = 0; i < 16; i++) buf[i] = buf[i]! ^ key[i]!;
-  key.set(tmp);
-  return 0;
-}
-
-// ── sub_428: cipher update helper (amctrl.c:401-447) ─────────────────
-
-function sub428(kirk: KirkState, kbuf: Uint8Array, dbuf: Uint8Array, dbufOff: number, size: number, ckey: CipherKey): number {
-  kbuf.set(ckey.key, 0x14);
-  for (let i = 0; i < 16; i++) kbuf[0x14 + i] = kbuf[0x14 + i]! ^ loc_1CF4[i]!;
-
-  let ret: number;
-  if (ckey.type === 2)
-    ret = kirk8(kirk, kbuf, 16);
-  else
-    ret = doKirk7(kirk, kbuf, 16, 0x39);
-  if (ret) return ret;
-
-  for (let i = 0; i < 16; i++) kbuf[i] = kbuf[i]! ^ loc_1CE4[i]!;
-
-  const tmp2 = new Uint8Array(16);
-  tmp2.set(kbuf.subarray(0, 16));
-
-  const tmp1 = new Uint8Array(16);
-  if (ckey.seed === 1) {
-    tmp1.fill(0);
-  } else {
-    tmp1.set(tmp2);
-    writeU32LE(tmp1, 0x0c, ckey.seed - 1);
-  }
-
-  for (let i = 0; i < size; i += 16) {
-    kbuf.set(tmp2.subarray(0, 12), 0x14 + i);
-    writeU32LE(kbuf, 0x14 + i + 12, ckey.seed);
-    ckey.seed += 1;
-  }
-
-  ret = sub1F8(kirk, kbuf, size, tmp1, 0x63);
-  if (ret) return ret;
-
-  for (let i = 0; i < size; i++) dbuf[dbufOff + i] = dbuf[dbufOff + i]! ^ kbuf[i]!;
-  return 0;
-}
-
-// ── sceDrmBBCipherInit/Update/Final ──────────────────────────────────
-
-function sceDrmBBCipherInit(kirk: KirkState, ckey: CipherKey, type: number, mode: number, headerKey: Uint8Array, hkOff: number, versionKey: Uint8Array | null, seed: number): number {
-  const kbuf = kirk.kirk_buf;
-  ckey.type = type;
-
-  if (mode === 2) {
-    // decrypt mode
-    ckey.seed = seed + 1;
-    for (let i = 0; i < 16; i++) ckey.key[i] = headerKey[hkOff + i]!;
-    if (versionKey) {
-      for (let i = 0; i < 16; i++) ckey.key[i] = ckey.key[i]! ^ versionKey[i]!;
-    }
-    return 0;
-  } else if (mode === 1) {
-    // encrypt mode
-    ckey.seed = 1;
-    let ret = kirk14(kirk, kbuf);
-    if (ret) return ret;
-    const kb = kbuf.subarray(0x14);
-    kb.set(kbuf.subarray(0, 0x10));
-    kb.fill(0, 0x0c, 0x10);
-
-    if (ckey.type === 2) {
-      for (let i = 0; i < 16; i++) kb[i] = kb[i]! ^ loc_1CE4[i]!;
-      ret = kirk5(kirk, kbuf, 0x10);
-      for (let i = 0; i < 16; i++) kb[i] = kb[i]! ^ loc_1CF4[i]!;
-    } else {
-      for (let i = 0; i < 16; i++) kb[i] = kb[i]! ^ loc_1CE4[i]!;
-      ret = doKirk4(kirk, kbuf, 0x10, 0x39);
-      for (let i = 0; i < 16; i++) kb[i] = kb[i]! ^ loc_1CF4[i]!;
-    }
-    if (ret) return ret;
-
-    ckey.key.set(kb.subarray(0, 0x10));
-    headerKey.set(kb.subarray(0, 0x10), hkOff);
-
-    if (versionKey) {
-      for (let i = 0; i < 16; i++) ckey.key[i] = ckey.key[i]! ^ versionKey[i]!;
-    }
-    return 0;
-  }
-  return 0;
-}
-
-function sceDrmBBCipherUpdate(kirk: KirkState, ckey: CipherKey, data: Uint8Array, dataOff: number, size: number): number {
-  let p = 0;
-  while (size > 0) {
-    const dsize = size >= 0x0800 ? 0x0800 : size;
-    const ret = sub428(kirk, kirk.kirk_buf, data, dataOff + p, dsize, ckey);
-    if (ret) return ret;
-    size -= dsize;
-    p += dsize;
-  }
-  return 0;
-}
-
-function sceDrmBBCipherFinal(ckey: CipherKey): number {
-  ckey.key.fill(0);
-  ckey.type = 0;
-  ckey.seed = 0;
-  return 0;
-}
-
-// ── PGD_DESC ─────────────────────────────────────────────────────────
 
 export interface PgdDesc {
   vkey: Uint8Array;    // 16
@@ -399,122 +40,89 @@ export interface PgdDesc {
   fileOffset: number;
 }
 
-// ── pgd_open / pgd_decrypt_block / pgd_close ─────────────────────────
-
-export function pgdOpen(kirk: KirkState, pgdBuf: Uint8Array, pgdBufOff: number, pgdFlag: number, pgdVkey: Uint8Array | null): PgdDesc | null {
-  const pgd: PgdDesc = {
-    vkey: new Uint8Array(16),
-    dkey: new Uint8Array(16),
-    openFlag: 0,
-    keyIndex: readU32LE(pgdBuf, pgdBufOff + 4),
-    drmType: readU32LE(pgdBuf, pgdBufOff + 8),
-    macType: 0,
-    cipherType: 0,
-    dataSize: 0,
-    alignSize: 0,
-    blockSize: 0,
-    blockNr: 0,
-    dataOffset: 0,
-    tableOffset: 0,
-    blockBuf: new Uint8Array(0),
-    currentBlock: -1,
-    fileOffset: 0,
-  };
-
-  if (pgd.drmType === 1) {
-    pgd.macType = 1;
-    pgdFlag |= 4;
-    if (pgd.keyIndex > 1) {
-      pgd.macType = 3;
-      pgdFlag |= 8;
-    }
-    pgd.cipherType = 1;
-  } else {
-    pgd.macType = 2;
-    pgd.cipherType = 2;
-  }
-  pgd.openFlag = pgdFlag;
-
-  // select fixed key
-  let fkey: Uint8Array | null = null;
-  if (pgdFlag & 2) fkey = dnas_key1A90;
-  if (pgdFlag & 1) fkey = dnas_key1AA0;
-  if (!fkey) return null;
-
-  // MAC_0x80 check
-  const mkey: MacKey = { type: 0, key: new Uint8Array(16), pad: new Uint8Array(16), padSize: 0 };
-  sceDrmBBMacInit(mkey, pgd.macType);
-  sceDrmBBMacUpdate(kirk, mkey, pgdBuf, pgdBufOff, 0x80);
-  let ret = sceDrmBBMacFinal2(kirk, mkey, pgdBuf, pgdBufOff + 0x80, fkey);
-  if (ret) return null;
-
-  // MAC_0x70
-  sceDrmBBMacInit(mkey, pgd.macType);
-  sceDrmBBMacUpdate(kirk, mkey, pgdBuf, pgdBufOff, 0x70);
-  if (pgdVkey) {
-    ret = sceDrmBBMacFinal2(kirk, mkey, pgdBuf, pgdBufOff + 0x70, pgdVkey);
-    if (ret) return null;
-    pgd.vkey.set(pgdVkey);
-  } else {
-    bbmacGetkey(kirk, mkey, pgdBuf, pgdBufOff + 0x70, pgd.vkey);
-  }
-
-  // decrypt PGD descriptor (0x30 bytes at offset 0x30)
-  const ckey: CipherKey = { type: 0, seed: 0, key: new Uint8Array(16) };
-  sceDrmBBCipherInit(kirk, ckey, pgd.cipherType, 2, pgdBuf, pgdBufOff + 0x10, pgd.vkey, 0);
-  sceDrmBBCipherUpdate(kirk, ckey, pgdBuf, pgdBufOff + 0x30, 0x30);
-  sceDrmBBCipherFinal(ckey);
-
-  pgd.dataSize = readU32LE(pgdBuf, pgdBufOff + 0x44);
-  pgd.blockSize = readU32LE(pgdBuf, pgdBufOff + 0x48);
-  pgd.dataOffset = readU32LE(pgdBuf, pgdBufOff + 0x4c);
-  pgd.dkey.set(pgdBuf.subarray(pgdBufOff + 0x30, pgdBufOff + 0x30 + 16));
-
-  pgd.alignSize = (pgd.dataSize + 15) & ~15;
-  pgd.tableOffset = pgd.dataOffset + pgd.alignSize;
-  pgd.blockNr = ((pgd.alignSize + pgd.blockSize - 1) & ~(pgd.blockSize - 1)) / pgd.blockSize;
-
-  pgd.fileOffset = 0;
-  pgd.currentBlock = -1;
-  pgd.blockBuf = new Uint8Array(pgd.blockSize * 2);
-
-  return pgd;
+const read32 = (data: Uint8Array, at: number): number => new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(at, true);
+const xor = (left: Uint8Array, right: Uint8Array): Uint8Array => left.map((byte, i) => byte ^ right[i]!);
+function cbc(data: Uint8Array, slot: number, decrypt: boolean): Uint8Array {
+  const cipher = aesCreateCtx();
+  aesSetKey(cipher, keyvault[slot]!, 0, 128);
+  const output = new Uint8Array(data.length);
+  if (decrypt) aesCbcDecrypt(cipher, data, 0, output, 0, data.length);
+  else aesCbcEncrypt(cipher, data, 0, output, 0, data.length);
+  return output;
 }
-
+function tag(data: Uint8Array, versionKey: Uint8Array | null): Uint8Array {
+  const cipher = aesCreateCtx();
+  aesSetKey(cipher, keyvault[0x38]!, 0, 128);
+  const digest = new Uint8Array(16);
+  aesCmac(cipher, data, 0, data.length, digest, 0);
+  const masked = xor(digest, loc_1CD4);
+  return versionKey ? cbc(xor(masked, versionKey), 0x38, false) : masked;
+}
+function storedTag(value: Uint8Array, mode: number): Uint8Array {
+  return mode === 3 ? cbc(value, 0x63, true) : value;
+}
+function matches(left: Uint8Array, right: Uint8Array): boolean {
+  return left.length === right.length && left.every((byte, i) => byte === right[i]);
+}
+function transform(data: Uint8Array, headerKey: Uint8Array, versionKey: Uint8Array, firstBlock: number): Uint8Array {
+  const nonce = xor(cbc(xor(xor(headerKey, versionKey), loc_1CF4), 0x39, true), loc_1CE4);
+  const counters = new Uint8Array(data.length);
+  const view = new DataView(counters.buffer);
+  for (let at = 0; at < data.length; at += 16) {
+    counters.set(nonce.subarray(0, 12), at);
+    view.setUint32(at + 12, firstBlock + at / 16 + 1, true);
+  }
+  const stream = cbc(counters, 0x63, true);
+  if (firstBlock !== 0) {
+    const previous = nonce.slice();
+    new DataView(previous.buffer).setUint32(12, firstBlock, true);
+    for (let i = 0; i < 16; i++) stream[i]! ^= previous[i]!;
+  }
+  return xor(data, stream);
+}
+export function pgdOpen(kirk: KirkState, buffer: Uint8Array, offset: number, flags: number, supplied: Uint8Array | null): PgdDesc | null {
+  if (!kirk.is_initialized || offset < 0 || offset + 0x90 > buffer.length || (supplied && supplied.length !== 16)) return null;
+  const header = buffer.slice(offset, offset + 0x90);
+  const drmType = read32(header, 8);
+  if (drmType !== 1) return null; // Fuse-bound PGD keys are not implemented.
+  const keyIndex = read32(header, 4);
+  const macType = keyIndex > 1 ? 3 : 1;
+  const fixed = flags & 1 ? dnas_key1AA0 : flags & 2 ? dnas_key1A90 : null;
+  if (!fixed || !matches(tag(header.subarray(0, 0x80), fixed), storedTag(header.subarray(0x80, 0x90), macType))) return null;
+  const second = storedTag(header.subarray(0x70, 0x80), macType);
+  const vkey = supplied?.slice() ?? xor(tag(header.subarray(0, 0x70), null), cbc(second, 0x38, true));
+  if (supplied && !matches(tag(header.subarray(0, 0x70), supplied), second)) return null;
+  const descriptor = transform(header.subarray(0x30, 0x60), header.subarray(0x10, 0x20), vkey, 0);
+  const dataSize = read32(descriptor, 0x14);
+  const blockSize = read32(descriptor, 0x18);
+  const dataOffset = read32(descriptor, 0x1c);
+  if (blockSize === 0 || blockSize % 16 || blockSize > 16 * 1024 * 1024) return null;
+  const alignSize = Math.ceil(dataSize / 16) * 16;
+  buffer.set(descriptor, offset + 0x30);
+  return {
+    vkey, dkey: descriptor.slice(0, 16), openFlag: flags | (macType === 3 ? 12 : 4), keyIndex, drmType,
+    macType, cipherType: 1, dataSize, alignSize, blockSize, blockNr: Math.ceil(alignSize / blockSize),
+    dataOffset, tableOffset: dataOffset + alignSize, blockBuf: new Uint8Array(blockSize * 2), currentBlock: -1, fileOffset: 0,
+  };
+}
 export function pgdDecryptBlock(kirk: KirkState, pgd: PgdDesc, block: number): number {
-  const blockOffset = block * pgd.blockSize;
-  const ckey: CipherKey = { type: 0, seed: 0, key: new Uint8Array(16) };
-  sceDrmBBCipherInit(kirk, ckey, pgd.cipherType, 2, pgd.dkey, 0, pgd.vkey, blockOffset >>> 4);
-  sceDrmBBCipherUpdate(kirk, ckey, pgd.blockBuf, 0, pgd.blockSize);
-  sceDrmBBCipherFinal(ckey);
+  if (!kirk.is_initialized || pgd.cipherType !== 1 || block < 0 || !Number.isInteger(block) || pgd.blockSize % 16) return -1;
+  const decoded = transform(pgd.blockBuf.subarray(0, pgd.blockSize), pgd.dkey, pgd.vkey, block * pgd.blockSize / 16);
+  pgd.blockBuf.set(decoded);
   return pgd.blockSize;
 }
-
-// ── sceNpDrmGetFixedKey (amctrl.c:556-592) ───────────────────────────
-
-export function sceNpDrmGetFixedKey(kirk: KirkState, key: Uint8Array, keyOff: number, npstr: string, type: number): number {
-  if ((type & 0x01000000) === 0) return 0x80550901;
-  type &= 0x000000ff;
-
-  const strbuf = new Uint8Array(0x30);
-  const enc = new TextEncoder();
-  const strBytes = enc.encode(npstr);
-  strbuf.set(strBytes.subarray(0, Math.min(strBytes.length, 0x30)));
-
-  const mkey: MacKey = { type: 0, key: new Uint8Array(16), pad: new Uint8Array(16), padSize: 0 };
-  let ret = sceDrmBBMacInit(mkey, 1);
-  if (ret) return ret;
-  ret = sceDrmBBMacUpdate(kirk, mkey, strbuf, 0, 0x30);
-  if (ret) return ret;
-  ret = sceDrmBBMacFinal(kirk, mkey, key, keyOff, key_363C);
-  if (ret) return 0x80550902;
-
-  if (type === 0) return 0;
-  if (type > 3) return 0x80550901;
-  const off = (type - 1) * 16;
-
-  const akey = aesCreateCtx();
-  aesSetKey(akey, key_357C, off, 128);
-  aesEncryptBlock(akey, key, keyOff, key, keyOff);
+export function sceNpDrmGetFixedKey(kirk: KirkState, output: Uint8Array, offset: number, name: string, type: number): number {
+  if (!(type & 0x1000000)) return 0x80550901;
+  if (!kirk.is_initialized) return 0x80510311;
+  const input = new Uint8Array(48);
+  input.set(new TextEncoder().encode(name).subarray(0, 48));
+  const derived = tag(input, key_363C);
+  output.set(derived, offset);
+  const variant = type & 0xff;
+  if (variant === 0) return 0;
+  if (variant > 3) return 0x80550901;
+  const cipher = aesCreateCtx();
+  aesSetKey(cipher, key_357C, (variant - 1) * 16, 128);
+  aesCbcEncrypt(cipher, derived, 0, output, offset, 16);
   return 0;
 }

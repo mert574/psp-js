@@ -1,3 +1,5 @@
+// Rijndael implementation by Vincent Rijmen, Antoon Bosselaers, and Paulo Barreto.
+// Public-domain declaration and disclaimer: ../../LICENSES/rijndael-public-domain.txt
 /**
  * AES (Rijndael) lookup tables — auto-generated from PPSSPP ext/libkirk/AES.c
  * Do not edit by hand. Regenerate with: npx tsx tools/extract-aes-tables.ts

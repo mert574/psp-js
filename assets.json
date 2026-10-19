@@ -1,0 +1,327 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "path": "docs/public/architecture.gif",
+      "sha256": "40cc128e2eefbc21e2699ff2d026bd812bc8b88a228509cd995bb3420409e970",
+      "source": "Original project architecture illustration",
+      "license": "MIT",
+      "notice": "LICENSES/illustration-MIT.txt"
+    },
+    {
+      "path": "src/frontend/fonts/Inconsolata.ttf",
+      "sha256": "23ded25b447074d00659392bf9b1123d89df55cb07b0ad9bfef3366d199b5fcb",
+      "source": "UI font distributed with the adjacent OFL notice",
+      "license": "OFL-1.1",
+      "notice": "src/frontend/fonts/Inconsolata-OFL.txt"
+    },
+    {
+      "path": "src/frontend/fonts/Saira.ttf",
+      "sha256": "9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde",
+      "source": "UI font distributed with the adjacent OFL notice",
+      "license": "OFL-1.1",
+      "notice": "src/frontend/fonts/OFL.txt"
+    },
+    {
+      "path": "docs/public/screenshots/demo-cladun.jpg",
+      "sha256": "5c96ed68aa07c2947b28c002144117eb90309e36c6d9d32103ff02d7dd2c1d20",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/demo-metal-slug.jpg",
+      "sha256": "fe6f0cbebc7daace2a44974c645af701cf35fd3805e88023222449da65787a69",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/demo-ridge-racer.jpg",
+      "sha256": "65a970f47d8a25747ce490e64358918d253afe0f9d65bdb8b1c9021a3359a42a",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/landing.png",
+      "sha256": "9e7b71d8cded918738d19729e2b279b7ac839bf327d0322cf044f86a0f3f9d0b",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/options.png",
+      "sha256": "9674ecc64a7a517ced39744fad7f2c4c42af22016f6a3624e892be860a8c5b53",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-ge-draw-stats.png",
+      "sha256": "d8ebad4c8f3968eef22679c24b01905eebd726e2aa7d75962fc61ca7d65c564e",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-ge.png",
+      "sha256": "fd9654a869cae46b1804637c164d72e714d9b850006247fafb47748679f26e54",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-logs.png",
+      "sha256": "fa0d273516e14261787b2ccf72565627bcaadb4d43c2c1f2cee07b2e52c4820c",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-memory.png",
+      "sha256": "e287afa19047e49032511f6ed0b3c8f870d986997e82f022353cb3f50f7369cd",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-performance.png",
+      "sha256": "ca90bc53861f9ca329cf246eca02d07d9658acdac0dabf09865974cdbb7024f7",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-save-data.png",
+      "sha256": "a761780b66152953502d14f566e9e2b1d2cc2a018601087fae9291953c5053e6",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-save-state.png",
+      "sha256": "b8a21a0223e007094473107733a2ea4fc1785e651de1d0097022192e2813ea95",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-stubs.png",
+      "sha256": "67a0b50336cd4cae31fc02c6f92f98488c8f7e5c6d7bc96eea5346b8edd6fdd5",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/screenshots/panel-threads.png",
+      "sha256": "350c96ec714bf5d3b8da0ec1e3273c3a8f0267cac6a43cb849742275edde6ac3",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/videos/cladun.mp4",
+      "sha256": "c4088b88fededbc51a416a4bd783c118441f367a24267755b96b181525a0f2cd",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/videos/metal-slug.mp4",
+      "sha256": "87ea5a92f1d2cff052fada111af80e24bca03e8c6cce9113d3ab1abd35212488",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "docs/public/videos/ridge-racer.mp4",
+      "sha256": "7a71cd424fc2919f0607be98f491df9fbc13efefd68a9f26620490488b12f02e",
+      "source": "Existing project demonstration capture, retained at maintainer request",
+      "license": "Third-party game/media rights retained; excluded from MIT code license",
+      "notice": "ASSETS.md"
+    },
+    {
+      "path": "public/flash0/font/ltn0.pgf",
+      "sha256": "cf8a038112b81930bf5991e76669f44830602447628263e7d09b6ba8e4725ac4",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn1.pgf",
+      "sha256": "128b89de195a65678fabafe251d8be4e91199cae867b47a5c210995f2942c9b8",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn2.pgf",
+      "sha256": "0862e70ef452f40fdd712f588abe2091132ddd9a76f0267731aad69a5c5a7f33",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn3.pgf",
+      "sha256": "d200d5e6b937aec2931bdf5a6bfb55c642cfa7e94bdf7fac015c2c2ff35dbb25",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn4.pgf",
+      "sha256": "1e265e36011a2e37c0b84c4438600fc8c2f68ff2fa9369a70de2313f37827c6e",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn5.pgf",
+      "sha256": "0bc4a71ad7b0c589f97407e4bea01bde301841ab0617038b43e54c8fb60dc937",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn6.pgf",
+      "sha256": "a4aa9ec5ce06cf27dc9ef04ac2645a572648759124ccf12c507be75b76369768",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn7.pgf",
+      "sha256": "ec5cf93e3ff5c186e6347c9593c6319cb8c5afd7af7b01f31a8df7c91e4ec96e",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn8.pgf",
+      "sha256": "1b00d3862cb1d72d0dc4e88939c6584f9e4e97d916f4b92ece4898ab315dd51f",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn9.pgf",
+      "sha256": "986538c905e064c00586dbccfd4c608305fcba80b9c77de9b108f7c368f2e2a6",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn10.pgf",
+      "sha256": "1b00d3862cb1d72d0dc4e88939c6584f9e4e97d916f4b92ece4898ab315dd51f",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn11.pgf",
+      "sha256": "986538c905e064c00586dbccfd4c608305fcba80b9c77de9b108f7c368f2e2a6",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn12.pgf",
+      "sha256": "30f0c4bd26b3b5c48dbbcf101f94caf8583bf7e04f565e03cced4e99614c7ba1",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn13.pgf",
+      "sha256": "c11e27b5ac4f8335b8b30a3a33c0946400c092d00b95b8582c2bd74ca5aecf71",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn14.pgf",
+      "sha256": "d37d667992c18a2f6a50ef32dd2d6f5adbdf6e0b7cd3617fd276c6de900f6a01",
+      "source": "src/frontend/fonts/Saira.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/flash0/font/ltn15.pgf",
+      "sha256": "d575b71322c2bb99e6505a34361f0e5ae9d186c38800d5d514f7f4890e31a167",
+      "source": "src/frontend/fonts/Inconsolata.ttf via tools/generate-pgf-fonts.mjs",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/flash0/font/provenance.json",
+      "sha256": "7981eee082af5b7e21c42681a183e17f856296eec57b371f33f0b2139d8af7ce",
+      "source": "Generated source and conversion record",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/licenses/ffmpeg-core-GPL-2.0.txt",
+      "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+      "source": "FFmpeg 5.1.4 COPYING.GPLv2",
+      "license": "GPL-2.0 license text",
+      "notice": "LICENSES/FFmpeg-GPL-2.0.txt"
+    },
+    {
+      "path": "public/licenses/ffmpeg-wasm-MIT.txt",
+      "sha256": "27fd38ee4bba8f51d4b644ccd128a5d09a41d2ea7b092c96b336631d07025f5c",
+      "source": "ffmpeg.wasm 71aa99d37c02a7b4c435275ca9ef50e612f6efa1 LICENSE",
+      "license": "MIT",
+      "notice": "LICENSES/ffmpeg-wasm-MIT.txt"
+    },
+    {
+      "path": "public/licenses/index.html",
+      "sha256": "278fffc3b92f97fe8f923700ecf4758ba77400f4a54a505f8a41ee9948055958",
+      "source": "Original project license index and runtime metadata",
+      "license": "MIT",
+      "notice": "LICENSE"
+    },
+    {
+      "path": "public/licenses/OFL-Mono.txt",
+      "sha256": "2491fa4545f3d45437b1416b569b852b6eda8e42e756353653fd85cab732b3a4",
+      "source": "Bundled font license notice",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Mono.txt"
+    },
+    {
+      "path": "public/licenses/OFL-Sans.txt",
+      "sha256": "be6a725adf507c9af2a6bd8c0225bfe97d76bb44d03f20bb8ee6f70ffebcb504",
+      "source": "Bundled font license notice",
+      "license": "OFL-1.1",
+      "notice": "public/flash0/font/OFL-Sans.txt"
+    },
+    {
+      "path": "public/licenses/psp-js-MIT.txt",
+      "sha256": "8b3faf6a1b4ead5c7334807393bd0893ef5ad6d159d0abc9e20d144cdcf0854e",
+      "source": "Original project license index and runtime metadata",
+      "license": "MIT",
+      "notice": "LICENSE"
+    },
+    {
+      "path": "public/licenses/rijndael-public-domain.txt",
+      "sha256": "4ffcf1eff35c37547e000caa4900d586e0bef9cccb93c90af7c6690b2cae36cd",
+      "source": "Rijndael original authors public-domain declaration",
+      "license": "Public-domain declaration",
+      "notice": "LICENSES/rijndael-public-domain.txt"
+    },
+    {
+      "path": "public/licenses/runtime.json",
+      "sha256": "7db85536c9c17af620ff451859f6c2d2bd5a4844552dc54d1d6b6c0814d77f56",
+      "source": "Original project license index and runtime metadata",
+      "license": "MIT",
+      "notice": "LICENSE"
+    },
+    {
+      "path": "public/licenses/dependency-notices.txt",
+      "source": "Installed package license files, copied verbatim",
+      "license": "MIT AND BSD-3-Clause",
+      "notice": "public/licenses/dependency-notices.txt",
+      "sha256": "cb72b6f1d1f5eb1ca0a31da32e0b7dc66c493538c230fd002b64ace14c447ade"
+    }
+  ]
+}

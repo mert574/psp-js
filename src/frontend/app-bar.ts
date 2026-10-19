@@ -115,6 +115,7 @@ class AppBar extends LitElement {
         </a>
         <span class="tag">PSP emulator</span>
         <span class="spacer"></span>
+        <a class="link" href=${`${import.meta.env.BASE_URL}licenses/`} target="_blank" rel="noopener">Licenses</a>
         <a class="link" href="https://github.com/mert574/psp-js" target="_blank" rel="noopener">GitHub</a>
         <span class="clock" aria-label="Date and time">${this._clock}</span>
       </div>

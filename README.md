@@ -98,6 +98,6 @@ Tests run under vitest. `npx vitest run src/` covers the units (CPU, crypto, tim
 
 ## PPSSPP reference
 
-`ppsspp-reference/` is a submodule with the PPSSPP source. It's the ground truth for PSP behavior. When fixing a syscall, read the matching `Core/HLE/sce*.cpp` and match it instead of guessing. NIDs are checked against both `ppsspp_niddb.xml` and the source, and the source wins on conflict.
+`ppsspp-reference/` is a submodule with the PPSSPP source. It's the ground truth for PSP behavior. When fixing a syscall, read the matching `Core/HLE/sce*.cpp` and match it instead of guessing. `ppsspp_niddb.xml` is generated from the project's NID constants with `npm run nids:generate`. Check hardware behavior against the reference source when needed.
 
 See `CLAUDE.md` for the deeper architecture notes and conventions.

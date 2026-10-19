@@ -1,60 +1,51 @@
-# Licensing and implementation provenance
+# Source provenance
 
-## Status
+Original project code uses MIT. The maintainer describes PSP.js as an independent
+reimplementation, with PPSSPP consulted for PSP behavior. Reference comments alone
+are not treated as proof of copied code or as permission to copy it.
 
-The maintainer's intended project license is MIT. The maintainer states that the
-emulator was independently reimplemented, with PPSSPP consulted as a behavioral
-reference. That distinction matters: consulting a reference does not by itself
-establish that an implementation is a derivative of its source.
+The comparison baseline is PPSSPP
+[`ab1ee21996b78aaac1f82baa390990c8ce9a9936`](https://github.com/hrydgard/ppsspp/tree/ab1ee21996b78aaac1f82baa390990c8ce9a9936).
 
-However, the checked-in code and documentation contain explicit "port" statements
-and some implementation-specific matches. Those need a concrete provenance review
-before a blanket MIT license can be published. The original `package.json` ISC
-field is metadata, not evidence that these questions have been resolved. No GPL
-license has been applied by this preparation, and no upstream license notice has
-been removed or silently relabeled.
+## Current implementations
 
-## Reference baseline
+| Area | Review result |
+| --- | --- |
+| `src/memory/block-allocator.ts` | Replaced the linked-list implementation with an ordered interval array. Alignment, fixed-address allocation, coalescing and save-state format have regression coverage. |
+| `src/crypto/sha1.ts` | Replaced the SHA1.c-shaped implementation with a byte-buffer implementation of FIPS 180-4 section 6.1. Tests compare padding boundaries, sliced updates and a million-byte input with Node's crypto implementation. |
+| `src/crypto/kirk.ts`, `src/loader/kirk.ts` | Replaced the command implementation and private-packet wrapper. Removed the reference emulator's default seed string, filler bytes and PRNG constants. Random bytes now come from the host. CBC, CMAC authentication, in-place buffers and malformed input are tested. |
+| `src/crypto/amctrl.ts` | Replaced the shared-workspace helper pipeline with direct CMAC and counter-stream composition. Synthetic PGDs cover both supported MAC variants, supplied/derived keys and later-block decoding. Fixed-key outputs match the previous implementation on synthetic identifiers. |
+| `src/loader/prx-decrypter.ts` | Replaced generated transformation code with legacy/modern packet-layout pipelines. Synthetic encrypted files exercise all five supported layouts and altered-payload rejection. |
+| `src/audio/sas-core.ts` | Replaced the synthesizer with packet ADPCM decoding, an envelope state machine and a per-voice renderer. Eight synthetic PCM/VAG traces match the previous output across multiple grains and pitches. Undefined ADPCM predictors use zero coefficients instead of the reference's incidental table contents. |
+| `src/audio/atrac-ring.ts` | New bounded-ring accounting for the asynchronous audio loader, with wrap, EOF and frame-alignment tests. |
+| `src/kernel/psp-registry.ts` | Replaced the reference registry defaults with a generated tree describing the 16 bundled replacement fonts and synthetic zero usage counters. |
+| `src/frontend/wave-background.ts` | Replaced the tuned reference background expressions with project-specific animated Bezier curves. |
+| `src/crypto/aes.ts`, `aes-tables.ts` | Retain the Rijndael implementation's named authors, public-domain declaration and disclaimer in [LICENSES](LICENSES/rijndael-public-domain.txt). This declaration is specific to Rijndael, not the whole libkirk directory. |
+| `ppsspp_niddb.xml` | Regenerated from the project's `src/kernel/nids.ts` declarations using `npm run nids:generate`. It is an index of project declarations, not an independently sourced comprehensive database. |
 
-The `ppsspp-reference` git submodule points to:
+## Format data and behavioral references
 
-`https://github.com/hrydgard/ppsspp/tree/ab1ee21996b78aaac1f82baa390990c8ce9a9936`
+PSP identifiers, register fields, file offsets, fixed decryption keys and tag maps
+remain for compatibility. The retained KIRK/PRX table files identify their
+reference source. They are separate from the replacement transformation code.
 
-Its components have different terms. The top-level PPSSPP license is not a
-substitute for reading each relevant source header.
+The remaining HLE, PGF, timing, loader and graphics reference comments describe
+syscall behavior or binary/hardware interfaces. The targeted review distinguishes
+those interfaces from implementation-specific choices such as the old PRNG seed,
+registry counters and background curves. It is not a certification of the origin
+of every line in the emulator.
 
-## Findings to resolve
+The replacements were written with access to the prior and reference code; this
+was not a clean-room process. Existing history remains available, including older
+implementations and fonts.
 
-| Local implementation | Reference / observed evidence | Status |
-| --- | --- | --- |
-| `src/crypto/kirk.ts`, `src/loader/kirk.ts` | `ext/libkirk/kirk_engine.c` declares GPL-3.0-or-later. Local comments call these ports. The PRNG/default initialization also matches implementation-specific upstream choices, including its default seed string, filler byte, and random-data constants; these are more specific than PSP command IDs. | Review origin of those implementations and replace source-derived expression or obtain permission if necessary. |
-| `src/audio/sas-core.ts` | `Core/HW/SasAudio.cpp` declares GPL-2.0-or-later. The local file identifies itself as a port; decoder state/update ordering closely follows the reference. ADPCM behavior and hardware constants alone are not proof of copying. | Review source origin at function level. |
-| `src/memory/block-allocator.ts` | `Core/Util/BlockAllocator.cpp` declares GPL-2.0-or-later. Similar public operations and a linked-list allocator can also arise independently. | Establish whether this is independently written code or a source translation; comments alone are insufficient. |
-| `src/frontend/wave-background.ts` | `UI/Background.cpp` uses the same two tuned sinusoidal expressions in the original checkout. This concerns visual implementation choices, not PSP hardware behavior. | A project-specific replacement is prepared locally and is not included in this documentation change. |
-| `src/crypto/aes.ts`, `aes-tables.ts` | `ext/libkirk/AES.c` contains a public-domain declaration for the Rijndael implementation, unlike KIRK's GPL header. | Preserve the exact applicable author/disclaimer notice; do not call every file in libkirk GPL. |
-| `src/crypto/sha1.ts`, `src/crypto/amctrl.ts` | Their reference files carry separate authorship/history text; a complete permission determination was not established by this review. | Trace original terms or independently replace; do not infer permission from the directory name. |
-| `src/kernel/psp-registry.ts`, `hle-audio.ts`, `hle-font.ts`, `hle-kernel.ts`, loaders and other HLE handlers | Comments and docs cite PPSSPP. Some may describe behavior; some may indicate translated implementation. | Record concrete source comparisons instead of treating all reference citations as copied code. |
-| `ppsspp_niddb.xml` | Checked-in reference database. | Record its original source and applicable redistribution terms. |
-| FFmpeg/libav runtime dependencies | Wrapper package licenses and the exact loaded WASM build can differ. | Inventory the selected core build, source and notices before claiming an entirely permissive distribution. |
+## Runtime and assets
 
-## Closing the review
+The retained FFmpeg core is GPL-2.0-or-later. The wrapper is MIT. Exact versions,
+source links and notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The unused libav.js packages were removed. The docs diagram now uses native
+browser animation, replacing the custom-licensed GSAP dependency.
 
-For each item, record the original implementation inputs, reference revision,
-what was independently written, copied/adapted portions if any, and applicable
-license/permission evidence. Hardware formats, algorithms, and required constants
-must be distinguished from expressive source code. Similarity is evidence to
-investigate, not an automated legal determination.
-
-The MIT route requires resolving retained third-party code and distribution
-dependencies, not merely changing comments or deleting attributions. Any needed
-replacement should be written against a behavioral specification and validated
-with synthetic tests. Do not describe such work as a clean-room process unless
-that process was actually followed.
-
-## Artwork and fonts
-
-The original architecture illustration is separately available under
-`LICENSES/illustration-MIT.txt`. The two retained browser UI fonts keep their
-adjacent OFL notices. Gameplay recordings retain underlying third-party rights;
-they are not covered by the MIT illustration license. PGF font provenance remains
-under review. Asset and runtime changes are not included in this documentation change.
+The 16 replacement PGFs use OFL fonts with recorded source/output hashes and
+adjacent notices. Gameplay videos and screenshots retain their respective rights.
+See [ASSETS.md](ASSETS.md) for the asset inventory and font coverage.

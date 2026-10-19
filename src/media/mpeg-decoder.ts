@@ -1,9 +1,8 @@
 /**
  * Real PSP MPEG (PSMF) video decode via WebCodecs.
  *
- * The default libav.js build ships no H.264 decoder and no MPEG-PS demuxer, so
- * we demux the Program Stream ourselves (PsmfDemux) and decode the H.264 access
- * units with the browser's native VideoDecoder.
+ * PsmfDemux extracts H.264 access units from the Program Stream. The browser's
+ * native VideoDecoder decodes those access units.
  *
  * Pacing matters. Our HLE disc reads are instant, so the game fills the whole
  * sceMpeg ringbuffer in a burst. If we decoded every access unit as it arrived,

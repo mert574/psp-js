@@ -1,5 +1,5 @@
 /**
- * Tests for the KIRK crypto engine port.
+ * Tests for the KIRK crypto engine and standard cryptographic primitives.
  * SHA1 and AES test vectors from NIST/RFC standards.
  */
 

@@ -6,8 +6,8 @@ How the code is organized and a few patterns to follow when extending it.
 
 PSP behavior in this project is matched against [PPSSPP](https://github.com/hrydgard/ppsspp), which is included as the `ppsspp-reference/` submodule. When checking a NID or a behavior, two sources are useful:
 
-1. `ppsspp_niddb.xml`, the NID database.
-2. `ppsspp-reference/Core/HLE/sce*.cpp`, the source. The source wins if it disagrees with the XML, which can be out of date.
+1. `ppsspp_niddb.xml`, generated from `src/kernel/nids.ts` with `npm run nids:generate`.
+2. `ppsspp-reference/Core/HLE/sce*.cpp`, for comparison of hardware behavior. The generated XML indexes project declarations; it is not an independent reference.
 
 ## NID constants
 

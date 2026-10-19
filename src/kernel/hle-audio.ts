@@ -11,6 +11,7 @@
  * until the browser's AudioContext is unlocked by a user gesture.
  */
 
+import { frameCapacity, refillWindow, consumeFrame } from "../audio/atrac-ring.js";
 import { Logger } from "../utils/logger.js";
 import type { HLEKernel, HLEHandler } from "./hle-kernel.js";
 import { parseAtracHeader, decodeAtrac, getCachedAtrac, getCachedAtracBySize, type AtracInfo } from "../audio/atrac-decoder.js";
@@ -71,10 +72,8 @@ interface AtracContext {
   codecType: number;
 
   // ── Streaming state (HALFWAY_BUFFER / STREAMED_*) ──────────────────────────
-  // Port of PPSSPP AtracCtx: the game refills a ring buffer as it plays. We
-  // accumulate the compressed bytes linearly into `dataBuf` (= PPSSPP dataBuf_)
-  // and decode that, while keeping ring bookkeeping for the game-facing
-  // sceAtracGetStreamDataInfo / RemainingFrames. Names mirror PPSSPP fields.
+  // Ring-buffer counters for guest refills; compressed bytes are retained in
+  // a separate linear buffer for asynchronous FFmpeg decoding.
   streaming: boolean;
   /** Full compressed file size (dataOffset + dataSize from the header). */
   fileSize: number;
@@ -249,8 +248,8 @@ function atracDecodeData(
 }
 
 /**
- * DecodeData for streaming contexts (HALFWAY_BUFFER / STREAMED_*). Port of the
- * relevant parts of PPSSPP Atrac::DecodeData + ConsumeFrame + RemainingFrames.
+ * DecodeData for streaming contexts (HALFWAY_BUFFER / STREAMED_*).
+ * Ring accounting is implemented in audio/atrac-ring.ts.
  * Plays from the growing decodedPcm; finishes only at the header's true end
  * sample, not at the current window. Advances the ring bookkeeping per frame so
  * sceAtracGetStreamDataInfo keeps telling the game to refill.
@@ -310,15 +309,13 @@ function atracDecodeStreaming(
     }
   }
 
-  // Ring consume (PPSSPP ConsumeFrame) — drives GetStreamDataInfo refill.
   if (!allLoaded && ctx.bytesPerFrame > 0) {
-    ctx.bufferPos += ctx.bytesPerFrame;
-    ctx.bufferValidBytes = ctx.bufferValidBytes > ctx.bytesPerFrame ? ctx.bufferValidBytes - ctx.bytesPerFrame : 0;
-    const end = Math.floor(ctx.bufferMaxSize / ctx.bytesPerFrame) * ctx.bytesPerFrame;
-    if (end > 0 && ctx.bufferPos >= end) ctx.bufferPos -= end;
+    const ring = consumeFrame(ctx.bufferPos, ctx.bufferValidBytes,
+      frameCapacity(ctx.bufferMaxSize, ctx.bytesPerFrame), ctx.bytesPerFrame);
+    ctx.bufferPos = ring.position;
+    ctx.bufferValidBytes = ring.valid;
   }
 
-  // RemainingFrames (PPSSPP): -1 when all loaded, else valid frames in the ring.
   const remain = allLoaded ? (-1 >>> 0) : ((ctx.bufferValidBytes / (ctx.bytesPerFrame || 1)) | 0);
 
   if (numSamplesPtr !== 0) bus.writeU32(numSamplesPtr, actualSamples);
@@ -656,14 +653,10 @@ export function registerAudioHLE(kernel: HLEKernel): void {
   }
 
   // ── Streaming (HALFWAY_BUFFER / STREAMED_*) ────────────────────────────────
-  // Port of PPSSPP AtracCtx. The game keeps refilling a ring buffer; we
-  // accumulate every compressed byte linearly into ctx.dataBuf and decode that,
-  // and keep PPSSPP-shaped ring bookkeeping for the game-facing stream info.
-
-  /** Effective ring size, floored to whole frames (PPSSPP StreamBufferEnd). */
+  // Retain compressed data linearly for asynchronous decoding while tracking
+  // the guest's bounded refill ring separately.
   function streamBufferEnd(ctx: AtracContext): number {
-    const bpf = ctx.bytesPerFrame || 1;
-    return Math.floor(ctx.bufferMaxSize / bpf) * bpf;
+    return frameCapacity(ctx.bufferMaxSize, ctx.bytesPerFrame);
   }
 
   /** Decode ctx.dataBuf[0..firstSize] → decodedPcm. Patches the RIFF data/RIFF
@@ -1024,27 +1017,13 @@ export function registerAudioHLE(kernel: HLEKernel): void {
     const writeP  = regs.getGpr(5);
     const writeSz = regs.getGpr(6);
     const rdOff   = regs.getGpr(7);
-    // Port of PPSSPP Atrac::CalculateStreamInfo (AtracCtx.cpp:515). Tells the
-    // game where in its ring to write the next chunk, how much, and the file
-    // offset to read from. Non-streaming contexts have nothing to add.
-    let writePtr = ctx?.bufPtr ?? 0, writableBytes = 0, readOffset = 0;
-    if (ctx?.streaming && ctx.status !== AtracStatus.ALL_DATA_LOADED) {
-      readOffset = ctx.fileOffset;
-      let offset = 0;
-      if (ctx.status === AtracStatus.HALFWAY_BUFFER) {
-        offset = readOffset;
-        writableBytes = ctx.fileSize - readOffset;
-      } else {
-        const bufEnd = streamBufferEnd(ctx);
-        const validExt = ctx.bufferPos + ctx.bufferValidBytes;
-        if (validExt < bufEnd) { offset = validExt; writableBytes = bufEnd - validExt; }
-        else { const startUsed = validExt - bufEnd; offset = startUsed; writableBytes = ctx.bufferPos - startUsed; }
-        if (readOffset >= ctx.fileSize) { readOffset = 0; offset = 0; writableBytes = 0; }
-      }
-      if (readOffset + writableBytes > ctx.fileSize) writableBytes = ctx.fileSize - readOffset;
-      if (writableBytes < 0) writableBytes = 0;
-      writePtr = ctx.bufPtr + offset;
-    }
+    const window = ctx?.streaming && ctx.status !== AtracStatus.ALL_DATA_LOADED
+      ? refillWindow(ctx.bufferPos, ctx.bufferValidBytes, streamBufferEnd(ctx),
+          ctx.fileOffset, ctx.fileSize, ctx.status === AtracStatus.HALFWAY_BUFFER)
+      : { position: 0, writable: 0, fileOffset: 0 };
+    const writePtr = (ctx?.bufPtr ?? 0) + window.position;
+    const writableBytes = window.writable;
+    const readOffset = window.fileOffset;
     if (writeP  !== 0) bus.writeU32(writeP, writePtr >>> 0);
     if (writeSz !== 0) bus.writeU32(writeSz, writableBytes >>> 0);
     if (rdOff   !== 0) bus.writeU32(rdOff, readOffset >>> 0);
@@ -1079,16 +1058,11 @@ export function registerAudioHLE(kernel: HLEKernel): void {
       regs.setGpr(2, 0);
       return;
     }
-    // Port of PPSSPP Atrac::AddStreamData (AtracCtx.cpp:546): the game wrote
-    // `bytesAdded` compressed bytes at the ring position we returned in
-    // GetStreamDataInfo. Copy them into our linear accumulation buffer.
-    const ringPos = (ctx.status === AtracStatus.HALFWAY_BUFFER)
-      ? ctx.fileOffset
-      : ((ctx.bufferPos + ctx.bufferValidBytes) % streamBufferEnd(ctx));
-    const n = Math.min(bytesAdded, ctx.fileSize - ctx.fileOffset);
+    const window = refillWindow(ctx.bufferPos, ctx.bufferValidBytes, streamBufferEnd(ctx),
+      ctx.fileOffset, ctx.fileSize, ctx.status === AtracStatus.HALFWAY_BUFFER);
+    const n = Math.min(bytesAdded, window.writable, Math.max(0, ctx.dataBuf.length - ctx.fileOffset));
     if (n > 0) {
-      const src = bus.readBytes(ctx.bufPtr + ringPos, n);
-      ctx.dataBuf.set(src.subarray(0, Math.min(n, ctx.dataBuf.length - ctx.fileOffset)), ctx.fileOffset);
+      ctx.dataBuf.set(bus.readBytes(ctx.bufPtr + window.position, n), ctx.fileOffset);
       ctx.fileOffset += n;
       ctx.firstSize += n;
       ctx.bufferValidBytes += n;

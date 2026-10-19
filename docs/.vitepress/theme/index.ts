@@ -7,7 +7,7 @@ import HeroVideo from "./components/HeroVideo.vue";
 
 // Extend VitePress's default theme:
 //  - register the browser-only <FrameCycle /> animation (used in markdown,
-//    wrapped in <ClientOnly> at the call site since it touches the DOM/GSAP);
+//    wrapped in <ClientOnly> at the call site since it touches the DOM);
 //  - add an "Open emulator" button to the nav bar that links back to the app;
 //  - fill the home hero's right-side image slot with a gameplay clip.
 export default {
